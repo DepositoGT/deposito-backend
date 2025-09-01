@@ -1,0 +1,228 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ========================================
+// Catálogos
+// ========================================
+
+model ProductCategory {
+  id        Int        @id @default(autoincrement())
+  name      String     @unique @db.VarChar(100)
+  products  Product[]
+  suppliers Supplier[]
+
+  @@map("product_categories")
+}
+
+model Status {
+  id        Int        @id @default(autoincrement())
+  name      String     @unique @db.VarChar(50)
+  suppliers Supplier[]
+  alerts    Alert[]
+
+  @@map("statuses")
+}
+
+model StockStatus {
+  id       Int       @id @default(autoincrement())
+  name     String    @unique @db.VarChar(50)
+  products Product[]
+
+  @@map("stock_statuses")
+}
+
+model PaymentMethod {
+  id    Int    @id @default(autoincrement())
+  name  String @unique @db.VarChar(50)
+  sales Sale[]
+
+  @@map("payment_methods")
+}
+
+model SaleStatus {
+  id    Int    @id @default(autoincrement())
+  name  String @unique @db.VarChar(50)
+  sales Sale[]
+
+  @@map("sale_statuses")
+}
+
+model PaymentTerm {
+  id        Int        @id @default(autoincrement())
+  name      String     @unique @db.VarChar(50)
+  suppliers Supplier[]
+
+  @@map("payment_terms")
+}
+
+model AlertType {
+  id     Int     @id @default(autoincrement())
+  name   String  @unique @db.VarChar(50)
+  alerts Alert[]
+
+  @@map("alert_types")
+}
+
+model AlertPriority {
+  id     Int     @id @default(autoincrement())
+  name   String  @unique @db.VarChar(50)
+  alerts Alert[]
+
+  @@map("alert_priorities")
+}
+
+// ========================================
+// Entidades principales
+// ========================================
+
+model Supplier {
+  id               String          @id @default(uuid()) @db.Uuid
+  name             String          @db.VarChar(150)
+  contact          String          @db.VarChar(100)
+  phone            String?         @db.VarChar(50)
+  email            String?         @db.VarChar(150)
+  address          String?         @db.Text
+  category_id      Int
+  category         ProductCategory @relation(fields: [category_id], references: [id])
+  products         Int             @default(0)
+  last_order       DateTime?
+  total_purchases  Decimal         @default(0) @db.Decimal(12, 2)
+  rating           Decimal?        @db.Decimal(3, 2)
+  status_id        Int
+  status           Status          @relation(fields: [status_id], references: [id])
+  payment_terms_id Int
+  payment_term     PaymentTerm     @relation(fields: [payment_terms_id], references: [id])
+  productsList     Product[]
+  purchase_logs    PurchaseLog[]
+  deleted          Boolean         @default(false)
+  deleted_at       DateTime?
+
+  @@map("suppliers")
+}
+
+model Product {
+  id            String          @id @default(uuid()) @db.Uuid
+  name          String          @db.VarChar(150)
+  category_id   Int
+  category      ProductCategory @relation(fields: [category_id], references: [id])
+  brand         String?         @db.VarChar(100)
+  size          String?         @db.VarChar(50)
+  stock         Int             @default(0)
+  min_stock     Int             @default(0)
+  price         Decimal         @db.Decimal(12, 2)
+  cost          Decimal         @db.Decimal(12, 2)
+  supplier_id   String          @db.Uuid
+  supplier      Supplier        @relation(fields: [supplier_id], references: [id])
+  barcode       String?         @unique @db.VarChar(100)
+  description   String?         @db.Text
+  deleted       Boolean         @default(false)
+  deleted_at    DateTime?
+  status_id     Int
+  status        StockStatus     @relation(fields: [status_id], references: [id])
+  alerts        Alert[]
+  sale_items    SaleItem[]
+  purchase_logs PurchaseLog[]
+
+  @@map("products")
+}
+
+model Role {
+  id    Int    @id @default(autoincrement())
+  name  String @unique @db.VarChar(50)
+  users User[]
+
+  @@map("roles")
+}
+
+model User {
+  id       String  @id @default(uuid()) @db.Uuid
+  name     String  @db.VarChar(150)
+  email    String  @unique @db.VarChar(150)
+  password String  @db.VarChar(255)
+  role_id  Int
+  role     Role    @relation(fields: [role_id], references: [id])
+  alerts   Alert[] @relation("AlertAssignedTo")
+
+  @@map("users")
+}
+
+model Alert {
+  id            String        @id @default(uuid()) @db.Uuid
+  type_id       Int
+  type          AlertType     @relation(fields: [type_id], references: [id])
+  priority_id   Int
+  priority      AlertPriority @relation(fields: [priority_id], references: [id])
+  title         String        @db.VarChar(150)
+  message       String?
+  product_id    String        @db.Uuid
+  product       Product       @relation(fields: [product_id], references: [id])
+  current_stock Int?
+  min_stock     Int?
+  timestamp     DateTime      @default(now())
+  status_id     Int
+  status        Status        @relation(fields: [status_id], references: [id])
+  assigned_to   String        @db.Uuid
+  assignedTo    User          @relation(fields: [assigned_to], references: [id], name: "AlertAssignedTo")
+
+  @@map("alerts")
+}
+
+model Sale {
+  id                String        @id @default(uuid()) @db.Uuid
+  date              DateTime      @default(now())
+  customer          String?       @db.VarChar(150)
+  customer_nit      String?       @db.VarChar(50)
+  is_final_consumer Boolean       @default(true)
+  total             Decimal       @db.Decimal(12, 2)
+  items             Int
+  payment_method_id Int
+  payment_method    PaymentMethod @relation(fields: [payment_method_id], references: [id])
+  status_id         Int
+  status            SaleStatus    @relation(fields: [status_id], references: [id])
+  amount_received   Decimal?      @db.Decimal(12, 2)
+  change            Decimal?      @db.Decimal(12, 2)
+  sale_items        SaleItem[]
+  sold_at           DateTime      @default(now())
+
+  @@map("sales")
+}
+
+model SaleItem {
+  id         Int     @id @default(autoincrement())
+  sale_id    String  @db.Uuid
+  sale       Sale    @relation(fields: [sale_id], references: [id])
+  product_id String  @db.Uuid
+  product    Product @relation(fields: [product_id], references: [id])
+  price      Decimal @db.Decimal(12, 2)
+  qty        Int
+
+  @@map("sale_items")
+}
+
+model PurchaseLog {
+  id          Int      @id @default(autoincrement())
+  product_id  String   @db.Uuid
+  product     Product  @relation(fields: [product_id], references: [id])
+  supplier_id String   @db.Uuid
+  supplier    Supplier @relation(fields: [supplier_id], references: [id])
+  qty         Int
+  date        DateTime @default(now())
+  cost        Decimal  @db.Decimal(12, 2)
+
+  @@index([product_id])
+  @@index([supplier_id])
+  @@map("purchase_logs")
+}
