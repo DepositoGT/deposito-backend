@@ -1,0 +1,3 @@
+nohup: ignoring input
+[prisma] Using DATABASE_URL (pooled) host: aws-1-us-east-2.pooler.supabase.com
+Server running on port 3000

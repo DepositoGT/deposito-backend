@@ -74,7 +74,7 @@ router.put('/:id', ctrl.update)
  * /catalogs/product-categories/{id}:
  *   delete:
  *     tags: [ProductCategories]
- *     summary: Eliminar categoría
+ *     summary: Eliminar categoría (soft delete)
  *     parameters:
  *       - in: path
  *         name: id
@@ -86,5 +86,23 @@ router.put('/:id', ctrl.update)
  *         description: Eliminada
  */
 router.delete('/:id', ctrl.remove)
+
+/**
+ * @openapi
+ * /catalogs/product-categories/{id}/restore:
+ *   patch:
+ *     tags: [ProductCategories]
+ *     summary: Restaurar categoría eliminada
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: integer
+ *     responses:
+ *       200:
+ *         description: Restaurada
+ */
+router.patch('/:id/restore', ctrl.restore)
 
 module.exports = router

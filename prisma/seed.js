@@ -21,13 +21,13 @@ async function main() {
     'Sake',
     'Mixers y Refrescos',
   ]
-  const statuses = ['Activo', 'Inactivo']
+  const statuses = ['Activo', 'Inactivo', 'Activa', 'Resuelta', 'Pendiente']
   const stockStatuses = ['Disponible', 'Bajo', 'Agotado']
   const paymentMethods = ['Efectivo', 'Tarjeta', 'Transferencia']
   const saleStatuses = ['Completada', 'Pendiente', 'Cancelada', 'Pagado']
   const paymentTerms = ['Contado', 'Crédito 15 días', 'Crédito 30 días']
-  const alertTypes = ['Stock Bajo', 'Vencimiento', 'Precio']
-  const alertPriorities = ['Baja', 'Media', 'Alta']
+  const alertTypes = ['Stock Bajo', 'Sin Stock', 'Vencimiento', 'Precio']
+  const alertPriorities = ['Baja', 'Media', 'Alta', 'Crítica']
 
   await prisma.role.createMany({ data: roles.map(name => ({ name })), skipDuplicates: true })
   // Crear o asegurarse que existan las nuevas categorías

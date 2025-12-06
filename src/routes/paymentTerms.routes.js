@@ -2,23 +2,19 @@ const { Router } = require('express')
 const ctrl = require('../controllers/paymentTerms.controller')
 const router = Router()
 
-/**
- * @openapi
- * tags:
- *   - name: PaymentTerms
- *     description: Términos de pago disponibles
- */
-
-/**
- * @openapi
- * /catalogs/payment-terms:
- *   get:
- *     tags: [PaymentTerms]
- *     summary: Obtener términos de pago
- *     responses:
- *       200:
- *         description: OK
- */
+// GET /catalogs/payment-terms
 router.get('/', ctrl.list)
+
+// POST /catalogs/payment-terms
+router.post('/', ctrl.create)
+
+// PUT /catalogs/payment-terms/:id
+router.put('/:id', ctrl.update)
+
+// DELETE /catalogs/payment-terms/:id (soft delete)
+router.delete('/:id', ctrl.remove)
+
+// PATCH /catalogs/payment-terms/:id/restore
+router.patch('/:id/restore', ctrl.restore)
 
 module.exports = router

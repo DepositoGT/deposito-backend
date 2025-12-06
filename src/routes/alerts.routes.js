@@ -66,4 +66,48 @@ router.get('/', Auth, Alerts.list)
  */
 router.post('/', Auth, hasAnyRole('admin'), Alerts.create)
 
+/**
+ * @openapi
+ * /alerts/{id}/assign:
+ *   post:
+ *     tags: [Alerts]
+ *     summary: Reasignar alerta a un usuario
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         schema: { type: string }
+ *         required: true
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               user_id: { type: string }
+ *     responses:
+ *       200: { description: OK }
+ */
+router.post('/:id/assign', Auth, hasAnyRole('admin'), Alerts.assign)
+
+/**
+ * @openapi
+ * /alerts/{id}/resolve:
+ *   patch:
+ *     tags: [Alerts]
+ *     summary: Marcar alerta como resuelta
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         schema: { type: string }
+ *         required: true
+ *     responses:
+ *       200: { description: OK }
+ */
+router.patch('/:id/resolve', Auth, Alerts.resolve)
+
 module.exports = router
