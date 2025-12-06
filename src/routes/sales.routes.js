@@ -78,6 +78,26 @@ router.get('/', Sales.list)
 
 /**
  * @openapi
+ * /sales/{id}:
+ *   get:
+ *     tags: [Sales]
+ *     summary: Obtener venta por ID
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Venta encontrada
+ *       404:
+ *         description: Venta no encontrada
+ */
+router.get('/:id', Sales.getById)
+
+/**
+ * @openapi
  * /sales:
  *   post:
  *     tags: [Sales]
@@ -105,5 +125,37 @@ router.get('/', Sales.list)
  *       201: { description: Creado }
  */
 router.post('/', Auth, hasAnyRole('admin', 'seller'), Sales.create)
+
+/**
+ * @openapi
+ * /sales/{id}/status:
+ *   patch:
+ *     tags: [Sales]
+ *     summary: Actualizar estado de una venta
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string, format: uuid }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               status_id: { type: integer, description: ID directo del estado }
+ *               status_name: { type: string, description: Nombre del estado (alternativo a status_id) }
+ *             oneOf:
+ *               - required: [status_id]
+ *               - required: [status_name]
+ *     responses:
+ *       200: { description: Estado actualizado }
+ *       400: { description: Petición inválida }
+ *       404: { description: Venta no encontrada }
+ */
+router.patch('/:id/status', Auth, hasAnyRole('admin', 'seller'), Sales.updateStatus)
 
 module.exports = router

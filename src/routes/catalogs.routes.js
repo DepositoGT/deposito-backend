@@ -34,4 +34,6 @@ router.use('/product-categories', require('./productCategories.routes'))
 // Mount payment terms
 router.use('/payment-terms', require('./paymentTerms.routes'))
 
+router.use('/payment-methods', require('./paymentMethods.routes'))
+
 module.exports = router

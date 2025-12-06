@@ -1,13 +1,20 @@
 const { prisma } = require('../models/prisma')
 const PDFDocument = require('pdfkit')
+// Luxon DateTime (single import; removed duplicate that caused startup SyntaxError)
 const { DateTime } = require('luxon')
+// Currency formatter helper (destructure format function)
 const { format } = new Intl.NumberFormat('es-GT', { style: 'currency', currency: 'GTQ' })
+
+// Reuse shared stock alert service
+const { ensureStockAlert } = require('../services/stockAlerts')
 
 exports.list = async (req, res, next) => {
   try {
+    const { includeDeleted } = req.query
+    const where = includeDeleted === 'true' ? {} : { deleted: false }
     const products = await prisma.product.findMany({
-  where: { deleted: false },
-  include: { category: true, supplier: true, status: true },
+      where,
+      include: { category: true, supplier: true, status: true },
       orderBy: { name: 'asc' },
     })
     res.json(products)
@@ -55,10 +62,30 @@ exports.create = async (req, res, next) => {
             date: dateAsUtcWithGtClock,
           },
         })
+
+        // increment supplier total_purchases by qty * cost and set last_order
+        const amount = Number(stock) * Number(cost)
+        await tx.supplier.update({
+          where: { id: supplierId },
+          data: {
+            total_purchases: { increment: amount },
+            last_order: dateAsUtcWithGtClock,
+          }
+        })
       }
 
       return { product, purchaseLog }
     })
+
+    // Si el producto inicia ya bajo mínimo (o en 0) generar / actualizar alerta
+    try {
+      const { product } = result
+      if (product && product.min_stock != null && Number(product.stock) < Number(product.min_stock)) {
+        await ensureStockAlert(prisma, product.id, product.stock, product.min_stock)
+      }
+    } catch (e) {
+      console.error('post-create ensureStockAlert error', e.message)
+    }
 
     // devolver ambos objetos; purchaseLog será null si no se creó
     res.status(201).json(result)
@@ -75,7 +102,31 @@ exports.getOne = async (req, res, next) => {
 
 exports.update = async (req, res, next) => {
   try {
-    const updated = await prisma.product.update({ where: { id: req.params.id }, data: req.body })
+    const id = req.params.id
+    const payload = req.body || {}
+    
+    // Get current product to detect stock changes
+    const current = await prisma.product.findUnique({ where: { id } })
+    if (!current || current.deleted) {
+      return res.status(404).json({ message: 'Producto no encontrado' })
+    }
+
+    const updated = await prisma.product.update({ where: { id }, data: payload })
+
+    // If stock or min_stock changed, trigger alert logic
+    const stockChanged = payload.stock !== undefined && Number(payload.stock) !== Number(current.stock)
+    const minStockChanged = payload.min_stock !== undefined && Number(payload.min_stock) !== Number(current.min_stock)
+    
+    if (stockChanged || minStockChanged) {
+      try {
+        const newStock = Number(updated.stock)
+        const newMinStock = Number(updated.min_stock)
+        await ensureStockAlert(prisma, id, newStock, newMinStock)
+      } catch (e) {
+        console.error('post-update ensureStockAlert error', e.message)
+      }
+    }
+
     res.json(updated)
   } catch (e) { next(e) }
 }
@@ -253,7 +304,7 @@ exports.reportPdf = async (req, res, next) => {
     // Footer
     doc.addPage ? null : null
     doc.moveDown(2)
-    doc.fontSize(9).fillColor('#64748b').text('Reporte generado por Depósito API', { align: 'right' })
+    doc.fontSize(9).fillColor('#64748b').text('Reporte generado por Depósito GT', { align: 'right' })
     doc.end()
   } catch (e) { next(e) }
 }
@@ -317,21 +368,33 @@ exports.adjustStock = async (req, res, next) => {
       const updated = await tx.product.update({ where: { id }, data: { stock: newStock } })
 
       let purchaseLog = null
-      if (type === 'add') {
-        // create purchase log if supplier_id present
-        const supplierId = supplier_id || prod.supplier_id
-        if (supplierId) {
-          purchaseLog = await tx.purchaseLog.create({
-            data: {
-              product_id: id,
-              supplier_id: supplierId,
-              qty: qty,
-              cost: cost != null ? Number(cost) : Number(prod.cost || 0),
-              date: dateAsUtcWithGtClock,
-            }
-          })
-        }
+      // create a purchase log for additions and a negative log for removals
+      const supplierId = supplier_id || prod.supplier_id
+      const unitCost = cost != null ? Number(cost) : Number(prod.cost || 0)
+      if (supplierId) {
+        const signedQty = type === 'add' ? qty : -qty
+        purchaseLog = await tx.purchaseLog.create({
+          data: {
+            product_id: id,
+            supplier_id: supplierId,
+            qty: signedQty,
+            cost: unitCost,
+            date: dateAsUtcWithGtClock,
+          }
+        })
+        // update supplier's total_purchases (increment by qty*cost; negative when removing)
+        const delta = signedQty * unitCost
+        await tx.supplier.update({
+          where: { id: supplierId },
+          data: {
+            total_purchases: { increment: delta },
+            ...(type === 'add' ? { last_order: dateAsUtcWithGtClock } : {}),
+          }
+        })
       }
+
+      // Stock alert logic SIEMPRE (aunque no haya supplier) para reflejar cualquier ajuste
+      await ensureStockAlert(tx, id, newStock, prod.min_stock)
 
       // optionally create a generic product log table in future; for now return updated + purchaseLog
       return { updated, purchaseLog }
@@ -339,4 +402,41 @@ exports.adjustStock = async (req, res, next) => {
 
     res.json(result)
   } catch (e) { next(e) }
+}
+
+/**
+ * @swagger
+ * /api/products/{id}/restore:
+ *   patch:
+ *     summary: Restaurar producto eliminado
+ *     description: Restaura un producto que fue eliminado (soft delete)
+ *     tags: [Products]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *     responses:
+ *       200:
+ *         description: Producto restaurado
+ *       404:
+ *         description: Producto no encontrado
+ */
+exports.restore = async (req, res, next) => {
+  try {
+    const { id } = req.params
+    const restored = await prisma.product.update({
+      where: { id },
+      data: { deleted: false, deleted_at: null },
+      include: { category: true, supplier: true, status: true }
+    })
+    res.json({ ok: true, product: restored })
+  } catch (e) {
+    if (e.code === 'P2025') {
+      return res.status(404).json({ message: 'Producto no encontrado' })
+    }
+    next(e)
+  }
 }

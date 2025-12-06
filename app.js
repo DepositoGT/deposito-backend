@@ -15,9 +15,23 @@ app.use(cookieParser())
 
 app.use(express.static(path.join(__dirname, 'files')))
 
+// CORS: explicitly allow local dev frontends
+const allowedOrigins = new Set([
+  'http://localhost:8080',
+  'http://127.0.0.1:8080',
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'http://localhost:3000',
+])
 const corsConfig = {
   credentials: true,
-  origin: true,
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true) // allow tools/curl or same-origin
+    if (allowedOrigins.has(origin)) return callback(null, true)
+    return callback(new Error('Not allowed by CORS'))
+  },
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
 }
 
 // middleware

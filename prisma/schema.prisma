@@ -21,6 +21,7 @@ datasource db {
 model ProductCategory {
   id        Int        @id @default(autoincrement())
   name      String     @unique @db.VarChar(100)
+  deleted   Boolean    @default(false)
   products  Product[]
   suppliers Supplier[]
 
@@ -45,9 +46,10 @@ model StockStatus {
 }
 
 model PaymentMethod {
-  id    Int    @id @default(autoincrement())
-  name  String @unique @db.VarChar(50)
-  sales Sale[]
+  id                     Int                    @id @default(autoincrement())
+  name                   String                 @unique @db.VarChar(50)
+  sales                  Sale[]
+  cash_closure_payments  CashClosurePayment[]  // Relación para saber qué método de pago se usó en cada línea del cierre
 
   @@map("payment_methods")
 }
@@ -60,9 +62,18 @@ model SaleStatus {
   @@map("sale_statuses")
 }
 
+model ReturnStatus {
+  id      Int      @id @default(autoincrement())
+  name    String   @unique @db.VarChar(50)
+  returns Return[]
+
+  @@map("return_statuses")
+}
+
 model PaymentTerm {
   id        Int        @id @default(autoincrement())
   name      String     @unique @db.VarChar(50)
+  deleted   Boolean    @default(false)
   suppliers Supplier[]
 
   @@map("payment_terms")
@@ -135,6 +146,7 @@ model Product {
   alerts        Alert[]
   sale_items    SaleItem[]
   purchase_logs PurchaseLog[]
+  return_items  ReturnItem[]
 
   @@map("products")
 }
@@ -174,8 +186,9 @@ model Alert {
   timestamp     DateTime      @default(now())
   status_id     Int
   status        Status        @relation(fields: [status_id], references: [id])
-  assigned_to   String        @db.Uuid
-  assignedTo    User          @relation(fields: [assigned_to], references: [id], name: "AlertAssignedTo")
+  assigned_to   String?       @db.Uuid
+  assignedTo    User?         @relation(fields: [assigned_to], references: [id], name: "AlertAssignedTo")
+  resolved      Int           @default(0)
 
   @@map("alerts")
 }
@@ -187,6 +200,8 @@ model Sale {
   customer_nit      String?       @db.VarChar(50)
   is_final_consumer Boolean       @default(true)
   total             Decimal       @db.Decimal(12, 2)
+  total_returned    Decimal       @default(0) @db.Decimal(12, 2)
+  adjusted_total    Decimal       @db.Decimal(12, 2)
   items             Int
   payment_method_id Int
   payment_method    PaymentMethod @relation(fields: [payment_method_id], references: [id])
@@ -195,19 +210,21 @@ model Sale {
   amount_received   Decimal?      @db.Decimal(12, 2)
   change            Decimal?      @db.Decimal(12, 2)
   sale_items        SaleItem[]
+  returns           Return[]
   sold_at           DateTime      @default(now())
 
   @@map("sales")
 }
 
 model SaleItem {
-  id         Int     @id @default(autoincrement())
-  sale_id    String  @db.Uuid
-  sale       Sale    @relation(fields: [sale_id], references: [id])
-  product_id String  @db.Uuid
-  product    Product @relation(fields: [product_id], references: [id])
-  price      Decimal @db.Decimal(12, 2)
-  qty        Int
+  id           Int          @id @default(autoincrement())
+  sale_id      String       @db.Uuid
+  sale         Sale         @relation(fields: [sale_id], references: [id])
+  product_id   String       @db.Uuid
+  product      Product      @relation(fields: [product_id], references: [id])
+  price        Decimal      @db.Decimal(12, 2)
+  qty          Int
+  return_items ReturnItem[]
 
   @@map("sale_items")
 }
@@ -225,4 +242,145 @@ model PurchaseLog {
   @@index([product_id])
   @@index([supplier_id])
   @@map("purchase_logs")
+}
+
+model Return {
+  id           String       @id @default(uuid()) @db.Uuid
+  sale_id      String       @db.Uuid
+  sale         Sale         @relation(fields: [sale_id], references: [id])
+  return_date  DateTime     @default(now())
+  reason       String?      @db.Text
+  total_refund Decimal      @db.Decimal(12, 2)
+  items_count  Int          @default(0)
+  status_id    Int
+  status       ReturnStatus @relation(fields: [status_id], references: [id])
+  processed_by String?      @db.Uuid
+  processed_at DateTime?
+  notes        String?      @db.Text
+
+  return_items ReturnItem[]
+
+  @@index([sale_id])
+  @@index([status_id])
+  @@map("returns")
+}
+
+model ReturnItem {
+  id            Int      @id @default(autoincrement())
+  return_id     String   @db.Uuid
+  return        Return   @relation(fields: [return_id], references: [id])
+  sale_item_id  Int
+  sale_item     SaleItem @relation(fields: [sale_item_id], references: [id])
+  product_id    String   @db.Uuid
+  product       Product  @relation(fields: [product_id], references: [id])
+  qty_returned  Int
+  refund_amount Decimal  @db.Decimal(12, 2)
+  reason        String?  @db.Text
+
+  @@index([return_id])
+  @@index([sale_item_id])
+  @@index([product_id])
+  @@map("return_items")
+}
+
+// ========================================
+// Cierre de Caja
+// ========================================
+
+model CashClosure {
+  id                    String                  @id @default(uuid()) @db.Uuid
+  closure_number        Int                     @unique @default(autoincrement())
+  date                  DateTime                @default(now())
+  start_date            DateTime // Fecha/hora de inicio del período
+  end_date              DateTime // Fecha/hora de fin del período
+  
+  // Usuario que genera el cierre
+  cashier_name          String                  @db.VarChar(100)
+  cashier_signature     String?                 @db.Text // Base64 de firma digital
+  
+  // Supervisor que valida
+  supervisor_name       String?                 @db.VarChar(100)
+  supervisor_signature  String?                 @db.Text // Base64 de firma digital
+  supervisor_validated_at DateTime?
+  
+  // Totales teóricos (según BD)
+  theoretical_total     Decimal                 @db.Decimal(12, 2)
+  theoretical_sales     Decimal                 @db.Decimal(12, 2)
+  theoretical_returns   Decimal                 @db.Decimal(12, 2)
+  
+  // Totales reales (conteo físico/validación)
+  actual_total          Decimal                 @db.Decimal(12, 2)
+  
+  // Diferencia
+  difference            Decimal                 @db.Decimal(12, 2) // actual - theoretical
+  difference_percentage Decimal?                @db.Decimal(5, 2)
+  
+  // Desglose por método de pago
+  payment_breakdowns    CashClosurePayment[]
+  
+  // Conteo de denominaciones (billetes/monedas)
+  denominations         CashClosureDenomination[]
+  
+  // Métricas adicionales
+  total_transactions    Int // Total de ventas en el período
+  total_customers       Int // Total de clientes atendidos
+  average_ticket        Decimal                 @db.Decimal(12, 2)
+  
+  // Notas y observaciones
+  notes                 String?                 @db.Text
+  status                String                  @default("Pendiente") @db.VarChar(50) // Pendiente, Validado, Cerrado
+  
+  // Timestamps
+  created_at            DateTime                @default(now())
+  updated_at            DateTime                @updatedAt
+  
+  @@index([date])
+  @@index([status])
+  @@map("cash_closures")
+}
+
+model CashClosurePayment {
+  id                    Int         @id @default(autoincrement())
+  cash_closure_id       String      @db.Uuid
+  cash_closure          CashClosure @relation(fields: [cash_closure_id], references: [id], onDelete: Cascade)
+  
+  payment_method_id     Int
+  payment_method        PaymentMethod @relation(fields: [payment_method_id], references: [id])
+  
+  // Teórico (según BD)
+  theoretical_amount    Decimal     @db.Decimal(12, 2)
+  theoretical_count     Int // Cantidad de transacciones
+  
+  // Real (conteo/validación)
+  actual_amount         Decimal     @db.Decimal(12, 2)
+  actual_count          Int?
+  
+  // Diferencia
+  difference            Decimal     @db.Decimal(12, 2)
+  
+  // Notas específicas por método
+  notes                 String?     @db.Text
+  
+  @@index([cash_closure_id])
+  @@index([payment_method_id])
+  @@map("cash_closure_payments")
+}
+
+model CashClosureDenomination {
+  id                Int         @id @default(autoincrement())
+  cash_closure_id   String      @db.Uuid
+  cash_closure      CashClosure @relation(fields: [cash_closure_id], references: [id], onDelete: Cascade)
+  
+  // Denominación (200, 100, 50, 20, 10, 5, 1, 0.50, 0.25, 0.10, 0.05, 0.01)
+  denomination      Decimal     @db.Decimal(10, 2)
+  type              String      @db.VarChar(20) // "Billete" o "Moneda"
+  
+  // Cantidad de unidades
+  quantity          Int
+  
+  // Subtotal (denomination * quantity)
+  subtotal          Decimal     @db.Decimal(12, 2)
+  
+  @@index([cash_closure_id])
+  @@map("cash_closure_denominations")
 }
