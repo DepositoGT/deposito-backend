@@ -4,11 +4,28 @@ const { DateTime } = require('luxon')
 exports.list = async (req, res, next) => {
   try {
     const items = await prisma.supplier.findMany({
-  where: { deleted: false },
-  include: { category: true, status: true, payment_term: true, productsList: true },
+      where: { deleted: false },
+      include: { category: true, status: true, payment_term: true, productsList: true },
       orderBy: { name: 'asc' },
     })
-    res.json(items)
+
+    // Map suppliers adding computed totalPurchases (numeric) and lastOrder (ISO) for frontend expectations
+    const adapted = items.map(s => {
+      let lastOrder = ''
+      if (s.last_order) {
+        // Formato amigable: 07 Nov 2025 14:32
+        lastOrder = DateTime.fromJSDate(s.last_order)
+          .setZone('America/Guatemala')
+          .setLocale('es')
+          .toFormat("dd LLL yyyy HH:mm")
+      }
+      return {
+        ...s,
+        totalPurchases: Number(s.total_purchases || 0),
+        lastOrder,
+      }
+    })
+    res.json(adapted)
   } catch (e) { next(e) }
 }
 
@@ -52,7 +69,12 @@ exports.getOne = async (req, res, next) => {
   try {
     const item = await prisma.supplier.findUnique({ where: { id: req.params.id }, include: { category: true, status: true, payment_term: true, productsList: true } })
     if (!item || item.deleted) return res.status(404).json({ message: 'No encontrado' })
-    res.json(item)
+    const adapted = {
+      ...item,
+      totalPurchases: Number(item.total_purchases || 0),
+      lastOrder: item.last_order ? DateTime.fromJSDate(item.last_order).setZone('America/Guatemala').setLocale('es').toFormat('dd LLL yyyy HH:mm') : '',
+    }
+    res.json(adapted)
   } catch (e) { next(e) }
 }
 

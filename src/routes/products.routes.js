@@ -199,4 +199,20 @@ router.delete('/:id', Auth, hasAnyRole('admin'), Products.remove)
  */
 router.post('/:id/stock-adjust', Auth, hasAnyRole('admin'), Products.adjustStock)
 
+/**
+ * @openapi
+ * /products/{id}/restore:
+ *   patch:
+ *     tags: [Products]
+ *     summary: Restaurar producto eliminado
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200: { description: OK }
+ */
+router.patch('/:id/restore', Auth, hasAnyRole('admin'), Products.restore)
+
 module.exports = router

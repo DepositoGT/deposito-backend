@@ -38,3 +38,21 @@ PORT=3000
 ## Endpoints
 - GET /health: verifica conexión a la base de datos
 - GET /api: ping básico
+
+### Ventas
+- GET /api/sales?period=month&status=Pendiente&page=1&pageSize=50
+   Lista ventas con filtros de periodo y estado.
+- POST /api/sales
+   Crea una venta (el backend asigna estado inicial 'Pendiente').
+- PATCH /api/sales/:id/status
+   Actualiza sólo el estado de una venta.
+   Body (uno de los dos campos):
+   {
+      "status_id": 2
+   }
+   o
+   {
+      "status_name": "Pagado"
+   }
+   Respuesta: objeto venta actualizado.
+

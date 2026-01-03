@@ -15,9 +15,31 @@ app.use(cookieParser())
 
 app.use(express.static(path.join(__dirname, 'files')))
 
+// CORS: allow local dev and production frontends
+const allowedOrigins = new Set([
+  'http://localhost:8080',
+  'http://127.0.0.1:8080',
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'http://localhost:3000',
+  // Add your production frontend URL here
+  process.env.FRONTEND_URL,
+])
+
 const corsConfig = {
   credentials: true,
-  origin: true,
+  origin: (origin, callback) => {
+    // Allow requests with no origin (like mobile apps, curl, Postman)
+    if (!origin) return callback(null, true)
+    // Allow if in whitelist
+    if (allowedOrigins.has(origin)) return callback(null, true)
+    // Allow any Vercel preview/production URLs
+    if (origin.endsWith('.vercel.app')) return callback(null, true)
+    // Reject others
+    return callback(new Error('Not allowed by CORS'))
+  },
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
 }
 
 // middleware

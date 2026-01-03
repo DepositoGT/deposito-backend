@@ -1,6 +1,6 @@
 const { Router } = require('express')
 const controller = require('../controllers/usuarios.controller')
-const { Auth } = require('../middlewares/autenticacion')
+const { Auth, hasAnyRole } = require('../middlewares/autenticacion')
 
 const router = Router()
 
@@ -87,6 +87,32 @@ router.post('/login', controller.login)
 
 /**
  * @openapi
+ * /auth/validate-admin:
+ *   post:
+ *     tags: [Auth]
+ *     summary: Validar credenciales de administrador
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [username, password]
+ *             properties:
+ *               username: { type: string, description: Email del usuario }
+ *               password: { type: string }
+ *     responses:
+ *       200:
+ *         description: Credenciales válidas
+ *       401:
+ *         description: Credenciales inválidas
+ *       403:
+ *         description: Usuario no es administrador
+ */
+router.post('/validate-admin', controller.validateAdmin)
+
+/**
+ * @openapi
  * /auth/me:
  *   get:
  *     tags: [Auth]
@@ -105,5 +131,120 @@ router.post('/login', controller.login)
  *                   $ref: '#/components/schemas/User'
  */
 router.get('/me', Auth, (req, res) => res.json({ user: req.user }))
+
+/**
+ * @openapi
+ * /auth/users:
+ *   get:
+ *     tags: [Auth]
+ *     summary: Listar usuarios (con roles)
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: OK
+ */
+router.get('/users', Auth, hasAnyRole('admin', '1'), controller.list)
+
+/**
+ * @openapi
+ * /auth/users/{id}:
+ *   get:
+ *     tags: [Auth]
+ *     summary: Obtener un usuario específico
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string, format: uuid }
+ *     responses:
+ *       200:
+ *         description: OK
+ *       404:
+ *         description: Usuario no encontrado
+ */
+router.get('/users/:id', Auth, hasAnyRole('admin', '1'), controller.getById)
+
+/**
+ * @openapi
+ * /auth/users/{id}:
+ *   put:
+ *     tags: [Auth]
+ *     summary: Actualizar usuario (nombre, email, rol, contraseña)
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string, format: uuid }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               name: { type: string }
+ *               email: { type: string, format: email }
+ *               role_id: { type: integer }
+ *               password: { type: string, description: "Nueva contraseña (opcional)" }
+ *     responses:
+ *       200:
+ *         description: Usuario actualizado
+ *       404:
+ *         description: Usuario no encontrado
+ *       409:
+ *         description: Email ya en uso
+ */
+router.put('/users/:id', Auth, hasAnyRole('admin', '1'), controller.update)
+
+/**
+ * @openapi
+ * /auth/users/{id}:
+ *   delete:
+ *     tags: [Auth]
+ *     summary: Eliminar usuario
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string, format: uuid }
+ *     responses:
+ *       200:
+ *         description: Usuario eliminado
+ *       400:
+ *         description: No puedes eliminar tu propia cuenta
+ *       404:
+ *         description: Usuario no encontrado
+ */
+router.delete('/users/:id', Auth, hasAnyRole('admin', '1'), controller.delete)
+
+/**
+ * @openapi
+ * /auth/roles:
+ *   get:
+ *     tags: [Auth]
+ *     summary: Listar todos los roles disponibles
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Lista de roles
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: array
+ *               items:
+ *                 type: object
+ *                 properties:
+ *                   id: { type: integer }
+ *                   name: { type: string }
+ */
+router.get('/roles', Auth, hasAnyRole('admin', '1'), controller.getRoles)
 
 module.exports = router
