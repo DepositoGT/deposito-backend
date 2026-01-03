@@ -5,8 +5,8 @@ const { salesOperationLimiter } = require('../utils/concurrencyLimiter')
 
 exports.list = async (req, res, next) => {
   try {
-  // Query params: period (today|week|month|year), status, page, pageSize
-  const { period, status } = req.query || {}
+    // Query params: period (today|week|month|year), status, page, pageSize
+    const { period, status } = req.query || {}
     const page = Math.max(1, Number(req.query.page ?? 1))
     const pageSize = Math.min(1000, Math.max(1, Number(req.query.pageSize ?? 100)))
 
@@ -76,9 +76,9 @@ exports.list = async (req, res, next) => {
 
     const items = await prisma.sale.findMany({
       where,
-      include: { 
-        payment_method: true, 
-        status: true, 
+      include: {
+        payment_method: true,
+        status: true,
         sale_items: { include: { product: true } },
         returns: {
           where: {
@@ -126,7 +126,7 @@ exports.list = async (req, res, next) => {
 exports.getById = async (req, res, next) => {
   try {
     const { id } = req.params
-    
+
     const sale = await prisma.sale.findUnique({
       where: { id },
       include: {
@@ -178,13 +178,13 @@ exports.getById = async (req, res, next) => {
 exports.create = async (req, res, next) => {
   try {
     console.log(req.body)
-    const { items, admin_authorized_products = [], ...saleData } = req.body
+    const { items, admin_authorized_products = [], promotion_codes = [], ...saleData } = req.body
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ message: 'items es requerido' })
     }
 
     const totalItems = items.reduce((acc, it) => acc + Number(it.qty || 0), 0)
-    const total = items.reduce((acc, it) => acc + Number(it.price || 0) * Number(it.qty || 0), 0)
+    const subtotal = items.reduce((acc, it) => acc + Number(it.price || 0) * Number(it.qty || 0), 0)
 
     // Convertir admin_authorized_products a Set para búsqueda rápida
     const adminAuthorizedSet = new Set(admin_authorized_products || [])
@@ -206,7 +206,7 @@ exports.create = async (req, res, next) => {
       const productIds = Array.from(qtyByProduct.keys())
       const products = await tx.product.findMany({
         where: { id: { in: productIds }, deleted: false },
-        select: { id: true, name: true, stock: true },
+        select: { id: true, name: true, stock: true, category_id: true },
       })
       const prodMap = new Map(products.map(p => [String(p.id), p]))
       // Verifica existencia y stock suficiente por producto (considera cantidades sumadas si hay repetidos)
@@ -217,13 +217,13 @@ exports.create = async (req, res, next) => {
           err.status = 400
           throw err
         }
-        
+
         // Omitir validación de stock si fue autorizado por administrador
         if (adminAuthorizedSet.has(pid)) {
           console.log(`[ADMIN AUTH] Omitiendo validación de stock para producto ${p.name} (ID: ${pid})`)
           continue
         }
-        
+
         const requested = Number(qtyByProduct.get(pid) || 0)
         const available = Number(p.stock || 0)
         if (requested > available) {
@@ -232,6 +232,67 @@ exports.create = async (req, res, next) => {
           throw err
         }
       }
+
+      // 2) Procesar códigos de promoción
+      let discountTotal = 0
+      const appliedPromotions = []
+
+      if (Array.isArray(promotion_codes) && promotion_codes.length > 0) {
+        const { applyMultiplePromotions } = require('../services/promotionCalculator')
+        const now = new Date()
+
+        // Preparar items con category_id para el cálculo
+        const itemsWithCategory = items.map(it => ({
+          ...it,
+          category_id: prodMap.get(it.product_id)?.category_id
+        }))
+
+        // Buscar promociones por código a través de la tabla PromotionCode
+        const promotionCodes = await tx.promotionCode.findMany({
+          where: {
+            code: { in: promotion_codes.map(c => c.toUpperCase()) },
+            active: true,
+            promotion: {
+              active: true,
+              deleted: false
+            }
+          },
+          include: {
+            promotion: {
+              include: {
+                type: true,
+                applicable_products: true,
+                applicable_categories: true
+              }
+            }
+          }
+        })
+
+        // Validar y aplicar cada promoción
+        for (const promoCode of promotionCodes) {
+          const promo = promoCode.promotion
+          // Agregar el código utilizado a la promoción para tracking
+          promo.usedCode = promoCode.code
+          promo.usedCodeId = promoCode.id
+
+          // Validar fechas
+          if (promo.start_date && now < promo.start_date) continue
+          if (promo.end_date && now > promo.end_date) continue
+          // Validar usos máximos (por código individual)
+          if (promo.max_uses && promoCode.current_uses >= promo.max_uses) continue
+
+          appliedPromotions.push(promo)
+        }
+
+        if (appliedPromotions.length > 0) {
+          const result = applyMultiplePromotions(appliedPromotions, itemsWithCategory)
+          discountTotal = result.totalDiscount
+          console.log(`[PROMOTIONS] Applied ${appliedPromotions.length} promotions, discount: Q${discountTotal}`)
+        }
+      }
+
+      // Calcular total final
+      const total = Math.max(0, subtotal - discountTotal)
 
       // Get the status ID for 'Pendiente'
       const pendienteStatus = await tx.saleStatus.findFirst({ where: { name: 'Pendiente' } })
@@ -242,7 +303,7 @@ exports.create = async (req, res, next) => {
       // We want to store the current Guatemala time AS IF it were UTC
       // Example: If it's 15:28 in Guatemala, we want DB to show 15:28, not 21:28
       const nowGt = DateTime.now().setZone('America/Guatemala');
-      
+
       // Create UTC Date with Guatemala's time values
       // This "tricks" PostgreSQL into storing Guatemala time as UTC
       const saleDate = DateTime.utc(
@@ -254,7 +315,7 @@ exports.create = async (req, res, next) => {
         nowGt.second,
         nowGt.millisecond
       ).toJSDate();
-      
+
       console.log('[SALE DATE] Guatemala local time:', nowGt.toFormat('yyyy-MM-dd HH:mm:ss'));
       console.log('[SALE DATE] Will be stored in DB as:', DateTime.fromJSDate(saleDate).toUTC().toFormat('yyyy-MM-dd HH:mm:ss'));
 
@@ -264,6 +325,8 @@ exports.create = async (req, res, next) => {
           date: saleDate,
           sold_at: saleDate,  // Establecer sold_at explícitamente en hora de Guatemala
           items: totalItems,
+          subtotal,
+          discount_total: discountTotal > 0 ? discountTotal : null,
           total,
           total_returned: 0,  // Nueva venta sin devoluciones
           adjusted_total: total,  // Total ajustado = total (sin devoluciones aún)
@@ -281,6 +344,38 @@ exports.create = async (req, res, next) => {
           },
         })
         // Stock NO se toca aquí: sólo se descontará cuando la venta pase a 'Completada'.
+      }
+
+      // 3) Guardar promociones usadas e incrementar contador
+      if (appliedPromotions.length > 0) {
+        const { applyPromotion } = require('../services/promotionCalculator')
+        const itemsWithCategory = items.map(it => ({
+          ...it,
+          category_id: prodMap.get(it.product_id)?.category_id
+        }))
+
+        for (const promo of appliedPromotions) {
+          const result = applyPromotion(promo, itemsWithCategory)
+
+          // Crear registro de uso
+          await tx.salePromotion.create({
+            data: {
+              sale_id: sale.id,
+              promotion_id: promo.id,
+              discount_applied: result.discount
+              // Note: code_used field available after server restart
+            }
+          })
+
+          // Incrementar contador de usos en el código específico
+          if (promo.usedCodeId) {
+            await tx.promotionCode.update({
+              where: { id: promo.usedCodeId },
+              data: { current_uses: { increment: 1 } }
+            })
+          }
+        }
+        console.log(`[PROMOTIONS] Saved ${appliedPromotions.length} promotion records for sale ${sale.id}`)
       }
 
       return sale
@@ -314,105 +409,105 @@ exports.updateStatus = async (req, res, next) => {
     // Usar limitador de concurrencia para evitar sobrecarga
     const result = await salesOperationLimiter.run(async () => {
       return await prisma.$transaction(async (tx) => {
-      // Cargar venta actual con su status e items
-      const current = await tx.sale.findUnique({
-        where: { id },
-        include: { status: true, sale_items: true }
-      })
-      if (!current) throw new Error('Venta no encontrada')
-
-      const prevStatusName = current.status?.name || ''
-      // Obtener nombre del nuevo status para comparar lógicamente
-      const newStatus = await tx.saleStatus.findUnique({ where: { id: targetStatusId } })
-      if (!newStatus) throw new Error('Estado destino inválido')
-      const newStatusName = newStatus.name
-
-      const wasCompleted = prevStatusName === 'Completada'
-      const willBeCompleted = newStatusName === 'Completada'
-      const willBeCancelled = newStatusName === 'Cancelada'
-
-      // Transición: otro -> Completada => descontar stock
-      if (!wasCompleted && willBeCompleted) {
-        console.log(`[STOCK ADJUSTMENT] Venta ${id}: ${prevStatusName} -> Completada. Descontando stock...`)
-        
-        // Agrupar items por producto (acumular qty si se repite)
-        const productQtyMap = new Map()
-        current.sale_items.forEach(si => {
-          const currentQty = productQtyMap.get(si.product_id) || 0
-          productQtyMap.set(si.product_id, currentQty + si.qty)
+        // Cargar venta actual con su status e items
+        const current = await tx.sale.findUnique({
+          where: { id },
+          include: { status: true, sale_items: true }
         })
-        
-        // Actualizar productos agrupados en paralelo (menos queries)
-        const updatePromises = Array.from(productQtyMap.entries()).map(([productId, totalQty]) => {
-          console.log(`[STOCK ADJUSTMENT] Producto ${productId}: -${totalQty} unidades`)
-          return tx.product.update({ 
-            where: { id: productId }, 
-            data: { stock: { decrement: totalQty } },
-            select: { id: true, name: true, stock: true, min_stock: true }
+        if (!current) throw new Error('Venta no encontrada')
+
+        const prevStatusName = current.status?.name || ''
+        // Obtener nombre del nuevo status para comparar lógicamente
+        const newStatus = await tx.saleStatus.findUnique({ where: { id: targetStatusId } })
+        if (!newStatus) throw new Error('Estado destino inválido')
+        const newStatusName = newStatus.name
+
+        const wasCompleted = prevStatusName === 'Completada'
+        const willBeCompleted = newStatusName === 'Completada'
+        const willBeCancelled = newStatusName === 'Cancelada'
+
+        // Transición: otro -> Completada => descontar stock
+        if (!wasCompleted && willBeCompleted) {
+          console.log(`[STOCK ADJUSTMENT] Venta ${id}: ${prevStatusName} -> Completada. Descontando stock...`)
+
+          // Agrupar items por producto (acumular qty si se repite)
+          const productQtyMap = new Map()
+          current.sale_items.forEach(si => {
+            const currentQty = productQtyMap.get(si.product_id) || 0
+            productQtyMap.set(si.product_id, currentQty + si.qty)
           })
-        })
-        const updatedProducts = await Promise.all(updatePromises)
-        
-        updatedProducts.forEach(p => {
-          console.log(`[STOCK ADJUSTMENT] ${p.name}: nuevo stock = ${p.stock}`)
-        })
-        
-        // Procesar alertas en lote (mucho más eficiente)
-        await ensureStockAlertsBatch(tx, updatedProducts)
-        console.log(`[STOCK ADJUSTMENT] Alertas de stock actualizadas`)
-      }
-      
-      // Transición: Completada -> Cancelada => REVERTIR todos los ajustes de stock
-      if (wasCompleted && willBeCancelled) {
-        console.log(`[STOCK REVERT] Venta ${id}: Completada -> Cancelada. Revirtiendo ajustes de stock...`)
-        
-        // Agrupar items por producto (acumular qty si se repite)
-        const productQtyMap = new Map()
-        current.sale_items.forEach(si => {
-          const currentQty = productQtyMap.get(si.product_id) || 0
-          productQtyMap.set(si.product_id, currentQty + si.qty)
-        })
-        
-        // Restaurar stock (incrementar las cantidades que se descontaron)
-        const updatePromises = Array.from(productQtyMap.entries()).map(([productId, totalQty]) => {
-          console.log(`[STOCK REVERT] Producto ${productId}: +${totalQty} unidades (restauración)`)
-          return tx.product.update({ 
-            where: { id: productId }, 
-            data: { stock: { increment: totalQty } },
-            select: { id: true, name: true, stock: true, min_stock: true }
+
+          // Actualizar productos agrupados en paralelo (menos queries)
+          const updatePromises = Array.from(productQtyMap.entries()).map(([productId, totalQty]) => {
+            console.log(`[STOCK ADJUSTMENT] Producto ${productId}: -${totalQty} unidades`)
+            return tx.product.update({
+              where: { id: productId },
+              data: { stock: { decrement: totalQty } },
+              select: { id: true, name: true, stock: true, min_stock: true }
+            })
           })
+          const updatedProducts = await Promise.all(updatePromises)
+
+          updatedProducts.forEach(p => {
+            console.log(`[STOCK ADJUSTMENT] ${p.name}: nuevo stock = ${p.stock}`)
+          })
+
+          // Procesar alertas en lote (mucho más eficiente)
+          await ensureStockAlertsBatch(tx, updatedProducts)
+          console.log(`[STOCK ADJUSTMENT] Alertas de stock actualizadas`)
+        }
+
+        // Transición: Completada -> Cancelada => REVERTIR todos los ajustes de stock
+        if (wasCompleted && willBeCancelled) {
+          console.log(`[STOCK REVERT] Venta ${id}: Completada -> Cancelada. Revirtiendo ajustes de stock...`)
+
+          // Agrupar items por producto (acumular qty si se repite)
+          const productQtyMap = new Map()
+          current.sale_items.forEach(si => {
+            const currentQty = productQtyMap.get(si.product_id) || 0
+            productQtyMap.set(si.product_id, currentQty + si.qty)
+          })
+
+          // Restaurar stock (incrementar las cantidades que se descontaron)
+          const updatePromises = Array.from(productQtyMap.entries()).map(([productId, totalQty]) => {
+            console.log(`[STOCK REVERT] Producto ${productId}: +${totalQty} unidades (restauración)`)
+            return tx.product.update({
+              where: { id: productId },
+              data: { stock: { increment: totalQty } },
+              select: { id: true, name: true, stock: true, min_stock: true }
+            })
+          })
+          const updatedProducts = await Promise.all(updatePromises)
+
+          updatedProducts.forEach(p => {
+            console.log(`[STOCK REVERT] ${p.name}: stock restaurado = ${p.stock}`)
+          })
+
+          // Actualizar alertas de stock (puede resolver alertas si el stock volvió a niveles normales)
+          await ensureStockAlertsBatch(tx, updatedProducts)
+          console.log(`[STOCK REVERT] Alertas de stock actualizadas después de reversión`)
+        }
+
+        // Actualizar estado de la venta
+        const updated = await tx.sale.update({
+          where: { id },
+          data: { status_id: targetStatusId },
+          include: { payment_method: true, status: true }
         })
-        const updatedProducts = await Promise.all(updatePromises)
-        
-        updatedProducts.forEach(p => {
-          console.log(`[STOCK REVERT] ${p.name}: stock restaurado = ${p.stock}`)
-        })
-        
-        // Actualizar alertas de stock (puede resolver alertas si el stock volvió a niveles normales)
-        await ensureStockAlertsBatch(tx, updatedProducts)
-        console.log(`[STOCK REVERT] Alertas de stock actualizadas después de reversión`)
-      }
 
-      // Actualizar estado de la venta
-      const updated = await tx.sale.update({
-        where: { id },
-        data: { status_id: targetStatusId },
-        include: { payment_method: true, status: true }
-      })
+        // Determinar tipo de ajuste realizado
+        let stockAdjustment = 'none'
+        if (!wasCompleted && willBeCompleted) {
+          stockAdjustment = 'stock_decremented' // Se descontó stock al completar
+        } else if (wasCompleted && willBeCancelled) {
+          stockAdjustment = 'stock_reverted' // Se revirtió stock al cancelar desde completada
+        }
 
-      // Determinar tipo de ajuste realizado
-      let stockAdjustment = 'none'
-      if (!wasCompleted && willBeCompleted) {
-        stockAdjustment = 'stock_decremented' // Se descontó stock al completar
-      } else if (wasCompleted && willBeCancelled) {
-        stockAdjustment = 'stock_reverted' // Se revirtió stock al cancelar desde completada
-      }
-
-      return { 
-        ...updated, 
-        _stockAdjustment: stockAdjustment,
-        _transition: `${prevStatusName} -> ${newStatusName}`
-      }
+        return {
+          ...updated,
+          _stockAdjustment: stockAdjustment,
+          _transition: `${prevStatusName} -> ${newStatusName}`
+        }
       }, {
         maxWait: 10000, // Aumentar el tiempo máximo de espera a 10 segundos
         timeout: 15000, // Aumentar el timeout a 15 segundos
