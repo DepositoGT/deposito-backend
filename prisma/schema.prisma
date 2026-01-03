@@ -24,6 +24,7 @@ model ProductCategory {
   deleted   Boolean    @default(false)
   products  Product[]
   suppliers Supplier[]
+  promotion_categories PromotionCategory[]
 
   @@map("product_categories")
 }
@@ -147,6 +148,7 @@ model Product {
   sale_items    SaleItem[]
   purchase_logs PurchaseLog[]
   return_items  ReturnItem[]
+  promotion_products PromotionProduct[]
 
   @@map("products")
 }
@@ -199,6 +201,8 @@ model Sale {
   customer          String?       @db.VarChar(150)
   customer_nit      String?       @db.VarChar(50)
   is_final_consumer Boolean       @default(true)
+  subtotal          Decimal?      @db.Decimal(12, 2)  // Total antes de descuentos
+  discount_total    Decimal?      @db.Decimal(12, 2)  // Total de descuentos aplicados
   total             Decimal       @db.Decimal(12, 2)
   total_returned    Decimal       @default(0) @db.Decimal(12, 2)
   adjusted_total    Decimal       @db.Decimal(12, 2)
@@ -211,6 +215,7 @@ model Sale {
   change            Decimal?      @db.Decimal(12, 2)
   sale_items        SaleItem[]
   returns           Return[]
+  sale_promotions   SalePromotion[]
   sold_at           DateTime      @default(now())
 
   @@map("sales")
@@ -384,3 +389,113 @@ model CashClosureDenomination {
   @@index([cash_closure_id])
   @@map("cash_closure_denominations")
 }
+
+// ========================================
+// Sistema de Promociones y Descuentos
+// ========================================
+
+model PromotionType {
+  id          Int         @id @default(autoincrement())
+  name        String      @unique @db.VarChar(50)
+  // Tipos: PERCENTAGE, FIXED_AMOUNT, BUY_X_GET_Y, COMBO_DISCOUNT, FREE_GIFT, MIN_QTY_DISCOUNT
+  description String?     @db.Text
+  promotions  Promotion[]
+
+  @@map("promotion_types")
+}
+
+model Promotion {
+  id                  String    @id @default(uuid()) @db.Uuid
+  name                String    @db.VarChar(150)
+  description         String?   @db.Text
+  type_id             Int
+  type                PromotionType @relation(fields: [type_id], references: [id])
+  
+  // Códigos vinculados (uno o varios)
+  codes               PromotionCode[]
+  
+  // Valores de la promoción
+  discount_value      Decimal?  @db.Decimal(12, 2)   // Para FIXED_AMOUNT
+  discount_percentage Decimal?  @db.Decimal(5, 2)    // Porcentaje (0-100)
+  buy_quantity        Int?      // Cantidad a comprar (2x1 = 2)
+  get_quantity        Int?      // Cantidad gratis (2x1 = 1)
+  min_quantity        Int?      // Cantidad mínima para aplicar
+  
+  // Productos relacionados
+  applies_to_all      Boolean   @default(false)      // Aplica a todos los productos
+  trigger_product_id  String?   @db.Uuid             // Producto que activa la promo
+  target_product_id   String?   @db.Uuid             // Producto que recibe el descuento/regalo
+  applicable_products PromotionProduct[]
+  applicable_categories PromotionCategory[]
+  
+  // Validez y límites
+  start_date          DateTime  @default(now())
+  end_date            DateTime?
+  max_uses            Int?      // Usos máximos totales (por código)
+  max_uses_per_customer Int?    // Usos máximos por cliente
+  min_purchase_amount Decimal?  @db.Decimal(12, 2)   // Compra mínima para aplicar
+  
+  // Estado
+  active              Boolean   @default(true)
+  deleted             Boolean   @default(false)
+  created_at          DateTime  @default(now())
+  updated_at          DateTime  @updatedAt
+  
+  // Relaciones
+  sale_promotions     SalePromotion[]
+  
+  @@index([active, start_date, end_date])
+  @@map("promotions")
+}
+
+// Códigos de promoción (permite múltiples códigos por promoción)
+model PromotionCode {
+  id            Int       @id @default(autoincrement())
+  code          String    @unique @db.VarChar(50)
+  promotion_id  String    @db.Uuid
+  promotion     Promotion @relation(fields: [promotion_id], references: [id], onDelete: Cascade)
+  current_uses  Int       @default(0)
+  active        Boolean   @default(true)
+  created_at    DateTime  @default(now())
+  
+  @@index([code])
+  @@index([promotion_id])
+  @@map("promotion_codes")
+}
+
+model PromotionProduct {
+  id           Int       @id @default(autoincrement())
+  promotion_id String    @db.Uuid
+  promotion    Promotion @relation(fields: [promotion_id], references: [id], onDelete: Cascade)
+  product_id   String    @db.Uuid
+  product      Product   @relation(fields: [product_id], references: [id])
+  
+  @@unique([promotion_id, product_id])
+  @@map("promotion_products")
+}
+
+model PromotionCategory {
+  id           Int             @id @default(autoincrement())
+  promotion_id String          @db.Uuid
+  promotion    Promotion       @relation(fields: [promotion_id], references: [id], onDelete: Cascade)
+  category_id  Int
+  category     ProductCategory @relation(fields: [category_id], references: [id])
+  
+  @@unique([promotion_id, category_id])
+  @@map("promotion_categories")
+}
+
+model SalePromotion {
+  id               Int       @id @default(autoincrement())
+  sale_id          String    @db.Uuid
+  sale             Sale      @relation(fields: [sale_id], references: [id], onDelete: Cascade)
+  promotion_id     String    @db.Uuid
+  promotion        Promotion @relation(fields: [promotion_id], references: [id])
+  discount_applied Decimal   @db.Decimal(12, 2)  // Monto efectivo descontado
+  code_used        String?   @db.VarChar(50)     // Código específico utilizado
+  
+  @@index([sale_id])
+  @@index([promotion_id])
+  @@map("sale_promotions")
+}
+

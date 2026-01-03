@@ -29,6 +29,8 @@ router.use('/reports', require('./reports.routes'))
 router.use('/returns', require('./returns.routes'))
 // Cash Closures (cierre de caja)
 router.use('/cash-closures', require('./cashClosures.routes'))
+// Promotions (discount codes)
+router.use('/promotions', require('./promotions.routes'))
 
 
 
