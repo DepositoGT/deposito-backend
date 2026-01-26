@@ -11,17 +11,14 @@ const usuariosRoutes = require('./src/routes/usuarios.routes')
 const apiRoutes = require('./src/routes')
 
 var app = express()
-app.use(cookieParser())
 
-app.use(express.static(path.join(__dirname, 'files')))
-
-// CORS: explicitly allow local dev frontends
+// CORS: explicitly allow local dev frontends and production
 const allowedOrigins = new Set([
   'http://localhost:8080',
   'http://127.0.0.1:8080',
   'http://localhost:5173',
   'http://127.0.0.1:5173',
-  'http://localhost:3000',
+  'https://deposito-frontend.vercel.app',
 ])
 const corsConfig = {
   credentials: true,
@@ -34,10 +31,14 @@ const corsConfig = {
   allowedHeaders: ['Content-Type', 'Authorization'],
 }
 
-// middleware
+// CORS must be applied FIRST before any other middleware
+app.use(cors(corsConfig))
+
+// Other middleware
+app.use(cookieParser())
+app.use(express.static(path.join(__dirname, 'files')))
 app.use(express.urlencoded({ extended: false }))
 app.use(express.json())
-app.use(cors(corsConfig))
 
 // Swagger setup
 const swaggerDefinition = {
