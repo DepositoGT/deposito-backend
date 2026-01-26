@@ -126,3 +126,102 @@ exports.remove = async (req, res, next) => {
     res.json({ ok: true })
   } catch (e) { next(e) }
 }
+
+// ========== BULK IMPORT METHODS ==========
+
+const { bulkValidateSuppliers, bulkCreateSuppliers, generateSupplierTemplate } = require('../services/supplierBulkImport')
+
+/**
+ * @swagger
+ * /api/suppliers/bulk-import-mapped:
+ *   post:
+ *     summary: Importar proveedores desde JSON mapeado
+ *     description: Valida y crea proveedores desde datos JSON con columnas ya mapeadas
+ *     tags: [Suppliers]
+ *     security:
+ *       - bearerAuth: []
+ */
+exports.bulkImportMapped = async (req, res, next) => {
+  try {
+    const { suppliers } = req.body
+
+    if (!suppliers || !Array.isArray(suppliers) || suppliers.length === 0) {
+      return res.status(400).json({ message: 'No se proporcionaron proveedores' })
+    }
+
+    // Validate all suppliers
+    const validation = await bulkValidateSuppliers(suppliers)
+
+    if (validation.invalidRows.length > 0) {
+      return res.status(400).json({
+        ok: false,
+        message: `${validation.invalidRows.length} proveedores tienen errores`,
+        ...validation
+      })
+    }
+
+    // All valid, proceed to import
+    const result = await bulkCreateSuppliers(validation.validRows)
+
+    res.json({
+      ok: true,
+      created: result.created,
+      skipped: result.skipped || 0,
+      errors: result.errors || [],
+      message: result.skipped > 0
+        ? `Se importaron ${result.created} proveedores (${result.skipped} omitidos por duplicados)`
+        : `Se importaron ${result.created} proveedores exitosamente`
+    })
+  } catch (e) {
+    next(e)
+  }
+}
+
+/**
+ * @swagger
+ * /api/suppliers/validate-import-mapped:
+ *   post:
+ *     summary: Validar proveedores sin importar
+ *     description: Valida proveedores desde JSON y retorna errores sin crear registros
+ *     tags: [Suppliers]
+ *     security:
+ *       - bearerAuth: []
+ */
+exports.validateImportMapped = async (req, res, next) => {
+  try {
+    const { suppliers } = req.body
+
+    if (!suppliers || !Array.isArray(suppliers) || suppliers.length === 0) {
+      return res.status(400).json({ message: 'No se proporcionaron proveedores' })
+    }
+
+    const validation = await bulkValidateSuppliers(suppliers)
+
+    res.json({
+      ok: validation.invalidRows.length === 0,
+      ...validation
+    })
+  } catch (e) {
+    next(e)
+  }
+}
+
+/**
+ * @swagger
+ * /api/suppliers/template:
+ *   get:
+ *     summary: Descargar plantilla Excel para proveedores
+ *     tags: [Suppliers]
+ */
+exports.downloadTemplate = async (req, res, next) => {
+  try {
+    const buffer = await generateSupplierTemplate()
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    res.setHeader('Content-Disposition', 'attachment; filename="plantilla_proveedores.xlsx"')
+    res.send(buffer)
+  } catch (e) {
+    next(e)
+  }
+}
+

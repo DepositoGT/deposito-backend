@@ -48,6 +48,77 @@ const router = Router()
  *         rating: { type: number, format: float }
  */
 
+// ========== SPECIFIC ROUTES (must come BEFORE /:id routes) ==========
+
+/**
+ * @openapi
+ * /suppliers/template:
+ *   get:
+ *     tags: [Suppliers]
+ *     summary: Descargar plantilla Excel para importación de proveedores
+ *     responses:
+ *       200:
+ *         description: Archivo Excel
+ *         content:
+ *           application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+ *             schema:
+ *               type: string
+ *               format: binary
+ */
+router.get('/template', Suppliers.downloadTemplate)
+
+/**
+ * @openapi
+ * /suppliers/bulk-import-mapped:
+ *   post:
+ *     tags: [Suppliers]
+ *     summary: Importar proveedores desde JSON mapeado
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               suppliers:
+ *                 type: array
+ *                 items:
+ *                   type: object
+ *     responses:
+ *       200:
+ *         description: Resultado de importación
+ */
+router.post('/bulk-import-mapped', Auth, hasAnyRole('admin'), Suppliers.bulkImportMapped)
+
+/**
+ * @openapi
+ * /suppliers/validate-import-mapped:
+ *   post:
+ *     tags: [Suppliers]
+ *     summary: Validar proveedores sin importar
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               suppliers:
+ *                 type: array
+ *                 items:
+ *                   type: object
+ *     responses:
+ *       200:
+ *         description: Resultado de validación
+ */
+router.post('/validate-import-mapped', Auth, hasAnyRole('admin'), Suppliers.validateImportMapped)
+
+// ========== STANDARD CRUD ROUTES ==========
+
 /**
  * @openapi
  * /suppliers:
