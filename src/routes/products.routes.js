@@ -1,6 +1,25 @@
 const { Router } = require('express')
+const multer = require('multer')
 const { Auth, hasAnyRole } = require('../middlewares/autenticacion')
 const Products = require('../controllers/products.controller')
+
+// Configure multer for memory storage (keep file in buffer)
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
+    fileFilter: (req, file, cb) => {
+        const allowedMimes = [
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'application/vnd.ms-excel',
+            'text/csv'
+        ]
+        if (allowedMimes.includes(file.mimetype)) {
+            cb(null, true)
+        } else {
+            cb(new Error('Tipo de archivo no permitido. Use Excel (.xlsx, .xls) o CSV.'))
+        }
+    }
+})
 
 const router = Router()
 
@@ -84,6 +103,126 @@ router.get('/critical', Auth, hasAnyRole('admin'), Products.critical)
  *               format: binary
  */
 router.get('/report.pdf', Products.reportPdf)
+
+/**
+ * @openapi
+ * /products/import-template:
+ *   get:
+ *     tags: [Products]
+ *     summary: Descargar plantilla de importación
+ *     description: Genera archivo Excel con estructura para importar productos
+ *     responses:
+ *       200:
+ *         description: Archivo Excel
+ *         content:
+ *           application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+ *             schema:
+ *               type: string
+ *               format: binary
+ */
+router.get('/import-template', Products.getImportTemplate)
+
+/**
+ * @openapi
+ * /products/validate-import:
+ *   post:
+ *     tags: [Products]
+ *     summary: Validar archivo de importación
+ *     description: Parsea y valida Excel antes de importar
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               file:
+ *                 type: string
+ *                 format: binary
+ *     responses:
+ *       200:
+ *         description: Resultado de validación
+ */
+router.post('/validate-import', Auth, hasAnyRole('admin'), upload.single('file'), Products.validateImport)
+
+/**
+ * @openapi
+ * /products/bulk-import:
+ *   post:
+ *     tags: [Products]
+ *     summary: Importar productos masivamente
+ *     description: Importa productos desde archivo Excel
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               file:
+ *                 type: string
+ *                 format: binary
+ *     responses:
+ *       200:
+ *         description: Resultado de importación
+ *       400:
+ *         description: Error de validación
+ */
+router.post('/bulk-import', Auth, hasAnyRole('admin'), upload.single('file'), Products.bulkImport)
+
+/**
+ * @openapi
+ * /products/bulk-import-mapped:
+ *   post:
+ *     tags: [Products]
+ *     summary: Importar productos con campos mapeados
+ *     description: Importa productos desde JSON con campos ya mapeados por el frontend
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               products:
+ *                 type: array
+ *     responses:
+ *       200:
+ *         description: Resultado de importación
+ *       400:
+ *         description: Error de validación
+ */
+router.post('/bulk-import-mapped', Auth, hasAnyRole('admin'), Products.bulkImportMapped)
+
+/**
+ * @openapi
+ * /products/validate-import-mapped:
+ *   post:
+ *     tags: [Products]
+ *     summary: Validar productos sin importar
+ *     description: Valida productos desde JSON y retorna errores sin crear registros
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               products:
+ *                 type: array
+ *     responses:
+ *       200:
+ *         description: Resultado de validación
+ */
+router.post('/validate-import-mapped', Auth, hasAnyRole('admin'), Products.validateImportMapped)
 
 /**
  * @openapi
@@ -216,3 +355,4 @@ router.post('/:id/stock-adjust', Auth, hasAnyRole('admin'), Products.adjustStock
 router.patch('/:id/restore', Auth, hasAnyRole('admin'), Products.restore)
 
 module.exports = router
+

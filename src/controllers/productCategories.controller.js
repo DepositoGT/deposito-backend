@@ -1,4 +1,6 @@
 const { prisma } = require('../models/prisma')
+const { generateCatalogTemplate } = require('../services/catalogTemplate')
+const { bulkValidateCatalogs, bulkCreateCatalogs } = require('../services/catalogBulkImport')
 
 /**
  * @swagger
@@ -222,6 +224,111 @@ exports.restore = async (req, res, next) => {
     if (e.code === 'P2025') {
       return res.status(404).json({ message: 'Categoría no encontrada' })
     }
+    next(e)
+  }
+}
+
+/**
+ * @swagger
+ * /api/catalogs/product-categories/template:
+ *   get:
+ *     summary: Descargar plantilla Excel para importación de categorías
+ *     description: Genera un archivo Excel con la estructura para importar categorías masivamente
+ *     tags: [Catálogos]
+ *     produces:
+ *       - application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+ *     responses:
+ *       200:
+ *         description: Archivo Excel
+ */
+exports.downloadTemplate = async (req, res, next) => {
+  try {
+    const buffer = generateCatalogTemplate('categories')
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    res.setHeader('Content-Disposition', 'attachment; filename="plantilla_categorias.xlsx"')
+    res.send(buffer)
+  } catch (e) {
+    next(e)
+  }
+}
+
+/**
+ * @swagger
+ * /api/catalogs/product-categories/validate-import-mapped:
+ *   post:
+ *     summary: Validar categorías sin importar
+ *     description: Valida categorías desde JSON y retorna errores sin crear registros
+ *     tags: [Catálogos]
+ *     security:
+ *       - bearerAuth: []
+ */
+exports.validateImportMapped = async (req, res, next) => {
+  try {
+    const { items } = req.body || {}
+
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ message: 'No se proporcionaron categorías para validar' })
+    }
+
+    // Validate without importing
+    const validation = await bulkValidateCatalogs(items, 'categories')
+
+    res.json({
+      ok: true,
+      totals: {
+        total: items.length,
+        valid: validation.validRows.length,
+        invalid: validation.invalidRows.length
+      },
+      validRows: validation.validRows,
+      invalidRows: validation.invalidRows
+    })
+  } catch (e) {
+    next(e)
+  }
+}
+
+/**
+ * @swagger
+ * /api/catalogs/product-categories/bulk-import-mapped:
+ *   post:
+ *     summary: Importar categorías con campos mapeados
+ *     description: Importa categorías desde JSON con campos ya mapeados por el frontend
+ *     tags: [Catálogos]
+ *     security:
+ *       - bearerAuth: []
+ */
+exports.bulkImportMapped = async (req, res, next) => {
+  try {
+    const { items } = req.body || {}
+
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ message: 'No se proporcionaron categorías para importar' })
+    }
+
+    // Validate all categories
+    const validation = await bulkValidateCatalogs(items, 'categories')
+
+    if (validation.invalidRows.length > 0) {
+      return res.status(400).json({
+        message: `${validation.invalidRows.length} categorías tienen errores`,
+        ...validation
+      })
+    }
+
+    // All valid, proceed to import
+    const result = await bulkCreateCatalogs(validation.validRows, 'categories')
+
+    res.json({
+      ok: true,
+      created: result.created,
+      skipped: result.skipped || 0,
+      errors: result.errors || [],
+      message: result.skipped > 0
+        ? `Se importaron ${result.created} categorías (${result.skipped} omitidas por duplicados)`
+        : `Se importaron ${result.created} categorías exitosamente`
+    })
+  } catch (e) {
     next(e)
   }
 }

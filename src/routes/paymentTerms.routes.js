@@ -1,9 +1,19 @@
 const { Router } = require('express')
+const { Auth, hasAnyRole } = require('../middlewares/autenticacion')
 const ctrl = require('../controllers/paymentTerms.controller')
 const router = Router()
 
 // GET /catalogs/payment-terms
 router.get('/', ctrl.list)
+
+// GET /catalogs/payment-terms/template
+router.get('/template', ctrl.downloadTemplate)
+
+// POST /catalogs/payment-terms/validate-import-mapped
+router.post('/validate-import-mapped', Auth, hasAnyRole('admin'), ctrl.validateImportMapped)
+
+// POST /catalogs/payment-terms/bulk-import-mapped
+router.post('/bulk-import-mapped', Auth, hasAnyRole('admin'), ctrl.bulkImportMapped)
 
 // POST /catalogs/payment-terms
 router.post('/', ctrl.create)

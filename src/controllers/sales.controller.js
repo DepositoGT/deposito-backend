@@ -80,6 +80,13 @@ exports.list = async (req, res, next) => {
         payment_method: true,
         status: true,
         sale_items: { include: { product: true } },
+        sale_promotions: {
+          include: {
+            promotion: {
+              include: { type: true }
+            }
+          }
+        },
         returns: {
           where: {
             status: { name: 'Completada' }

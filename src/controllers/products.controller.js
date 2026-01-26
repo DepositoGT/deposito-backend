@@ -8,6 +8,9 @@ const { format } = new Intl.NumberFormat('es-GT', { style: 'currency', currency:
 // Reuse shared stock alert service
 const { ensureStockAlert } = require('../services/stockAlerts')
 
+// Bulk import service
+const { parseExcel, validateBulkData, bulkCreateProducts, generateTemplateWithCatalogs } = require('../services/bulkImport')
+
 exports.list = async (req, res, next) => {
   try {
     const { includeDeleted } = req.query
@@ -94,8 +97,8 @@ exports.create = async (req, res, next) => {
 
 exports.getOne = async (req, res, next) => {
   try {
-  const item = await prisma.product.findUnique({ where: { id: req.params.id } })
-  if (!item || item.deleted) return res.status(404).json({ message: 'No encontrado' })
+    const item = await prisma.product.findUnique({ where: { id: req.params.id } })
+    if (!item || item.deleted) return res.status(404).json({ message: 'No encontrado' })
     res.json(item)
   } catch (e) { next(e) }
 }
@@ -104,7 +107,7 @@ exports.update = async (req, res, next) => {
   try {
     const id = req.params.id
     const payload = req.body || {}
-    
+
     // Get current product to detect stock changes
     const current = await prisma.product.findUnique({ where: { id } })
     if (!current || current.deleted) {
@@ -116,7 +119,7 @@ exports.update = async (req, res, next) => {
     // If stock or min_stock changed, trigger alert logic
     const stockChanged = payload.stock !== undefined && Number(payload.stock) !== Number(current.stock)
     const minStockChanged = payload.min_stock !== undefined && Number(payload.min_stock) !== Number(current.min_stock)
-    
+
     if (stockChanged || minStockChanged) {
       try {
         const newStock = Number(updated.stock)
@@ -153,8 +156,8 @@ exports.remove = async (req, res, next) => {
 exports.reportPdf = async (req, res, next) => {
   try {
     const products = await prisma.product.findMany({
-  where: { deleted: false },
-  include: { category: true, supplier: true, status: true },
+      where: { deleted: false },
+      include: { category: true, supplier: true, status: true },
       orderBy: { name: 'asc' },
     })
 
@@ -197,19 +200,19 @@ exports.reportPdf = async (req, res, next) => {
     drawSummary(startX + cardW + 12, startY, 'Unidades en inventario', String(totalUnidades), '#0b1220')
     drawSummary(startX + (cardW + 12) * 2, startY, 'Valor del inventario (GTQ)', money(valorInventario), '#0b1220')
 
-  // leave space after the summary cards and start the grid just below them
-  const gridTop = startY + cardH + 24
+    // leave space after the summary cards and start the grid just below them
+    const gridTop = startY + cardH + 24
 
-  // Product cards grid (2 columns)
-  const cols = 2
-  const gap = 12
-  const cardWidth = (pageWidth - gap) / cols
-  const cardHeight = 120
+    // Product cards grid (2 columns)
+    const cols = 2
+    const gap = 12
+    const cardWidth = (pageWidth - gap) / cols
+    const cardHeight = 120
 
-  // start x at left page margin
-  let x = doc.page.margins.left
-  // start y at a fixed position right below the summary cards to avoid overlapping
-  let y = gridTop
+    // start x at left page margin
+    let x = doc.page.margins.left
+    // start y at a fixed position right below the summary cards to avoid overlapping
+    let y = gridTop
 
     for (const p of products) {
       // wrap to next row when exceeding right boundary
@@ -335,7 +338,7 @@ exports.adjustStock = async (req, res, next) => {
     const { type, amount, reason, supplier_id, cost } = req.body || {}
     const id = req.params.id
 
-    if (!['add','remove'].includes(type)) return res.status(400).json({ message: 'type must be add or remove' })
+    if (!['add', 'remove'].includes(type)) return res.status(400).json({ message: 'type must be add or remove' })
     const qty = Number(amount || 0)
     if (!Number.isFinite(qty) || qty <= 0) return res.status(400).json({ message: 'amount must be a positive number' })
     if (!reason || typeof reason !== 'string') return res.status(400).json({ message: 'reason required' })
@@ -437,6 +440,241 @@ exports.restore = async (req, res, next) => {
     if (e.code === 'P2025') {
       return res.status(404).json({ message: 'Producto no encontrado' })
     }
+    next(e)
+  }
+}
+
+/**
+ * @swagger
+ * /api/products/import-template:
+ *   get:
+ *     summary: Descargar plantilla de importación
+ *     description: Genera un archivo Excel con la estructura para importar productos masivamente
+ *     tags: [Products]
+ *     produces:
+ *       - application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+ *     responses:
+ *       200:
+ *         description: Archivo Excel
+ */
+exports.getImportTemplate = async (req, res, next) => {
+  try {
+    const buffer = await generateTemplateWithCatalogs()
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    res.setHeader('Content-Disposition', 'attachment; filename="plantilla_productos.xlsx"')
+    res.send(buffer)
+  } catch (e) {
+    next(e)
+  }
+}
+
+/**
+ * @swagger
+ * /api/products/validate-import:
+ *   post:
+ *     summary: Validar archivo de importación
+ *     description: Parsea y valida un archivo Excel antes de importar. Retorna errores por fila.
+ *     tags: [Products]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               file:
+ *                 type: string
+ *                 format: binary
+ *     responses:
+ *       200:
+ *         description: Resultado de validación
+ */
+exports.validateImport = async (req, res, next) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: 'No se proporcionó archivo' })
+    }
+
+    const rows = parseExcel(req.file.buffer)
+    if (rows.length === 0) {
+      return res.status(400).json({ message: 'El archivo está vacío o no tiene datos válidos' })
+    }
+
+    const result = await validateBulkData(rows)
+    res.json(result)
+  } catch (e) {
+    next(e)
+  }
+}
+
+/**
+ * @swagger
+ * /api/products/bulk-import:
+ *   post:
+ *     summary: Importar productos masivamente
+ *     description: Importa productos desde un archivo Excel ya validado
+ *     tags: [Products]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               file:
+ *                 type: string
+ *                 format: binary
+ *     responses:
+ *       200:
+ *         description: Resultado de importación
+ *       400:
+ *         description: Error de validación
+ */
+exports.bulkImport = async (req, res, next) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: 'No se proporcionó archivo' })
+    }
+
+    const rows = parseExcel(req.file.buffer)
+    if (rows.length === 0) {
+      return res.status(400).json({ message: 'El archivo está vacío o no tiene datos válidos' })
+    }
+
+    // First validate
+    const validation = await validateBulkData(rows)
+
+    if (validation.invalidRows.length > 0) {
+      return res.status(400).json({
+        message: `${validation.invalidRows.length} filas tienen errores`,
+        ...validation
+      })
+    }
+
+    // All valid, proceed to import
+    const result = await bulkCreateProducts(validation.validRows)
+
+    res.json({
+      ok: true,
+      created: result.created,
+      message: `Se importaron ${result.created} productos exitosamente`
+    })
+  } catch (e) {
+    next(e)
+  }
+}
+
+/**
+ * @swagger
+ * /api/products/bulk-import-mapped:
+ *   post:
+ *     summary: Importar productos con campos mapeados
+ *     description: Importa productos desde JSON con campos ya mapeados por el frontend
+ *     tags: [Products]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               products:
+ *                 type: array
+ *                 items:
+ *                   type: object
+ *     responses:
+ *       200:
+ *         description: Resultado de importación
+ *       400:
+ *         description: Error de validación
+ */
+exports.bulkImportMapped = async (req, res, next) => {
+  try {
+    const { products } = req.body || {}
+
+    if (!products || !Array.isArray(products) || products.length === 0) {
+      return res.status(400).json({ message: 'No se proporcionaron productos para importar' })
+    }
+
+    // Validate by calling the existing validation service
+    const validation = await validateBulkData(products)
+
+    if (validation.invalidRows.length > 0) {
+      return res.status(400).json({
+        message: `${validation.invalidRows.length} productos tienen errores`,
+        ...validation
+      })
+    }
+
+    // All valid, proceed to import
+    const result = await bulkCreateProducts(validation.validRows)
+
+    res.json({
+      ok: true,
+      created: result.created,
+      skipped: result.skipped || 0,
+      errors: result.errors || [],
+      message: result.skipped > 0
+        ? `Se importaron ${result.created} productos (${result.skipped} omitidos por duplicados)`
+        : `Se importaron ${result.created} productos exitosamente`
+    })
+  } catch (e) {
+    next(e)
+  }
+}
+
+/**
+ * @swagger
+ * /api/products/validate-import-mapped:
+ *   post:
+ *     summary: Validar productos sin importar
+ *     description: Valida productos desde JSON y retorna errores sin crear registros
+ *     tags: [Products]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               products:
+ *                 type: array
+ *                 items:
+ *                   type: object
+ *     responses:
+ *       200:
+ *         description: Resultado de validación
+ */
+exports.validateImportMapped = async (req, res, next) => {
+  try {
+    const { products } = req.body || {}
+
+    if (!products || !Array.isArray(products) || products.length === 0) {
+      return res.status(400).json({ message: 'No se proporcionaron productos para validar' })
+    }
+
+    // Validate without importing
+    const validation = await validateBulkData(products)
+
+    res.json({
+      ok: true,
+      totals: {
+        total: products.length,
+        valid: validation.validRows.length,
+        invalid: validation.invalidRows.length
+      },
+      validRows: validation.validRows,
+      invalidRows: validation.invalidRows
+    })
+  } catch (e) {
     next(e)
   }
 }
