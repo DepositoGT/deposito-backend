@@ -14,11 +14,11 @@ exports.list = async (req, res, next) => {
     const pageSize = Math.min(1000, Math.max(1, Number(req.query.pageSize ?? 50)))
 
     const where = {}
-    
+
     if (status) {
       where.status = { name: String(status) }
     }
-    
+
     if (sale_id) {
       where.sale_id = String(sale_id)
     }
@@ -79,7 +79,7 @@ exports.list = async (req, res, next) => {
 exports.getById = async (req, res, next) => {
   try {
     const { id } = req.params
-    
+
     const returnRecord = await prisma.return.findUnique({
       where: { id },
       include: {
@@ -124,8 +124,8 @@ exports.create = async (req, res, next) => {
     const { sale_id, reason, items, notes } = req.body
 
     if (!sale_id || !Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({ 
-        message: 'sale_id e items son requeridos. items debe ser un array no vacío.' 
+      return res.status(400).json({
+        message: 'sale_id e items son requeridos. items debe ser un array no vacío.'
       })
     }
 
@@ -230,6 +230,20 @@ exports.create = async (req, res, next) => {
         throw err
       }
 
+
+      const nowGt = DateTime.now().setZone('America/Guatemala');
+      const returnDate = DateTime.utc(
+        nowGt.year,
+        nowGt.month,
+        nowGt.day,
+        nowGt.hour,
+        nowGt.minute,
+        nowGt.second,
+        nowGt.millisecond
+      ).toJSDate();
+
+      console.log('[RETURN DATE] Guatemala local time:', nowGt.toFormat('yyyy-MM-dd HH:mm:ss'));
+
       // 4. Crear la devolución
       const returnRecord = await tx.return.create({
         data: {
@@ -239,7 +253,7 @@ exports.create = async (req, res, next) => {
           total_refund: totalRefund,
           items_count: validatedItems.length,
           status_id: pendingStatus.id,
-          return_date: new Date()
+          return_date: returnDate
         }
       })
 
@@ -303,7 +317,7 @@ exports.updateStatus = async (req, res, next) => {
 
     // restore_stock es opcional y solo aplica cuando status_name = 'Aprobada'
     // Por defecto es true si no se especifica
-    const shouldRestoreStock = status_name === 'Aprobada' 
+    const shouldRestoreStock = status_name === 'Aprobada'
       ? (restore_stock !== undefined ? restore_stock : true)
       : false
 
@@ -366,7 +380,7 @@ exports.updateStatus = async (req, res, next) => {
           }
 
           const newQty = Math.max(0, saleItem.qty - returnItem.qty_returned)
-          
+
           await tx.saleItem.update({
             where: { id: returnItem.sale_item_id },
             data: { qty: newQty }
@@ -460,12 +474,24 @@ exports.updateStatus = async (req, res, next) => {
         console.log(`[RETURN STATUS UPDATE] Return ${id}: ${prevStatusName} -> ${newStatusName}. Stock NO será restaurado (restore_stock=false)`)
       }
 
+      // Get Guatemala time for processed_at
+      const nowGtProcessed = DateTime.now().setZone('America/Guatemala');
+      const processedDate = DateTime.utc(
+        nowGtProcessed.year,
+        nowGtProcessed.month,
+        nowGtProcessed.day,
+        nowGtProcessed.hour,
+        nowGtProcessed.minute,
+        nowGtProcessed.second,
+        nowGtProcessed.millisecond
+      ).toJSDate();
+
       // 5. Actualizar la devolución
       const updated = await tx.return.update({
         where: { id },
         data: {
           status_id: newStatus.id,
-          processed_at: (shouldProcessReturn || shouldRestoreStockOnly) ? new Date() : undefined
+          processed_at: (shouldProcessReturn || shouldRestoreStockOnly) ? processedDate : undefined
         },
         include: {
           sale: true,
