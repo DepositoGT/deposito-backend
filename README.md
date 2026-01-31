@@ -1,11 +1,13 @@
 # Deposito Backend
 
 Stack:
+
 - Node.js + Express
 - Prisma ORM
 - Supabase Postgres
 
 ## Configuración
+
 1. Configura `.env` con tus conexiones de Supabase (pooler y directa para migraciones):
 
 ```
@@ -19,16 +21,18 @@ PORT=3000
 ```
 
 2. Genera el cliente y crea el esquema en tu DB:
+
    - `npm run prisma:generate`
    - `npm run migrate`
-
 3. Ejecuta el seed de catálogos:
-   - `npm run seed`
 
+   - `npm run seed`
 4. Levanta el servidor:
+
    - `npm run dev`
 
 ## Scripts
+
 - dev: nodemon src/index.js
 - start: node src/index.js
 - seed: node prisma/seed.js
@@ -36,28 +40,34 @@ PORT=3000
 - prisma:generate: prisma generate
 
 ## Endpoints
+
 - GET /health: verifica conexión a la base de datos
 - GET /api: ping básico
 
 ### Ventas
-- GET /api/sales?period=month&status=Pendiente&page=1&pageSize=50
-   Lista ventas con filtros de periodo y estado.
-- POST /api/sales
-   Crea una venta (el backend asigna estado inicial 'Pendiente').
-- PATCH /api/sales/:id/status
-   Actualiza sólo el estado de una venta.
-   Body (uno de los dos campos):
-   {
-      "status_id": 2
-   }
-   o
-   {
-      "status_name": "Pagado"
-   }
-   Respuesta: objeto venta actualizado.
 
-## 📄 Licencia
+- GET /api/sales?period=month&status=Pendiente&page=1&pageSize=50
+  Lista ventas con filtros de periodo y estado.
+- POST /api/sales
+  Crea una venta (el backend asigna estado inicial 'Pendiente').
+- PATCH /api/sales/:id/status
+  Actualiza sólo el estado de una venta.
+  Body (uno de los dos campos):
+  {
+  "status_id": 2
+  }
+  o
+  {
+  "status_name": "Pagado"
+  }
+  Respuesta: objeto venta actualizado.
+
+## Licencia
 
 Este proyecto está bajo una **Licencia Propietaria**. El código fuente es visible públicamente, pero **NO está permitido** su uso, copia, modificación o distribución sin autorización expresa del propietario.
 
 Para más detalles, consulta el archivo [LICENSE](./LICENSE).
+
+## Propiedad
+
+Este repositorio está alojado bajo una organización de GitHub únicamente con propósitos administrativos. **Todos los derechos de propiedad intelectual pertenecen exclusivamente a Diego Patzán.**
