@@ -9,10 +9,17 @@
  */
 
 const { Router } = require('express')
+const multer = require('multer')
 const controller = require('../controllers/usuarios.controller')
 const { Auth, hasAnyRole } = require('../middlewares/autenticacion')
 
 const router = Router()
+
+// Configurar multer para almacenar en memoria
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 } // 5MB
+})
 
 /**
  * @openapi
@@ -158,6 +165,72 @@ router.get('/users', Auth, hasAnyRole('admin', '1'), controller.list)
 
 /**
  * @openapi
+ * /auth/users/template:
+ *   get:
+ *     tags: [Auth]
+ *     summary: Descargar plantilla Excel para importar usuarios
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Archivo Excel descargado
+ */
+router.get('/users/template', Auth, hasAnyRole('admin', '1'), controller.downloadTemplate)
+
+/**
+ * @openapi
+ * /auth/users/validate-import-mapped:
+ *   post:
+ *     tags: [Auth]
+ *     summary: Validar datos de usuarios mapeados para importación
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [rows]
+ *             properties:
+ *               rows:
+ *                 type: array
+ *                 items:
+ *                   type: object
+ *     responses:
+ *       200:
+ *         description: Resultado de validación
+ */
+router.post('/users/validate-import-mapped', Auth, hasAnyRole('admin', '1'), controller.validateImportMapped)
+
+/**
+ * @openapi
+ * /auth/users/bulk-import-mapped:
+ *   post:
+ *     tags: [Auth]
+ *     summary: Importar usuarios validados masivamente
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [rows]
+ *             properties:
+ *               rows:
+ *                 type: array
+ *                 items:
+ *                   type: object
+ *     responses:
+ *       200:
+ *         description: Importación completada
+ */
+router.post('/users/bulk-import-mapped', Auth, hasAnyRole('admin', '1'), controller.bulkImportMapped)
+
+/**
+ * @openapi
  * /auth/users/{id}:
  *   get:
  *     tags: [Auth]
@@ -256,5 +329,38 @@ router.delete('/users/:id', Auth, hasAnyRole('admin', '1'), controller.delete)
  *                   name: { type: string }
  */
 router.get('/roles', Auth, hasAnyRole('admin', '1'), controller.getRoles)
+
+/**
+ * @openapi
+ * /auth/users/{id}/photo:
+ *   post:
+ *     tags: [Auth]
+ *     summary: Subir foto de usuario
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string, format: uuid }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               file:
+ *                 type: string
+ *                 format: binary
+ *     responses:
+ *       200:
+ *         description: Foto subida exitosamente
+ *       400:
+ *         description: Archivo inválido o muy grande
+ *       404:
+ *         description: Usuario no encontrado
+ */
+router.post('/users/:id/photo', Auth, hasAnyRole('admin', '1'), upload.single('file'), controller.uploadPhoto)
 
 module.exports = router

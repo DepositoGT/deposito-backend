@@ -372,10 +372,19 @@ exports.updateStatus = async (req, res, next) => {
         throw err
       }
 
-      // 4. Si se completa, actualizar venta y restaurar stock
-      const shouldProcessReturn = (newStatusName === 'Completada') && prevStatusName !== 'Completada'
+      // 4. Lógica de procesamiento según transición de estados
+      const isCompletingFromApproved = (newStatusName === 'Completada') && prevStatusName === 'Aprobada'
+      const isCompletingFromPending = (newStatusName === 'Completada') && prevStatusName === 'Pendiente'
+      const isApproving = (newStatusName === 'Aprobada') && prevStatusName === 'Pendiente'
 
-      if (shouldProcessReturn) {
+
+      // CASO 1: Si viene de "Aprobada" a "Completada", SOLO cambiar el estado, NO procesar nada
+      if (isCompletingFromApproved) {
+        console.log(`[RETURN STATUS UPDATE] Return ${id}: ${prevStatusName} -> ${newStatusName}. Solo cambiando estado (sin procesar venta ni restaurar stock)`)
+        // NO hacer nada más, solo continuar para actualizar el estado
+      }
+      // CASO 2: Si se completa directamente desde "Pendiente", procesar venta y restaurar stock
+      else if (isCompletingFromPending) {
         console.log(`[RETURN PROCESS] Return ${id}: ${prevStatusName} -> ${newStatusName}. Procesando devolución...`)
 
         // 4a. Actualizar sale_items: reducir cantidades vendidas
@@ -419,7 +428,9 @@ exports.updateStatus = async (req, res, next) => {
           console.log(`[RETURN PROCESS] Sale ${currentReturn.sale_id}: total_returned ${sale.total_returned} -> ${newTotalReturned}, adjusted_total ${sale.adjusted_total} -> ${newAdjustedTotal}`)
         }
 
-        // 4c. Restaurar stock de productos
+        // 4c. Restaurar stock de productos (solo cuando se completa desde Pendiente)
+        console.log(`[RETURN STOCK RESTORE] Return ${id}: ${prevStatusName} -> ${newStatusName}. Restaurando stock al completar...`)
+        
         // Agrupar cantidades por producto
         const productQtyMap = new Map()
         currentReturn.return_items.forEach(item => {
@@ -448,10 +459,8 @@ exports.updateStatus = async (req, res, next) => {
         console.log(`[RETURN STOCK RESTORE] Alertas de stock actualizadas`)
       }
 
-      // 4 ALT. Si se aprueba (pero no completa), restaurar stock solo si restore_stock es true
-      const shouldRestoreStockOnly = (newStatusName === 'Aprobada') && prevStatusName !== 'Completada' && prevStatusName !== 'Aprobada' && shouldRestoreStock
-
-      if (shouldRestoreStockOnly) {
+      // CASO 3: Si se aprueba desde "Pendiente", restaurar stock solo si restore_stock es true
+      if (isApproving && shouldRestoreStock) {
         console.log(`[RETURN STOCK RESTORE] Return ${id}: ${prevStatusName} -> ${newStatusName}. Restaurando stock solamente...`)
 
         // Agrupar cantidades por producto
@@ -480,7 +489,7 @@ exports.updateStatus = async (req, res, next) => {
         // Actualizar alertas de stock
         await ensureStockAlertsBatch(tx, updatedProducts)
         console.log(`[RETURN STOCK RESTORE] Alertas de stock actualizadas`)
-      } else if (newStatusName === 'Aprobada' && !shouldRestoreStock) {
+      } else if (isApproving && !shouldRestoreStock) {
         console.log(`[RETURN STATUS UPDATE] Return ${id}: ${prevStatusName} -> ${newStatusName}. Stock NO será restaurado (restore_stock=false)`)
       }
 
@@ -497,11 +506,15 @@ exports.updateStatus = async (req, res, next) => {
       ).toJSDate();
 
       // 5. Actualizar la devolución
+      // processed_at solo se actualiza si se procesa la devolución o se restaura stock
+      // Si viene de "Aprobada" a "Completada", mantener el processed_at que se estableció al aprobar
+      const shouldUpdateProcessedAt = isCompletingFromPending || (isApproving && shouldRestoreStock)
+      console.log('[RETURN DEBUG] shouldUpdateProcessedAt:', shouldUpdateProcessedAt)
       const updated = await tx.return.update({
         where: { id },
         data: {
           status_id: newStatus.id,
-          processed_at: (shouldProcessReturn || shouldRestoreStockOnly) ? processedDate : undefined
+          processed_at: shouldUpdateProcessedAt ? processedDate : (currentReturn.processed_at || (isCompletingFromApproved ? processedDate : undefined))
         },
         include: {
           sale: true,
@@ -516,8 +529,8 @@ exports.updateStatus = async (req, res, next) => {
 
       return {
         ...updated,
-        _saleAdjustment: shouldProcessReturn ? 'sale_updated' : 'none',
-        _stockAdjustment: (shouldProcessReturn || shouldRestoreStockOnly) ? 'stock_restored' : 'none',
+        _saleAdjustment: isCompletingFromPending ? 'sale_updated' : 'none',
+        _stockAdjustment: (isCompletingFromPending || (isApproving && shouldRestoreStock)) ? 'stock_restored' : 'none',
         _transition: `${prevStatusName} -> ${newStatusName}`
       }
     }, {
