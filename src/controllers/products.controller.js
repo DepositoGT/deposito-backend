@@ -23,14 +23,52 @@ const { parseExcel, validateBulkData, bulkCreateProducts, generateTemplateWithCa
 
 exports.list = async (req, res, next) => {
   try {
-    const { includeDeleted } = req.query
+    const page = Math.max(1, Number(req.query.page ?? 1))
+    const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 20)))
+    const { includeDeleted, search, category } = req.query || {}
+    
     const where = includeDeleted === 'true' ? {} : { deleted: false }
+    
+    // Filtro de búsqueda
+    if (search) {
+      where.OR = [
+        { name: { contains: String(search), mode: 'insensitive' } },
+        { brand: { contains: String(search), mode: 'insensitive' } },
+        { barcode: { contains: String(search), mode: 'insensitive' } }
+      ]
+    }
+    
+    // Filtro de categoría
+    if (category && category !== 'all') {
+      where.category = {
+        name: { equals: String(category), mode: 'insensitive' }
+      }
+    }
+    
+    const totalItems = await prisma.product.count({ where })
+    const totalPages = Math.max(1, Math.ceil(totalItems / pageSize))
+    const safePage = Math.min(page, totalPages)
+    
     const products = await prisma.product.findMany({
       where,
       include: { category: true, supplier: true, status: true },
       orderBy: { name: 'asc' },
+      skip: (safePage - 1) * pageSize,
+      take: pageSize,
     })
-    res.json(products)
+    
+    const nextPage = safePage < totalPages ? safePage + 1 : null
+    const prevPage = safePage > 1 ? safePage - 1 : null
+    
+    res.json({
+      items: products,
+      page: safePage,
+      pageSize,
+      totalPages,
+      totalItems,
+      nextPage,
+      prevPage
+    })
   } catch (e) { next(e) }
 }
 
