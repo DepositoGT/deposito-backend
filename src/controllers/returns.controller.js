@@ -378,10 +378,53 @@ exports.updateStatus = async (req, res, next) => {
       const isApproving = (newStatusName === 'Aprobada') && prevStatusName === 'Pendiente'
 
 
-      // CASO 1: Si viene de "Aprobada" a "Completada", SOLO cambiar el estado, NO procesar nada
+      // CASO 1: Si viene de "Aprobada" a "Completada", actualizar venta pero NO restaurar stock (ya se restauró al aprobar)
       if (isCompletingFromApproved) {
-        console.log(`[RETURN STATUS UPDATE] Return ${id}: ${prevStatusName} -> ${newStatusName}. Solo cambiando estado (sin procesar venta ni restaurar stock)`)
-        // NO hacer nada más, solo continuar para actualizar el estado
+        console.log(`[RETURN PROCESS] Return ${id}: ${prevStatusName} -> ${newStatusName}. Actualizando venta (sin restaurar stock, ya restaurado al aprobar)...`)
+
+        // 4a. Actualizar sale_items: reducir cantidades vendidas
+        for (const returnItem of currentReturn.return_items) {
+          const saleItem = await tx.saleItem.findUnique({
+            where: { id: returnItem.sale_item_id }
+          })
+
+          if (!saleItem) {
+            console.warn(`[RETURN PROCESS] SaleItem ${returnItem.sale_item_id} no encontrado`)
+            continue
+          }
+
+          const newQty = Math.max(0, saleItem.qty - returnItem.qty_returned)
+
+          await tx.saleItem.update({
+            where: { id: returnItem.sale_item_id },
+            data: { qty: newQty }
+          })
+
+          console.log(`[RETURN PROCESS] SaleItem ${returnItem.sale_item_id}: ${saleItem.qty} -> ${newQty} unidades`)
+        }
+
+        // 4b. Actualizar sale: incrementar total_returned y recalcular adjusted_total
+        const sale = await tx.sale.findUnique({
+          where: { id: currentReturn.sale_id }
+        })
+
+        if (sale) {
+          const newTotalReturned = Number(sale.total_returned || 0) + Number(currentReturn.total_refund)
+          const newAdjustedTotal = Number(sale.total) - newTotalReturned
+
+          await tx.sale.update({
+            where: { id: currentReturn.sale_id },
+            data: {
+              total_returned: newTotalReturned,
+              adjusted_total: newAdjustedTotal
+            }
+          })
+
+          console.log(`[RETURN PROCESS] Sale ${currentReturn.sale_id}: total_returned ${sale.total_returned} -> ${newTotalReturned}, adjusted_total ${sale.adjusted_total} -> ${newAdjustedTotal}`)
+        }
+
+        // NO restaurar stock porque ya se restauró al aprobar
+        console.log(`[RETURN PROCESS] Stock NO restaurado (ya se restauró al aprobar)`)
       }
       // CASO 2: Si se completa directamente desde "Pendiente", procesar venta y restaurar stock
       else if (isCompletingFromPending) {
@@ -506,9 +549,8 @@ exports.updateStatus = async (req, res, next) => {
       ).toJSDate();
 
       // 5. Actualizar la devolución
-      // processed_at solo se actualiza si se procesa la devolución o se restaura stock
-      // Si viene de "Aprobada" a "Completada", mantener el processed_at que se estableció al aprobar
-      const shouldUpdateProcessedAt = isCompletingFromPending || (isApproving && shouldRestoreStock)
+      // processed_at se actualiza si se procesa la devolución (actualizar venta) o se restaura stock
+      const shouldUpdateProcessedAt = isCompletingFromPending || isCompletingFromApproved || (isApproving && shouldRestoreStock)
       console.log('[RETURN DEBUG] shouldUpdateProcessedAt:', shouldUpdateProcessedAt)
       const updated = await tx.return.update({
         where: { id },
@@ -529,7 +571,7 @@ exports.updateStatus = async (req, res, next) => {
 
       return {
         ...updated,
-        _saleAdjustment: isCompletingFromPending ? 'sale_updated' : 'none',
+        _saleAdjustment: (isCompletingFromPending || isCompletingFromApproved) ? 'sale_updated' : 'none',
         _stockAdjustment: (isCompletingFromPending || (isApproving && shouldRestoreStock)) ? 'stock_restored' : 'none',
         _transition: `${prevStatusName} -> ${newStatusName}`
       }
