@@ -162,13 +162,22 @@ model Role {
 }
 
 model User {
-  id       String  @id @default(uuid()) @db.Uuid
-  name     String  @db.VarChar(150)
-  email    String  @unique @db.VarChar(150)
-  password String  @db.VarChar(255)
-  role_id  Int
-  role     Role    @relation(fields: [role_id], references: [id])
-  alerts   Alert[] @relation("AlertAssignedTo")
+  id          String  @id @default(uuid()) @db.Uuid
+  name        String  @db.VarChar(150)
+  email       String  @unique @db.VarChar(150)
+  password    String  @db.VarChar(255)
+  role_id     Int
+  role        Role    @relation(fields: [role_id], references: [id])
+  alerts      Alert[] @relation("AlertAssignedTo")
+  
+  // Campos de empleado
+  is_employee Boolean @default(false)
+  photo_url   String? @db.VarChar(500)
+  phone       String? @db.VarChar(50)
+  address     String? @db.Text
+  hire_date   DateTime? // Fecha de contratación
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
 
   @@map("users")
 }
