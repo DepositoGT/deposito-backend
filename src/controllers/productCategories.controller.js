@@ -31,8 +31,15 @@ const { bulkValidateCatalogs, bulkCreateCatalogs } = require('../services/catalo
  */
 exports.list = async (req, res, next) => {
   try {
+    const page = Math.max(1, Number(req.query.page ?? 1))
+    const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 20)))
     const { includeDeleted } = req.query
     const where = includeDeleted === 'true' ? {} : { deleted: false }
+    
+    const totalItems = await prisma.productCategory.count({ where })
+    const totalPages = Math.max(1, Math.ceil(totalItems / pageSize))
+    const safePage = Math.min(page, totalPages)
+    
     const categories = await prisma.productCategory.findMany({ 
       where,
       orderBy: { name: 'asc' },
@@ -43,9 +50,23 @@ exports.list = async (req, res, next) => {
             suppliers: { where: { deleted: false } } 
           } 
         } 
-      }
+      },
+      skip: (safePage - 1) * pageSize,
+      take: pageSize,
     })
-    res.json(categories)
+    
+    const nextPage = safePage < totalPages ? safePage + 1 : null
+    const prevPage = safePage > 1 ? safePage - 1 : null
+    
+    res.json({
+      items: categories,
+      page: safePage,
+      pageSize,
+      totalPages,
+      totalItems,
+      nextPage,
+      prevPage
+    })
   } catch (e) { next(e) }
 }
 
