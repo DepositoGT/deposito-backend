@@ -13,10 +13,34 @@ const { DateTime } = require('luxon')
 
 exports.list = async (req, res, next) => {
   try {
+    const page = Math.max(1, Number(req.query.page ?? 1))
+    const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 20)))
+    const { search, category_id } = req.query || {}
+    
+    const where = { deleted: false }
+    
+    if (search) {
+      where.OR = [
+        { name: { contains: String(search), mode: 'insensitive' } },
+        { contact: { contains: String(search), mode: 'insensitive' } },
+        { email: { contains: String(search), mode: 'insensitive' } }
+      ]
+    }
+    
+    if (category_id) {
+      where.category_id = Number(category_id)
+    }
+    
+    const totalItems = await prisma.supplier.count({ where })
+    const totalPages = Math.max(1, Math.ceil(totalItems / pageSize))
+    const safePage = Math.min(page, totalPages)
+    
     const items = await prisma.supplier.findMany({
-      where: { deleted: false },
+      where,
       include: { category: true, status: true, payment_term: true, productsList: true },
       orderBy: { name: 'asc' },
+      skip: (safePage - 1) * pageSize,
+      take: pageSize,
     })
 
     // Map suppliers adding computed totalPurchases (numeric) and lastOrder (ISO) for frontend expectations
@@ -35,7 +59,19 @@ exports.list = async (req, res, next) => {
         lastOrder,
       }
     })
-    res.json(adapted)
+    
+    const nextPage = safePage < totalPages ? safePage + 1 : null
+    const prevPage = safePage > 1 ? safePage - 1 : null
+    
+    res.json({
+      items: adapted,
+      page: safePage,
+      pageSize,
+      totalPages,
+      totalItems,
+      nextPage,
+      prevPage
+    })
   } catch (e) { next(e) }
 }
 
