@@ -142,11 +142,31 @@ function validateUserRow(row, rowIndex, rolesMap, existingEmails, batchEmails) {
     // Optional: hire_date
     const hireDateStr = String(normalizedRow.hire_date || '').trim()
     if (hireDateStr) {
-        const hireDate = new Date(hireDateStr)
-        if (isNaN(hireDate.getTime())) {
-            errors.push(`Fecha de contratación inválida: "${hireDateStr}". Use formato YYYY-MM-DD`)
+        let hireDate = null
+
+        // Detectar posibles fechas en formato serial de Excel (solo dígitos)
+        if (/^\d+(\.\d+)?$/.test(hireDateStr)) {
+            const serial = Number(hireDateStr)
+            if (!isNaN(serial)) {
+                const excelEpoch = new Date(Date.UTC(1899, 11, 30)) // base Excel
+                hireDate = new Date(excelEpoch.getTime() + serial * 24 * 60 * 60 * 1000)
+            }
         } else {
-            data.hire_date = hireDate
+            const parsed = new Date(hireDateStr)
+            if (!isNaN(parsed.getTime())) {
+                hireDate = parsed
+            }
+        }
+
+        if (!hireDate || isNaN(hireDate.getTime())) {
+            errors.push(`Fecha de contratación inválida: "${hireDateStr}". Use formato YYYY-MM-DD o una fecha válida.`)
+        } else {
+            const year = hireDate.getUTCFullYear()
+            if (year < 1900 || year > 2100) {
+                errors.push(`Fecha de contratación fuera de rango válido (1900-2100): "${hireDateStr}".`)
+            } else {
+                data.hire_date = hireDate
+            }
         }
     }
 
