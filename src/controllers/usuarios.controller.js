@@ -105,7 +105,18 @@ exports.register = async (req, res, next) => {
       ...(address && { address }),
       ...(hire_date && { hire_date: new Date(hire_date) })
     }
-    const user = await prisma.user.create({ data: userData, include: { role: true } })
+    const user = await prisma.user.create({
+      data: userData,
+      include: {
+        role: {
+          include: {
+            permissions: {
+              include: { permission: true }
+            }
+          }
+        }
+      }
+    })
     const token = crearToken(user)
     res.status(201).json({
       user: {
@@ -119,6 +130,9 @@ exports.register = async (req, res, next) => {
         phone: user.phone,
         address: user.address,
         hire_date: user.hire_date,
+        permissions: Array.isArray(user.role?.permissions)
+          ? user.role.permissions.map((rp) => rp.permission?.code).filter(Boolean)
+          : [],
       },
       token,
     })
@@ -130,7 +144,18 @@ exports.login = async (req, res, next) => {
   const { email, password } = req.body || {}
   console.log('Login payload received:', { email })
     // Fetch user including role so we can return role properties to the client
-    const user = await prisma.user.findUnique({ where: { email }, include: { role: true } })
+    const user = await prisma.user.findUnique({
+      where: { email },
+      include: {
+        role: {
+          include: {
+            permissions: {
+              include: { permission: true }
+            }
+          }
+        }
+      }
+    })
     if (!user) return res.status(401).json({ message: 'Credenciales inválidas' })
 
     const ok = await bcrypt.compare(password, user.password)
@@ -149,6 +174,9 @@ exports.login = async (req, res, next) => {
         phone: user.phone,
         address: user.address,
         hire_date: user.hire_date,
+        permissions: Array.isArray(user.role?.permissions)
+          ? user.role.permissions.map((rp) => rp.permission?.code).filter(Boolean)
+          : [],
       },
       token,
     })
@@ -273,6 +301,275 @@ exports.getRoles = async (req, res, next) => {
   try {
     const roles = await prisma.role.findMany({ orderBy: { id: 'asc' } })
     res.json(roles)
+  } catch (e) { next(e) }
+}
+
+// GET /api/auth/permissions - Listar todos los permisos disponibles
+exports.getPermissions = async (req, res, next) => {
+  try {
+    const permissions = await prisma.permission.findMany({
+      orderBy: { code: 'asc' }
+    })
+    res.json(permissions)
+  } catch (e) { next(e) }
+}
+
+// GET /api/auth/roles/with-permissions - Listar roles con sus permisos asociados (paginado)
+exports.getRolesWithPermissions = async (req, res, next) => {
+  try {
+    const page = Math.max(1, Number(req.query.page ?? 1))
+    const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 20)))
+
+    const where = {}
+
+    const totalItems = await prisma.role.count({ where })
+    const totalPages = Math.max(1, Math.ceil(totalItems / pageSize))
+    const safePage = Math.min(page, totalPages)
+
+    const roles = await prisma.role.findMany({
+      where,
+      orderBy: { id: 'asc' },
+      skip: (safePage - 1) * pageSize,
+      take: pageSize,
+      include: {
+        permissions: {
+          include: { permission: true }
+        }
+      }
+    })
+
+    const items = roles.map(role => ({
+      id: role.id,
+      name: role.name,
+      permissions: role.permissions
+        .map(rp => rp.permission)
+        .filter(Boolean)
+        .map(p => ({
+          id: p.id,
+          code: p.code,
+          name: p.name,
+          description: p.description
+        }))
+    }))
+
+    const nextPage = safePage < totalPages ? safePage + 1 : null
+    const prevPage = safePage > 1 ? safePage - 1 : null
+
+    res.json({
+      items,
+      page: safePage,
+      pageSize,
+      totalPages,
+      totalItems,
+      nextPage,
+      prevPage
+    })
+  } catch (e) { next(e) }
+}
+
+// GET /api/auth/roles/:id/with-permissions - Obtener un rol con sus permisos
+exports.getRoleWithPermissions = async (req, res, next) => {
+  try {
+    const { id } = req.params
+    const roleId = Number(id)
+    if (Number.isNaN(roleId)) {
+      return res.status(400).json({ message: 'ID de rol inválido' })
+    }
+
+    const role = await prisma.role.findUnique({
+      where: { id: roleId },
+      include: {
+        permissions: { include: { permission: true } },
+        users: true
+      }
+    })
+
+    if (!role) {
+      return res.status(404).json({ message: 'Rol no encontrado' })
+    }
+
+    const mapped = {
+      id: role.id,
+      name: role.name,
+      permissions: role.permissions
+        .map(rp => rp.permission)
+        .filter(Boolean)
+        .map(p => ({
+          id: p.id,
+          code: p.code,
+          name: p.name,
+          description: p.description
+        })),
+      usersCount: role.users.length
+    }
+
+    res.json(mapped)
+  } catch (e) { next(e) }
+}
+
+// POST /api/auth/roles - Crear rol con permisos opcionales
+exports.createRole = async (req, res, next) => {
+  try {
+    const { name, permissions = [] } = req.body || {}
+    if (!name || String(name).trim() === '') {
+      return res.status(400).json({ message: 'El nombre del rol es requerido' })
+    }
+
+    const existing = await prisma.role.findUnique({ where: { name } })
+    if (existing) {
+      return res.status(409).json({ message: 'Ya existe un rol con ese nombre' })
+    }
+
+    const role = await prisma.role.create({ data: { name } })
+
+    if (Array.isArray(permissions) && permissions.length > 0) {
+      const perms = await prisma.permission.findMany({
+        where: { code: { in: permissions.map(String) } }
+      })
+      if (perms.length) {
+        await prisma.rolePermission.createMany({
+          data: perms.map(p => ({ role_id: role.id, permission_id: p.id })),
+          skipDuplicates: true
+        })
+      }
+    }
+
+    const created = await prisma.role.findUnique({
+      where: { id: role.id },
+      include: {
+        permissions: { include: { permission: true } }
+      }
+    })
+
+    res.status(201).json(created)
+  } catch (e) { next(e) }
+}
+
+// PUT /api/auth/roles/:id - Actualizar nombre y permisos de un rol
+exports.updateRole = async (req, res, next) => {
+  try {
+    const { id } = req.params
+    const { name, permissions } = req.body || {}
+
+    const roleId = Number(id)
+    if (Number.isNaN(roleId)) {
+      return res.status(400).json({ message: 'ID de rol inválido' })
+    }
+
+    const role = await prisma.role.findUnique({ where: { id: roleId } })
+    if (!role) {
+      return res.status(404).json({ message: 'Rol no encontrado' })
+    }
+
+    // No permitir renombrar el rol admin por seguridad
+    let newName = undefined
+    if (name && String(name).trim() !== '' && role.name.toLowerCase() !== 'admin') {
+      newName = String(name).trim()
+    }
+
+    // Actualizar nombre si aplica
+    if (newName) {
+      await prisma.role.update({
+        where: { id: roleId },
+        data: { name: newName }
+      })
+    }
+
+    // Actualizar permisos si se envía arreglo
+    if (Array.isArray(permissions)) {
+      // No permitir cambiar permisos del rol admin: siempre tiene todos
+      if (role.name.toLowerCase() === 'admin') {
+        // Ignorar cambios de permisos y devolver estado actual
+      } else {
+        // Borrar permisos actuales del rol
+        await prisma.rolePermission.deleteMany({ where: { role_id: roleId } })
+
+        if (permissions.length > 0) {
+          const perms = await prisma.permission.findMany({
+            where: { code: { in: permissions.map(String) } }
+          })
+          if (perms.length) {
+            await prisma.rolePermission.createMany({
+              data: perms.map(p => ({ role_id: roleId, permission_id: p.id })),
+              skipDuplicates: true
+            })
+          }
+        }
+      }
+    }
+
+    const updated = await prisma.role.findUnique({
+      where: { id: roleId },
+      include: {
+        permissions: { include: { permission: true } }
+      }
+    })
+
+    res.json(updated)
+  } catch (e) { next(e) }
+}
+
+// DELETE /api/auth/roles/:id - Eliminar rol y reasignar usuarios
+exports.deleteRole = async (req, res, next) => {
+  try {
+    const { id } = req.params
+    const roleId = Number(id)
+    if (Number.isNaN(roleId)) {
+      return res.status(400).json({ message: 'ID de rol inválido' })
+    }
+
+    const role = await prisma.role.findUnique({
+      where: { id: roleId },
+      include: { users: true }
+    })
+
+    if (!role) {
+      return res.status(404).json({ message: 'Rol no encontrado' })
+    }
+
+    // No permitir eliminar el rol admin
+    if (role.name.toLowerCase() === 'admin') {
+      return res.status(400).json({ message: 'No se puede eliminar el rol administrador' })
+    }
+
+    const result = await prisma.$transaction(async (tx) => {
+      // Buscar o crear un rol "Sin rol" sin permisos, usado como contenedor neutro
+      let fallbackRole = await tx.role.findFirst({
+        where: { name: 'Sin rol' },
+      })
+
+      if (!fallbackRole) {
+        fallbackRole = await tx.role.create({
+          data: { name: 'Sin rol' },
+        })
+      }
+
+      // Reasignar todos los usuarios que tenían este rol al rol "Sin rol"
+      const reassigned = await tx.user.updateMany({
+        where: { role_id: roleId },
+        data: { role_id: fallbackRole.id },
+      })
+
+      // Eliminar las asociaciones de permisos del rol a eliminar
+      await tx.rolePermission.deleteMany({ where: { role_id: roleId } })
+
+      // Eliminar el rol
+      await tx.role.delete({ where: { id: roleId } })
+
+      return {
+        reassignedUsers: reassigned.count,
+        fallbackRoleId: fallbackRole.id,
+        fallbackRoleName: fallbackRole.name,
+      }
+    })
+
+    res.json({
+      message: 'Rol eliminado correctamente',
+      id: roleId,
+      reassignedUsers: result.reassignedUsers,
+      fallbackRoleId: result.fallbackRoleId,
+      fallbackRoleName: result.fallbackRoleName,
+    })
   } catch (e) { next(e) }
 }
 

@@ -10,7 +10,7 @@
 
 const { Router } = require('express')
 const multer = require('multer')
-const { Auth, hasAnyRole } = require('../middlewares/autenticacion')
+const { Auth, hasAnyRole, hasPermission } = require('../middlewares/autenticacion')
 const Products = require('../controllers/products.controller')
 
 // Configure multer for memory storage (keep file in buffer)
@@ -94,7 +94,7 @@ router.get('/', Products.list)
  *               items:
  *                 $ref: '#/components/schemas/Product'
  */
-router.get('/critical', Auth, hasAnyRole('admin'), Products.critical)
+router.get('/critical', Auth, hasPermission('products.view', 'alerts.view'), Products.critical)
 
 /**
  * @openapi
@@ -155,7 +155,7 @@ router.get('/import-template', Products.getImportTemplate)
  *       200:
  *         description: Resultado de validación
  */
-router.post('/validate-import', Auth, hasAnyRole('admin'), upload.single('file'), Products.validateImport)
+router.post('/validate-import', Auth, hasPermission('products.import'), upload.single('file'), Products.validateImport)
 
 /**
  * @openapi
@@ -182,7 +182,7 @@ router.post('/validate-import', Auth, hasAnyRole('admin'), upload.single('file')
  *       400:
  *         description: Error de validación
  */
-router.post('/bulk-import', Auth, hasAnyRole('admin'), upload.single('file'), Products.bulkImport)
+router.post('/bulk-import', Auth, hasPermission('products.import'), upload.single('file'), Products.bulkImport)
 
 /**
  * @openapi
@@ -208,7 +208,7 @@ router.post('/bulk-import', Auth, hasAnyRole('admin'), upload.single('file'), Pr
  *       400:
  *         description: Error de validación
  */
-router.post('/bulk-import-mapped', Auth, hasAnyRole('admin'), Products.bulkImportMapped)
+router.post('/bulk-import-mapped', Auth, hasPermission('products.import'), Products.bulkImportMapped)
 
 /**
  * @openapi
@@ -232,7 +232,7 @@ router.post('/bulk-import-mapped', Auth, hasAnyRole('admin'), Products.bulkImpor
  *       200:
  *         description: Resultado de validación
  */
-router.post('/validate-import-mapped', Auth, hasAnyRole('admin'), Products.validateImportMapped)
+router.post('/validate-import-mapped', Auth, hasPermission('products.import'), Products.validateImportMapped)
 
 /**
  * @openapi
@@ -251,7 +251,7 @@ router.post('/validate-import-mapped', Auth, hasAnyRole('admin'), Products.valid
  *     responses:
  *       201: { description: Creado }
  */
-router.post('/', Auth, hasAnyRole('admin'), Products.create)
+router.post('/', Auth, hasPermission('products.create'), Products.create)
 
 /**
  * @openapi
@@ -297,7 +297,7 @@ router.get('/:id', Products.getOne)
  *     responses:
  *       200: { description: OK }
  */
-router.put('/:id', Auth, hasAnyRole('admin'), Products.update)
+router.put('/:id', Auth, hasPermission('products.edit'), Products.update)
 
 /**
  * @openapi
@@ -315,7 +315,7 @@ router.put('/:id', Auth, hasAnyRole('admin'), Products.update)
  *     responses:
  *       200: { description: OK }
  */
-router.delete('/:id', Auth, hasAnyRole('admin'), Products.remove)
+router.delete('/:id', Auth, hasPermission('products.delete'), Products.remove)
 
 /**
  * @openapi
@@ -346,7 +346,7 @@ router.delete('/:id', Auth, hasAnyRole('admin'), Products.remove)
  *       200: { description: OK }
  *       400: { description: Bad request }
  */
-router.post('/:id/stock-adjust', Auth, hasAnyRole('admin'), Products.adjustStock)
+router.post('/:id/stock-adjust', Auth, hasPermission('products.adjust_stock'), Products.adjustStock)
 
 /**
  * @openapi
@@ -362,7 +362,7 @@ router.post('/:id/stock-adjust', Auth, hasAnyRole('admin'), Products.adjustStock
  *     responses:
  *       200: { description: OK }
  */
-router.patch('/:id/restore', Auth, hasAnyRole('admin'), Products.restore)
+router.patch('/:id/restore', Auth, hasPermission('products.adjust_stock', 'products.edit'), Products.restore)
 
 module.exports = router
 
