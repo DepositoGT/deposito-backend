@@ -9,7 +9,7 @@
  */
 
 const { Router } = require('express')
-const { Auth, hasAnyRole } = require('../middlewares/autenticacion')
+const { Auth, hasAnyRole, hasPermission } = require('../middlewares/autenticacion')
 const Suppliers = require('../controllers/suppliers.controller')
 
 const router = Router()
@@ -100,7 +100,7 @@ router.get('/template', Suppliers.downloadTemplate)
  *       200:
  *         description: Resultado de importación
  */
-router.post('/bulk-import-mapped', Auth, hasAnyRole('admin'), Suppliers.bulkImportMapped)
+router.post('/bulk-import-mapped', Auth, hasPermission('suppliers.import'), Suppliers.bulkImportMapped)
 
 /**
  * @openapi
@@ -125,7 +125,7 @@ router.post('/bulk-import-mapped', Auth, hasAnyRole('admin'), Suppliers.bulkImpo
  *       200:
  *         description: Resultado de validación
  */
-router.post('/validate-import-mapped', Auth, hasAnyRole('admin'), Suppliers.validateImportMapped)
+router.post('/validate-import-mapped', Auth, hasPermission('suppliers.import'), Suppliers.validateImportMapped)
 
 // ========== STANDARD CRUD ROUTES ==========
 
@@ -165,7 +165,7 @@ router.get('/', Suppliers.list)
  *     responses:
  *       201: { description: Creado }
  */
-router.post('/', Auth, hasAnyRole('admin'), Suppliers.create)
+router.post('/', Auth, hasPermission('suppliers.create'), Suppliers.create)
 
 /**
  * @openapi
@@ -211,7 +211,7 @@ router.get('/:id', Suppliers.getOne)
  *     responses:
  *       200: { description: OK }
  */
-router.put('/:id', Auth, hasAnyRole('admin'), Suppliers.update)
+router.put('/:id', Auth, hasPermission('suppliers.edit'), Suppliers.update)
 
 /**
  * @openapi
@@ -229,6 +229,6 @@ router.put('/:id', Auth, hasAnyRole('admin'), Suppliers.update)
  *     responses:
  *       200: { description: OK }
  */
-router.delete('/:id', Auth, hasAnyRole('admin'), Suppliers.remove)
+router.delete('/:id', Auth, hasPermission('suppliers.delete'), Suppliers.remove)
 
 module.exports = router
