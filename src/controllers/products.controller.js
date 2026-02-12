@@ -8,7 +8,7 @@
  * For licensing inquiries: GitHub @dpatzan2
  */
 
-const { prisma } = require('../models/prisma')
+const { prisma, prismaTransaction } = require('../models/prisma')
 const PDFDocument = require('pdfkit')
 // Luxon DateTime (single import; removed duplicate that caused startup SyntaxError)
 const { DateTime } = require('luxon')
@@ -123,7 +123,8 @@ exports.create = async (req, res, next) => {
     }
 
     // create product and, if initial stock > 0, create a purchase log in the same transaction
-    const result = await prisma.$transaction(async (tx) => {
+    // Use prismaTransaction (DIRECT_URL) for transactions as pooled connections don't support them
+    const result = await prismaTransaction.$transaction(async (tx) => {
       let product
       try {
         product = await tx.product.create({ data: safePayload })
@@ -554,7 +555,8 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
     ))
 
     // Run in transaction: create audit record, update products, create purchase logs, update supplier
-    const result = await prisma.$transaction(async (tx) => {
+    // Use prismaTransaction (DIRECT_URL) for transactions as pooled connections don't support them
+    const result = await prismaTransaction.$transaction(async (tx) => {
       // Verify supplier exists
       const supplier = await tx.supplier.findUnique({ where: { id: supplier_id } })
       if (!supplier || supplier.deleted) {
@@ -655,6 +657,9 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
         purchaseLogs,
         totalPurchaseValue,
       }
+    }, {
+      maxWait: 10000, // 10 seconds
+      timeout: 30000, // 30 seconds
     })
 
     res.json(result)
