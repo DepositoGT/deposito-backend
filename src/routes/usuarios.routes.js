@@ -5,13 +5,13 @@
  * Unauthorized copying, modification, distribution, or use of this file,
  * via any medium, is strictly prohibited without express written permission.
  * 
- * For licensing inquiries: GitHub @dpatzan
+ * For licensing inquiries: GitHub @dpatzan2
  */
 
 const { Router } = require('express')
 const multer = require('multer')
 const controller = require('../controllers/usuarios.controller')
-const { Auth, hasAnyRole } = require('../middlewares/autenticacion')
+const { Auth, hasAnyRole, hasPermission } = require('../middlewares/autenticacion')
 
 const router = Router()
 
@@ -161,7 +161,7 @@ router.get('/me', Auth, (req, res) => res.json({ user: req.user }))
  *       200:
  *         description: OK
  */
-router.get('/users', Auth, hasAnyRole('admin', '1'), controller.list)
+router.get('/users', Auth, hasPermission('users.view'), controller.list)
 
 /**
  * @openapi
@@ -175,7 +175,7 @@ router.get('/users', Auth, hasAnyRole('admin', '1'), controller.list)
  *       200:
  *         description: Archivo Excel descargado
  */
-router.get('/users/template', Auth, hasAnyRole('admin', '1'), controller.downloadTemplate)
+router.get('/users/template', Auth, hasPermission('users.import'), controller.downloadTemplate)
 
 /**
  * @openapi
@@ -201,7 +201,7 @@ router.get('/users/template', Auth, hasAnyRole('admin', '1'), controller.downloa
  *       200:
  *         description: Resultado de validación
  */
-router.post('/users/validate-import-mapped', Auth, hasAnyRole('admin', '1'), controller.validateImportMapped)
+router.post('/users/validate-import-mapped', Auth, hasPermission('users.import'), controller.validateImportMapped)
 
 /**
  * @openapi
@@ -227,7 +227,7 @@ router.post('/users/validate-import-mapped', Auth, hasAnyRole('admin', '1'), con
  *       200:
  *         description: Importación completada
  */
-router.post('/users/bulk-import-mapped', Auth, hasAnyRole('admin', '1'), controller.bulkImportMapped)
+router.post('/users/bulk-import-mapped', Auth, hasPermission('users.import'), controller.bulkImportMapped)
 
 /**
  * @openapi
@@ -248,7 +248,7 @@ router.post('/users/bulk-import-mapped', Auth, hasAnyRole('admin', '1'), control
  *       404:
  *         description: Usuario no encontrado
  */
-router.get('/users/:id', Auth, hasAnyRole('admin', '1'), controller.getById)
+router.get('/users/:id', Auth, hasPermission('users.view'), controller.getById)
 
 /**
  * @openapi
@@ -282,7 +282,7 @@ router.get('/users/:id', Auth, hasAnyRole('admin', '1'), controller.getById)
  *       409:
  *         description: Email ya en uso
  */
-router.put('/users/:id', Auth, hasAnyRole('admin', '1'), controller.update)
+router.put('/users/:id', Auth, hasPermission('users.edit'), controller.update)
 
 /**
  * @openapi
@@ -305,7 +305,7 @@ router.put('/users/:id', Auth, hasAnyRole('admin', '1'), controller.update)
  *       404:
  *         description: Usuario no encontrado
  */
-router.delete('/users/:id', Auth, hasAnyRole('admin', '1'), controller.delete)
+router.delete('/users/:id', Auth, hasPermission('users.delete'), controller.delete)
 
 /**
  * @openapi
@@ -328,7 +328,135 @@ router.delete('/users/:id', Auth, hasAnyRole('admin', '1'), controller.delete)
  *                   id: { type: integer }
  *                   name: { type: string }
  */
-router.get('/roles', Auth, hasAnyRole('admin', '1'), controller.getRoles)
+router.get('/roles', Auth, hasPermission('roles.view', 'roles.manage'), controller.getRoles)
+
+/**
+ * @openapi
+ * /auth/permissions:
+ *   get:
+ *     tags: [Auth]
+ *     summary: Listar todos los permisos disponibles
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Lista de permisos
+ */
+router.get('/permissions', Auth, hasPermission('roles.manage'), controller.getPermissions)
+
+/**
+ * @openapi
+ * /auth/roles/with-permissions:
+ *   get:
+ *     tags: [Auth]
+ *     summary: Listar roles con sus permisos asociados
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Lista de roles con permisos
+ */
+router.get('/roles/with-permissions', Auth, hasPermission('roles.manage'), controller.getRolesWithPermissions)
+
+/**
+ * @openapi
+ * /auth/roles/{id}/with-permissions:
+ *   get:
+ *     tags: [Auth]
+ *     summary: Obtener un rol con sus permisos asociados
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: integer }
+ *     responses:
+ *       200:
+ *         description: Rol con permisos
+ *       404:
+ *         description: Rol no encontrado
+ */
+router.get('/roles/:id/with-permissions', Auth, hasPermission('roles.manage'), controller.getRoleWithPermissions)
+
+/**
+ * @openapi
+ * /auth/roles:
+ *   post:
+ *     tags: [Auth]
+ *     summary: Crear un nuevo rol
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [name]
+ *             properties:
+ *               name:
+ *                 type: string
+ *               permissions:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *     responses:
+ *       201:
+ *         description: Rol creado
+ */
+router.post('/roles', Auth, hasPermission('roles.manage'), controller.createRole)
+
+/**
+ * @openapi
+ * /auth/roles/{id}:
+ *   put:
+ *     tags: [Auth]
+ *     summary: Actualizar rol y sus permisos
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: integer }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               name:
+ *                 type: string
+ *               permissions:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *     responses:
+ *       200:
+ *         description: Rol actualizado
+ */
+router.put('/roles/:id', Auth, hasPermission('roles.manage'), controller.updateRole)
+
+/**
+ * @openapi
+ * /auth/roles/{id}:
+ *   delete:
+ *     tags: [Auth]
+ *     summary: Eliminar rol (si no tiene usuarios asignados)
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: integer }
+ *     responses:
+ *       200:
+ *         description: Rol eliminado
+ */
+router.delete('/roles/:id', Auth, hasPermission('roles.manage'), controller.deleteRole)
 
 /**
  * @openapi
@@ -361,6 +489,6 @@ router.get('/roles', Auth, hasAnyRole('admin', '1'), controller.getRoles)
  *       404:
  *         description: Usuario no encontrado
  */
-router.post('/users/:id/photo', Auth, hasAnyRole('admin', '1'), upload.single('file'), controller.uploadPhoto)
+router.post('/users/:id/photo', Auth, hasPermission('users.edit'), upload.single('file'), controller.uploadPhoto)
 
 module.exports = router

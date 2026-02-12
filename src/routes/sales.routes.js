@@ -5,11 +5,11 @@
  * Unauthorized copying, modification, distribution, or use of this file,
  * via any medium, is strictly prohibited without express written permission.
  * 
- * For licensing inquiries: GitHub @dpatzan
+ * For licensing inquiries: GitHub @dpatzan2
  */
 
 const { Router } = require('express')
-const { Auth, hasAnyRole } = require('../middlewares/autenticacion')
+const { Auth, hasAnyRole, hasPermission } = require('../middlewares/autenticacion')
 const Sales = require('../controllers/sales.controller')
 
 const router = Router()
@@ -134,7 +134,7 @@ router.get('/:id', Sales.getById)
  *     responses:
  *       201: { description: Creado }
  */
-router.post('/', Auth, hasAnyRole('admin', 'seller'), Sales.create)
+router.post('/', Auth, hasPermission('sales.create'), Sales.create)
 
 /**
  * @openapi
@@ -166,6 +166,6 @@ router.post('/', Auth, hasAnyRole('admin', 'seller'), Sales.create)
  *       400: { description: Petición inválida }
  *       404: { description: Venta no encontrada }
  */
-router.patch('/:id/status', Auth, hasAnyRole('admin', 'seller'), Sales.updateStatus)
+router.patch('/:id/status', Auth, hasPermission('sales.cancel', 'sales.create'), Sales.updateStatus)
 
 module.exports = router

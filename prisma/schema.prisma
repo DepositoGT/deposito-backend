@@ -119,6 +119,7 @@ model Supplier {
   payment_term     PaymentTerm     @relation(fields: [payment_terms_id], references: [id])
   productsList     Product[]
   purchase_logs    PurchaseLog[]
+  incoming_merchandise IncomingMerchandise[]
   deleted          Boolean         @default(false)
   deleted_at       DateTime?
 
@@ -136,6 +137,7 @@ model Product {
   min_stock     Int             @default(0)
   price         Decimal         @db.Decimal(12, 2)
   cost          Decimal         @db.Decimal(12, 2)
+  image_url     String?         @db.VarChar(500)
   supplier_id   String          @db.Uuid
   supplier      Supplier        @relation(fields: [supplier_id], references: [id])
   barcode       String?         @unique @db.VarChar(100)
@@ -149,16 +151,40 @@ model Product {
   purchase_logs PurchaseLog[]
   return_items  ReturnItem[]
   promotion_products PromotionProduct[]
+  incoming_merchandise_items IncomingMerchandiseItem[]
 
   @@map("products")
 }
 
 model Role {
-  id    Int    @id @default(autoincrement())
-  name  String @unique @db.VarChar(50)
-  users User[]
+  id          Int              @id @default(autoincrement())
+  name        String           @unique @db.VarChar(50)
+  users       User[]
+  permissions RolePermission[]
 
   @@map("roles")
+}
+
+/// Sistema de permisos granular por rol
+model Permission {
+  id          Int              @id @default(autoincrement())
+  code        String           @unique @db.VarChar(100)
+  name        String           @db.VarChar(150)
+  description String?          @db.Text
+  roles       RolePermission[]
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  role_id       Int
+  permission_id Int
+
+  role       Role       @relation(fields: [role_id], references: [id])
+  permission Permission @relation(fields: [permission_id], references: [id])
+
+  @@id([role_id, permission_id])
+  @@map("role_permissions")
 }
 
 model User {
@@ -169,6 +195,7 @@ model User {
   role_id     Int
   role        Role    @relation(fields: [role_id], references: [id])
   alerts      Alert[] @relation("AlertAssignedTo")
+  incoming_merchandise IncomingMerchandise[]
   
   // Campos de empleado
   is_employee Boolean @default(false)
@@ -256,6 +283,37 @@ model PurchaseLog {
   @@index([product_id])
   @@index([supplier_id])
   @@map("purchase_logs")
+}
+
+/// Registro de auditoría para ingresos de mercancía
+model IncomingMerchandise {
+  id          String                      @id @default(uuid()) @db.Uuid
+  supplier_id String                      @db.Uuid
+  supplier    Supplier                    @relation(fields: [supplier_id], references: [id])
+  registered_by String                     @db.Uuid
+  registeredBy User                        @relation(fields: [registered_by], references: [id])
+  date        DateTime                    @default(now())
+  notes       String?                     @db.Text
+  items       IncomingMerchandiseItem[]
+
+  @@index([supplier_id])
+  @@index([registered_by])
+  @@index([date])
+  @@map("incoming_merchandise")
+}
+
+model IncomingMerchandiseItem {
+  id                      String              @id @default(uuid()) @db.Uuid
+  incoming_merchandise_id String              @db.Uuid
+  incomingMerchandise     IncomingMerchandise @relation(fields: [incoming_merchandise_id], references: [id], onDelete: Cascade)
+  product_id              String              @db.Uuid
+  product                 Product             @relation(fields: [product_id], references: [id])
+  quantity                Int
+  unit_cost               Decimal             @db.Decimal(12, 2)
+
+  @@index([incoming_merchandise_id])
+  @@index([product_id])
+  @@map("incoming_merchandise_items")
 }
 
 model Return {

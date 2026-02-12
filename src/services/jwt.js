@@ -5,7 +5,7 @@
  * Unauthorized copying, modification, distribution, or use of this file,
  * via any medium, is strictly prohibited without express written permission.
  * 
- * For licensing inquiries: GitHub @dpatzan
+ * For licensing inquiries: GitHub @dpatzan2
  */
 
 const jwt_simple = require('jwt-simple')
@@ -20,6 +20,16 @@ exports.crearToken = function (usuario) {
     ? { id: usuario.role_id, name: usuario.role_name || null }
     : null
 
+  // Intentar extraer permisos del objeto de usuario si vienen incluidos
+  let permissions = []
+  if (usuario.role && Array.isArray(usuario.role.permissions)) {
+    permissions = usuario.role.permissions
+      .map((rp) => rp.permission && rp.permission.code)
+      .filter(Boolean)
+  } else if (Array.isArray(usuario.permissions)) {
+    permissions = usuario.permissions
+  }
+
   const payload = {
     sub: usuario.id,
     name: usuario.name,
@@ -27,6 +37,7 @@ exports.crearToken = function (usuario) {
     role_id: usuario.role_id,
     role_name: usuario.role?.name || usuario.role_name || null,
     role: roleObj,
+    permissions,
     iat: moment().unix(),
     exp: moment().add(7, 'days').unix(),
   }
