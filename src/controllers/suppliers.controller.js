@@ -248,6 +248,15 @@ exports.validateImportMapped = async (req, res, next) => {
       ...validation
     })
   } catch (e) {
+    // Log error for debugging
+    console.error('[suppliers.validateImportMapped] Error:', e)
+    // Return a proper error response
+    if (e.code === 'P1001' || e.message?.includes('Can\'t reach database')) {
+      return res.status(503).json({ 
+        message: 'Error de conexión con la base de datos. Por favor, intenta nuevamente.',
+        error: 'Database connection error'
+      })
+    }
     next(e)
   }
 }
