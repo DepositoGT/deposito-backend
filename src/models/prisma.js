@@ -32,13 +32,42 @@ const prisma = new PrismaClient({
   log: process.env.PRISMA_LOG_QUERIES === 'true' ? ['query', 'error', 'warn'] : ['error', 'warn']
 })
 
+// Create a separate Prisma client for transactions that uses DIRECT_URL
+// This is needed because pooled connections (PgBouncer) don't support transactions
+let prismaTransaction = null
+if (process.env.DIRECT_URL) {
+  prismaTransaction = new PrismaClient({
+    datasources: {
+      db: {
+        url: process.env.DIRECT_URL
+      }
+    },
+    log: process.env.PRISMA_LOG_QUERIES === 'true' ? ['query', 'error', 'warn'] : ['error', 'warn']
+  })
+  console.log('[prisma] Transaction client initialized with DIRECT_URL')
+} else {
+  // Fallback to regular prisma if DIRECT_URL is not available
+  prismaTransaction = prisma
+  console.warn('[prisma] DIRECT_URL not set, transactions will use pooled connection (may fail)')
+}
+
 process.on('SIGINT', async () => {
-  try { await prisma.$disconnect() } catch (e) { /* ignore */ }
+  try { 
+    await prisma.$disconnect()
+    if (prismaTransaction !== prisma) {
+      await prismaTransaction.$disconnect()
+    }
+  } catch (e) { /* ignore */ }
   process.exit(0)
 })
 process.on('SIGTERM', async () => {
-  try { await prisma.$disconnect() } catch (e) { /* ignore */ }
+  try { 
+    await prisma.$disconnect()
+    if (prismaTransaction !== prisma) {
+      await prismaTransaction.$disconnect()
+    }
+  } catch (e) { /* ignore */ }
   process.exit(0)
 })
 
-module.exports = { prisma }
+module.exports = { prisma, prismaTransaction }
