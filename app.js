@@ -19,6 +19,7 @@ const allowedOrigins = new Set([
   'http://localhost:5173',
   'http://127.0.0.1:5173',
   'https://deposito-frontend.vercel.app',
+  'http://localhost:3000',
 ])
 const corsConfig = {
   credentials: true,

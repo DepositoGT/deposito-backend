@@ -5,11 +5,11 @@
  * Unauthorized copying, modification, distribution, or use of this file,
  * via any medium, is strictly prohibited without express written permission.
  * 
- * For licensing inquiries: GitHub @dpatzan
+ * For licensing inquiries: GitHub @dpatzan2
  */
 
 const { Router } = require('express')
-const { Auth, hasAnyRole } = require('../middlewares/autenticacion')
+const { Auth, hasAnyRole, hasPermission } = require('../middlewares/autenticacion')
 const ctrl = require('../controllers/productCategories.controller')
 const router = Router()
 
@@ -72,7 +72,7 @@ router.get('/template', ctrl.downloadTemplate)
  *       200:
  *         description: Resultado de validación
  */
-router.post('/validate-import-mapped', Auth, hasAnyRole('admin'), ctrl.validateImportMapped)
+router.post('/validate-import-mapped', Auth, hasPermission('catalogs.manage'), ctrl.validateImportMapped)
 
 /**
  * @openapi
@@ -98,7 +98,7 @@ router.post('/validate-import-mapped', Auth, hasAnyRole('admin'), ctrl.validateI
  *       400:
  *         description: Error de validación
  */
-router.post('/bulk-import-mapped', Auth, hasAnyRole('admin'), ctrl.bulkImportMapped)
+router.post('/bulk-import-mapped', Auth, hasPermission('catalogs.manage'), ctrl.bulkImportMapped)
 
 /**
  * @openapi

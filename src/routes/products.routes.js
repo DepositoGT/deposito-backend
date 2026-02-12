@@ -5,12 +5,12 @@
  * Unauthorized copying, modification, distribution, or use of this file,
  * via any medium, is strictly prohibited without express written permission.
  * 
- * For licensing inquiries: GitHub @dpatzan
+ * For licensing inquiries: GitHub @dpatzan2
  */
 
 const { Router } = require('express')
 const multer = require('multer')
-const { Auth, hasAnyRole } = require('../middlewares/autenticacion')
+const { Auth, hasAnyRole, hasPermission } = require('../middlewares/autenticacion')
 const Products = require('../controllers/products.controller')
 
 // Configure multer for memory storage (keep file in buffer)
@@ -27,6 +27,19 @@ const upload = multer({
             cb(null, true)
         } else {
             cb(new Error('Tipo de archivo no permitido. Use Excel (.xlsx, .xls) o CSV.'))
+        }
+    }
+})
+
+// Configure multer for image uploads
+const uploadImage = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+    fileFilter: (req, file, cb) => {
+        if (file.mimetype.startsWith('image/')) {
+            cb(null, true)
+        } else {
+            cb(new Error('Solo se permiten archivos de imagen'))
         }
     }
 })
@@ -94,7 +107,7 @@ router.get('/', Products.list)
  *               items:
  *                 $ref: '#/components/schemas/Product'
  */
-router.get('/critical', Auth, hasAnyRole('admin'), Products.critical)
+router.get('/critical', Auth, hasPermission('products.view', 'alerts.view'), Products.critical)
 
 /**
  * @openapi
@@ -155,7 +168,7 @@ router.get('/import-template', Products.getImportTemplate)
  *       200:
  *         description: Resultado de validación
  */
-router.post('/validate-import', Auth, hasAnyRole('admin'), upload.single('file'), Products.validateImport)
+router.post('/validate-import', Auth, hasPermission('products.import'), upload.single('file'), Products.validateImport)
 
 /**
  * @openapi
@@ -182,7 +195,7 @@ router.post('/validate-import', Auth, hasAnyRole('admin'), upload.single('file')
  *       400:
  *         description: Error de validación
  */
-router.post('/bulk-import', Auth, hasAnyRole('admin'), upload.single('file'), Products.bulkImport)
+router.post('/bulk-import', Auth, hasPermission('products.import'), upload.single('file'), Products.bulkImport)
 
 /**
  * @openapi
@@ -208,7 +221,7 @@ router.post('/bulk-import', Auth, hasAnyRole('admin'), upload.single('file'), Pr
  *       400:
  *         description: Error de validación
  */
-router.post('/bulk-import-mapped', Auth, hasAnyRole('admin'), Products.bulkImportMapped)
+router.post('/bulk-import-mapped', Auth, hasPermission('products.import'), Products.bulkImportMapped)
 
 /**
  * @openapi
@@ -232,7 +245,7 @@ router.post('/bulk-import-mapped', Auth, hasAnyRole('admin'), Products.bulkImpor
  *       200:
  *         description: Resultado de validación
  */
-router.post('/validate-import-mapped', Auth, hasAnyRole('admin'), Products.validateImportMapped)
+router.post('/validate-import-mapped', Auth, hasPermission('products.import'), Products.validateImportMapped)
 
 /**
  * @openapi
@@ -251,7 +264,7 @@ router.post('/validate-import-mapped', Auth, hasAnyRole('admin'), Products.valid
  *     responses:
  *       201: { description: Creado }
  */
-router.post('/', Auth, hasAnyRole('admin'), Products.create)
+router.post('/', Auth, hasPermission('products.create'), Products.create)
 
 /**
  * @openapi
@@ -297,7 +310,7 @@ router.get('/:id', Products.getOne)
  *     responses:
  *       200: { description: OK }
  */
-router.put('/:id', Auth, hasAnyRole('admin'), Products.update)
+router.put('/:id', Auth, hasPermission('products.edit'), Products.update)
 
 /**
  * @openapi
@@ -315,38 +328,46 @@ router.put('/:id', Auth, hasAnyRole('admin'), Products.update)
  *     responses:
  *       200: { description: OK }
  */
-router.delete('/:id', Auth, hasAnyRole('admin'), Products.remove)
+router.delete('/:id', Auth, hasPermission('products.delete'), Products.remove)
 
 /**
  * @openapi
- * /products/{id}/stock-adjust:
+ * /products/register-incoming:
  *   post:
  *     tags: [Products]
- *     summary: Ajustar stock de un producto (add/remove)
+ *     summary: Registrar ingreso de mercancía desde un proveedor
  *     security:
  *       - bearerAuth: []
- *     parameters:
- *       - in: path
- *         name: id
- *         schema: { type: string }
- *         required: true
  *     requestBody:
  *       required: true
  *       content:
  *         application/json:
  *           schema:
  *             type: object
+ *             required:
+ *               - supplier_id
+ *               - items
  *             properties:
- *               type: { type: string, enum: ["add","remove"] }
- *               amount: { type: integer }
- *               reason: { type: string }
- *               supplier_id: { type: string }
- *               cost: { type: number }
+ *               supplier_id: { type: string, format: uuid }
+ *               items:
+ *                 type: array
+ *                 items:
+ *                   type: object
+ *                   required:
+ *                     - product_id
+ *                     - quantity
+ *                     - unit_cost
+ *                   properties:
+ *                     product_id: { type: string, format: uuid }
+ *                     quantity: { type: integer, minimum: 1 }
+ *                     unit_cost: { type: number, minimum: 0 }
+ *               notes: { type: string }
  *     responses:
  *       200: { description: OK }
  *       400: { description: Bad request }
+ *       401: { description: Unauthorized }
  */
-router.post('/:id/stock-adjust', Auth, hasAnyRole('admin'), Products.adjustStock)
+router.post('/register-incoming', Auth, hasPermission('products.register_incoming'), Products.registerIncomingMerchandise)
 
 /**
  * @openapi
@@ -362,7 +383,44 @@ router.post('/:id/stock-adjust', Auth, hasAnyRole('admin'), Products.adjustStock
  *     responses:
  *       200: { description: OK }
  */
-router.patch('/:id/restore', Auth, hasAnyRole('admin'), Products.restore)
+router.patch('/:id/restore', Auth, hasPermission('products.register_incoming', 'products.edit'), Products.restore)
+
+/**
+ * @openapi
+ * /api/products/upload-image:
+ *   post:
+ *     summary: Sube una imagen de producto a Supabase Storage
+ *     tags: [Products]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - image
+ *             properties:
+ *               image:
+ *                 type: string
+ *                 format: binary
+ *     responses:
+ *       200:
+ *         description: Imagen subida exitosamente
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 imageUrl:
+ *                   type: string
+ *       400:
+ *         description: Error en la petición
+ *       500:
+ *         description: Error del servidor
+ */
+router.post('/upload-image', Auth, hasPermission('products.create', 'products.edit'), uploadImage.single('image'), Products.uploadImage)
 
 module.exports = router
 
