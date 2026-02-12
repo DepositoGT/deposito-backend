@@ -5,7 +5,7 @@
  * Unauthorized copying, modification, distribution, or use of this file,
  * via any medium, is strictly prohibited without express written permission.
  * 
- * For licensing inquiries: GitHub @dpatzan
+ * For licensing inquiries: GitHub @dpatzan2
  */
 
 const { Router } = require('express')
@@ -27,6 +27,19 @@ const upload = multer({
             cb(null, true)
         } else {
             cb(new Error('Tipo de archivo no permitido. Use Excel (.xlsx, .xls) o CSV.'))
+        }
+    }
+})
+
+// Configure multer for image uploads
+const uploadImage = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+    fileFilter: (req, file, cb) => {
+        if (file.mimetype.startsWith('image/')) {
+            cb(null, true)
+        } else {
+            cb(new Error('Solo se permiten archivos de imagen'))
         }
     }
 })
@@ -319,34 +332,42 @@ router.delete('/:id', Auth, hasPermission('products.delete'), Products.remove)
 
 /**
  * @openapi
- * /products/{id}/stock-adjust:
+ * /products/register-incoming:
  *   post:
  *     tags: [Products]
- *     summary: Ajustar stock de un producto (add/remove)
+ *     summary: Registrar ingreso de mercancía desde un proveedor
  *     security:
  *       - bearerAuth: []
- *     parameters:
- *       - in: path
- *         name: id
- *         schema: { type: string }
- *         required: true
  *     requestBody:
  *       required: true
  *       content:
  *         application/json:
  *           schema:
  *             type: object
+ *             required:
+ *               - supplier_id
+ *               - items
  *             properties:
- *               type: { type: string, enum: ["add","remove"] }
- *               amount: { type: integer }
- *               reason: { type: string }
- *               supplier_id: { type: string }
- *               cost: { type: number }
+ *               supplier_id: { type: string, format: uuid }
+ *               items:
+ *                 type: array
+ *                 items:
+ *                   type: object
+ *                   required:
+ *                     - product_id
+ *                     - quantity
+ *                     - unit_cost
+ *                   properties:
+ *                     product_id: { type: string, format: uuid }
+ *                     quantity: { type: integer, minimum: 1 }
+ *                     unit_cost: { type: number, minimum: 0 }
+ *               notes: { type: string }
  *     responses:
  *       200: { description: OK }
  *       400: { description: Bad request }
+ *       401: { description: Unauthorized }
  */
-router.post('/:id/stock-adjust', Auth, hasPermission('products.adjust_stock'), Products.adjustStock)
+router.post('/register-incoming', Auth, hasPermission('products.register_incoming'), Products.registerIncomingMerchandise)
 
 /**
  * @openapi
@@ -362,7 +383,44 @@ router.post('/:id/stock-adjust', Auth, hasPermission('products.adjust_stock'), P
  *     responses:
  *       200: { description: OK }
  */
-router.patch('/:id/restore', Auth, hasPermission('products.adjust_stock', 'products.edit'), Products.restore)
+router.patch('/:id/restore', Auth, hasPermission('products.register_incoming', 'products.edit'), Products.restore)
+
+/**
+ * @openapi
+ * /api/products/upload-image:
+ *   post:
+ *     summary: Sube una imagen de producto a Supabase Storage
+ *     tags: [Products]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - image
+ *             properties:
+ *               image:
+ *                 type: string
+ *                 format: binary
+ *     responses:
+ *       200:
+ *         description: Imagen subida exitosamente
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 imageUrl:
+ *                   type: string
+ *       400:
+ *         description: Error en la petición
+ *       500:
+ *         description: Error del servidor
+ */
+router.post('/upload-image', Auth, hasPermission('products.create', 'products.edit'), uploadImage.single('image'), Products.uploadImage)
 
 module.exports = router
 
