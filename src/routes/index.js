@@ -5,7 +5,7 @@
  * Unauthorized copying, modification, distribution, or use of this file,
  * via any medium, is strictly prohibited without express written permission.
  * 
- * For licensing inquiries: GitHub @dpatzan
+ * For licensing inquiries: GitHub @dpatzan2
  */
 
 const { Router } = require('express')
@@ -41,7 +41,8 @@ router.use('/returns', require('./returns.routes'))
 router.use('/cash-closures', require('./cashClosures.routes'))
 // Promotions (discount codes)
 router.use('/promotions', require('./promotions.routes'))
-
+// Incoming Merchandise (registro de mercancía)
+router.use('/incoming-merchandise', require('./incomingMerchandise.routes'))
 
 
 module.exports = router

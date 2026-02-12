@@ -5,7 +5,7 @@
  * Unauthorized copying, modification, distribution, or use of this file,
  * via any medium, is strictly prohibited without express written permission.
  * 
- * For licensing inquiries: GitHub @dpatzan
+ * For licensing inquiries: GitHub @dpatzan2
  */
 
 const { prisma } = require('../models/prisma')
@@ -14,6 +14,7 @@ const PDFDocument = require('pdfkit')
 const { DateTime } = require('luxon')
 // Currency formatter helper (destructure format function)
 const { format } = new Intl.NumberFormat('es-GT', { style: 'currency', currency: 'GTQ' })
+const { createClient } = require('@supabase/supabase-js')
 
 // Reuse shared stock alert service
 const { ensureStockAlert } = require('../services/stockAlerts')
@@ -21,11 +22,18 @@ const { ensureStockAlert } = require('../services/stockAlerts')
 // Bulk import service
 const { parseExcel, validateBulkData, bulkCreateProducts, generateTemplateWithCatalogs } = require('../services/bulkImport')
 
+// Inicializar cliente de Supabase con service role key (solo para backend)
+const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY
+const supabase = supabaseUrl && supabaseServiceKey 
+  ? createClient(supabaseUrl, supabaseServiceKey)
+  : null
+
 exports.list = async (req, res, next) => {
   try {
     const page = Math.max(1, Number(req.query.page ?? 1))
     const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 20)))
-    const { includeDeleted, search, category } = req.query || {}
+    const { includeDeleted, search, category, supplier } = req.query || {}
     
     const where = includeDeleted === 'true' ? {} : { deleted: false }
     
@@ -43,6 +51,11 @@ exports.list = async (req, res, next) => {
       where.category = {
         name: { equals: String(category), mode: 'insensitive' }
       }
+    }
+    
+    // Filtro de proveedor
+    if (supplier) {
+      where.supplier_id = String(supplier)
     }
     
     const totalItems = await prisma.product.count({ where })
@@ -78,9 +91,58 @@ exports.create = async (req, res, next) => {
     const stock = Number(payload.stock || 0)
     const cost = payload.cost != null ? Number(payload.cost) : 0
 
+    // Preparar payload seguro: normalizar campos y validar
+    const safePayload = { ...payload }
+    
+    // Remover image_url si está vacío
+    if (safePayload.image_url === '' || safePayload.image_url === null) {
+      delete safePayload.image_url
+    }
+
+    // Validar y normalizar supplier_id: debe ser un UUID válido
+    if (safePayload.supplier_id !== undefined) {
+      const supplierId = String(safePayload.supplier_id).trim()
+      // Validar formato UUID básico (8-4-4-4-12 caracteres hex)
+      const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+      if (!uuidRegex.test(supplierId)) {
+        // Si no es un UUID válido, intentar buscar el proveedor por nombre
+        const supplier = await prisma.supplier.findFirst({
+          where: { 
+            name: { equals: supplierId, mode: 'insensitive' },
+            deleted: false
+          }
+        })
+        if (supplier) {
+          safePayload.supplier_id = supplier.id
+        } else {
+          return res.status(400).json({ message: `Proveedor no encontrado: ${supplierId}. Debe ser un UUID válido o el nombre de un proveedor existente.` })
+        }
+      } else {
+        safePayload.supplier_id = supplierId
+      }
+    }
+
     // create product and, if initial stock > 0, create a purchase log in the same transaction
     const result = await prisma.$transaction(async (tx) => {
-      const product = await tx.product.create({ data: payload })
+      let product
+      try {
+        product = await tx.product.create({ data: safePayload })
+      } catch (prismaError) {
+        // Si el error es porque image_url no existe en la base de datos (migración no ejecutada)
+        // Remover image_url y reintentar
+        if (prismaError.message && (
+          prismaError.message.includes('image_url') || 
+          prismaError.message.includes('Unknown argument') ||
+          prismaError.message.includes('Unknown field')
+        )) {
+          const fallbackPayload = { ...safePayload }
+          delete fallbackPayload.image_url
+          product = await tx.product.create({ data: fallbackPayload })
+          console.warn('[products.create] image_url no disponible en la base de datos. Ejecuta la migración para habilitar imágenes de productos.')
+        } else {
+          throw prismaError
+        }
+      }
 
       let purchaseLog = null
 
@@ -162,7 +224,79 @@ exports.update = async (req, res, next) => {
       return res.status(404).json({ message: 'Producto no encontrado' })
     }
 
-    const updated = await prisma.product.update({ where: { id }, data: payload })
+    // Preparar payload seguro: normalizar campos y validar
+    const safePayload = {}
+    
+    // Copiar solo los campos permitidos y necesarios
+    const allowedFields = ['name', 'brand', 'size', 'stock', 'min_stock', 'price', 'cost', 'barcode', 'description', 'image_url', 'category_id', 'supplier_id', 'status_id']
+    for (const field of allowedFields) {
+      if (payload[field] !== undefined) {
+        safePayload[field] = payload[field]
+      }
+    }
+    
+    // Remover image_url si está vacío
+    if (safePayload.image_url === '' || safePayload.image_url === null) {
+      delete safePayload.image_url
+    }
+
+    // Validar y normalizar category_id
+    if (safePayload.category_id !== undefined) {
+      safePayload.category_id = Number(safePayload.category_id)
+      if (Number.isNaN(safePayload.category_id)) {
+        return res.status(400).json({ message: 'category_id debe ser un número válido' })
+      }
+    }
+
+    // Validar y normalizar status_id
+    if (safePayload.status_id !== undefined) {
+      safePayload.status_id = Number(safePayload.status_id)
+      if (Number.isNaN(safePayload.status_id)) {
+        return res.status(400).json({ message: 'status_id debe ser un número válido' })
+      }
+    }
+
+    // Validar y normalizar supplier_id: debe ser un UUID válido
+    if (safePayload.supplier_id !== undefined) {
+      const supplierId = String(safePayload.supplier_id).trim()
+      // Validar formato UUID básico (8-4-4-4-12 caracteres hex)
+      const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+      if (!uuidRegex.test(supplierId)) {
+        // Si no es un UUID válido, intentar buscar el proveedor por nombre
+        const supplier = await prisma.supplier.findFirst({
+          where: { 
+            name: { equals: supplierId, mode: 'insensitive' },
+            deleted: false
+          }
+        })
+        if (supplier) {
+          safePayload.supplier_id = supplier.id
+        } else {
+          return res.status(400).json({ message: `Proveedor no encontrado: ${supplierId}. Debe ser un UUID válido o el nombre de un proveedor existente.` })
+        }
+      } else {
+        safePayload.supplier_id = supplierId
+      }
+    }
+
+    let updated
+    try {
+      updated = await prisma.product.update({ where: { id }, data: safePayload })
+    } catch (prismaError) {
+      // Si el error es porque image_url no existe en la base de datos (migración no ejecutada)
+      // Remover image_url y reintentar
+      if (prismaError.message && (
+        prismaError.message.includes('image_url') || 
+        prismaError.message.includes('Unknown argument') ||
+        prismaError.message.includes('Unknown field')
+      )) {
+        delete safePayload.image_url
+        updated = await prisma.product.update({ where: { id }, data: safePayload })
+        console.warn('[products.update] image_url no disponible en la base de datos. Ejecuta la migración para habilitar imágenes de productos.')
+      } else {
+        throw prismaError
+      }
+    }
 
     // If stock or min_stock changed, trigger alert logic
     const stockChanged = payload.stock !== undefined && Number(payload.stock) !== Number(current.stock)
@@ -380,18 +514,34 @@ exports.critical = async (req, res, next) => {
   } catch (e) { next(e) }
 }
 
-// Adjust stock endpoint: body { type: 'add'|'remove', amount: number, reason: string, supplier_id?: string, cost?: number }
-exports.adjustStock = async (req, res, next) => {
+// Register incoming merchandise endpoint: body { supplier_id: string, items: [{ product_id: string, quantity: number, unit_cost: number }], notes?: string }
+exports.registerIncomingMerchandise = async (req, res, next) => {
   try {
-    const { type, amount, reason, supplier_id, cost } = req.body || {}
-    const id = req.params.id
+    const { supplier_id, items, notes } = req.body || {}
+    const user = req.user
+    if (!user || !user.sub) {
+      return res.status(401).json({ message: 'Usuario no autenticado' })
+    }
+    const registered_by = user.sub // User ID from JWT
 
-    if (!['add', 'remove'].includes(type)) return res.status(400).json({ message: 'type must be add or remove' })
-    const qty = Number(amount || 0)
-    if (!Number.isFinite(qty) || qty <= 0) return res.status(400).json({ message: 'amount must be a positive number' })
-    if (!reason || typeof reason !== 'string') return res.status(400).json({ message: 'reason required' })
+    if (!supplier_id || typeof supplier_id !== 'string') {
+      return res.status(400).json({ message: 'supplier_id es requerido' })
+    }
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ message: 'items debe ser un array con al menos un producto' })
+    }
 
-    // prepare Guatemala local clock time (stored as UTC instant so DB shows GT clock)
+    // Validate items structure
+    for (const item of items) {
+      if (!item.product_id || !item.quantity || item.quantity <= 0) {
+        return res.status(400).json({ message: 'Cada item debe tener product_id y quantity > 0' })
+      }
+      if (item.unit_cost == null || Number(item.unit_cost) < 0) {
+        return res.status(400).json({ message: 'Cada item debe tener unit_cost >= 0' })
+      }
+    }
+
+    // Prepare Guatemala local clock time
     const nowGt = DateTime.now().setZone('America/Guatemala')
     const dateAsUtcWithGtClock = new Date(Date.UTC(
       nowGt.year,
@@ -403,56 +553,114 @@ exports.adjustStock = async (req, res, next) => {
       nowGt.millisecond
     ))
 
-    // run in transaction: update product stock and optionally create purchase log when adding
+    // Run in transaction: create audit record, update products, create purchase logs, update supplier
     const result = await prisma.$transaction(async (tx) => {
-      const prod = await tx.product.findUnique({ where: { id } })
-      if (!prod || prod.deleted) throw new Error('No encontrado')
-
-      let newStock = prod.stock
-      if (type === 'add') {
-        newStock = prod.stock + qty
-      } else {
-        newStock = prod.stock - qty
-        if (newStock < 0) newStock = 0
+      // Verify supplier exists
+      const supplier = await tx.supplier.findUnique({ where: { id: supplier_id } })
+      if (!supplier || supplier.deleted) {
+        throw new Error('Proveedor no encontrado')
       }
 
-      const updated = await tx.product.update({ where: { id }, data: { stock: newStock } })
+      // Verify all products exist and belong to the supplier
+      const productIds = items.map(item => item.product_id)
+      const products = await tx.product.findMany({
+        where: {
+          id: { in: productIds },
+          deleted: false
+        }
+      })
 
-      let purchaseLog = null
-      // create a purchase log for additions and a negative log for removals
-      const supplierId = supplier_id || prod.supplier_id
-      const unitCost = cost != null ? Number(cost) : Number(prod.cost || 0)
-      if (supplierId) {
-        const signedQty = type === 'add' ? qty : -qty
-        purchaseLog = await tx.purchaseLog.create({
+      if (products.length !== productIds.length) {
+        throw new Error('Uno o más productos no encontrados')
+      }
+
+      // Verify all products belong to the supplier
+      for (const product of products) {
+        if (product.supplier_id !== supplier_id) {
+          throw new Error(`El producto ${product.name} no pertenece al proveedor seleccionado`)
+        }
+      }
+
+      // Create incoming merchandise audit record
+      const incomingMerchandise = await tx.incomingMerchandise.create({
+        data: {
+          supplier_id,
+          registered_by,
+          date: dateAsUtcWithGtClock,
+          notes: notes || null,
+        }
+      })
+
+      // Process each item
+      const updatedProducts = []
+      const purchaseLogs = []
+      let totalPurchaseValue = 0
+
+      for (const item of items) {
+        const product = products.find(p => p.id === item.product_id)
+        if (!product) continue
+
+        const quantity = Number(item.quantity)
+        const unitCost = Number(item.unit_cost)
+        const newStock = product.stock + quantity
+
+        // Update product stock
+        const updated = await tx.product.update({
+          where: { id: product.id },
+          data: { stock: newStock },
+          select: { id: true, name: true, stock: true, min_stock: true }
+        })
+        updatedProducts.push(updated)
+
+        // Create purchase log
+        const purchaseLog = await tx.purchaseLog.create({
           data: {
-            product_id: id,
-            supplier_id: supplierId,
-            qty: signedQty,
+            product_id: product.id,
+            supplier_id,
+            qty: quantity,
             cost: unitCost,
             date: dateAsUtcWithGtClock,
           }
         })
-        // update supplier's total_purchases (increment by qty*cost; negative when removing)
-        const delta = signedQty * unitCost
-        await tx.supplier.update({
-          where: { id: supplierId },
+        purchaseLogs.push(purchaseLog)
+
+        // Create incoming merchandise item (audit)
+        await tx.incomingMerchandiseItem.create({
           data: {
-            total_purchases: { increment: delta },
-            ...(type === 'add' ? { last_order: dateAsUtcWithGtClock } : {}),
+            incoming_merchandise_id: incomingMerchandise.id,
+            product_id: product.id,
+            quantity,
+            unit_cost: unitCost,
           }
         })
+
+        // Update stock alerts
+        await ensureStockAlert(tx, product.id, newStock, product.min_stock)
+
+        totalPurchaseValue += quantity * unitCost
       }
 
-      // Stock alert logic SIEMPRE (aunque no haya supplier) para reflejar cualquier ajuste
-      await ensureStockAlert(tx, id, newStock, prod.min_stock)
+      // Update supplier: total_purchases and last_order
+      await tx.supplier.update({
+        where: { id: supplier_id },
+        data: {
+          total_purchases: { increment: totalPurchaseValue },
+          last_order: dateAsUtcWithGtClock,
+        }
+      })
 
-      // optionally create a generic product log table in future; for now return updated + purchaseLog
-      return { updated, purchaseLog }
+      return {
+        incomingMerchandise,
+        updatedProducts,
+        purchaseLogs,
+        totalPurchaseValue,
+      }
     })
 
     res.json(result)
-  } catch (e) { next(e) }
+  } catch (e) {
+    next(e)
+  }
 }
 
 /**
@@ -725,4 +933,74 @@ exports.validateImportMapped = async (req, res, next) => {
   } catch (e) {
     next(e)
   }
+}
+
+/**
+ * POST /api/products/upload-image
+ * Sube una imagen de producto a Supabase Storage (bucket: productos)
+ * Requiere: multipart/form-data con campo 'image'
+ * Retorna: { imageUrl: string }
+ */
+exports.uploadImage = async (req, res, next) => {
+  try {
+    const file = req.file
+
+    if (!supabase) {
+      return res.status(500).json({ message: 'Supabase no configurado. Verifica SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY en .env' })
+    }
+
+    if (!file) {
+      return res.status(400).json({ message: 'No se proporcionó ningún archivo' })
+    }
+
+    // Validar tipo de archivo
+    if (!file.mimetype.startsWith('image/')) {
+      return res.status(400).json({ message: 'Solo se permiten archivos de imagen' })
+    }
+
+    // Validar tamaño (máx 5MB)
+    if (file.size > 5 * 1024 * 1024) {
+      return res.status(400).json({ message: 'La imagen no debe exceder 5MB' })
+    }
+
+    // Generar nombre único para el archivo
+    const fileExt = file.originalname.split('.').pop() || 'jpg'
+    const fileName = `${Date.now()}-${Math.random().toString(36).slice(2)}.${fileExt}`
+    const filePath = fileName
+
+    // Validar que el buffer tenga contenido
+    if (!file.buffer || file.buffer.length === 0) {
+      return res.status(400).json({ message: 'El archivo está vacío o no se pudo leer correctamente' })
+    }
+
+    // Subir a Supabase Storage (bucket: productos)
+    const { data: uploadData, error: uploadError } = await supabase.storage
+      .from('productos')
+      .upload(filePath, file.buffer, {
+        cacheControl: '3600',
+        upsert: false,
+        contentType: file.mimetype
+      })
+
+    if (uploadError) {
+      return res.status(500).json({ message: 'Error al subir la imagen: ' + uploadError.message })
+    }
+
+    if (!uploadData) {
+      return res.status(500).json({ message: 'Error al subir la imagen: No se recibió confirmación' })
+    }
+
+    // Obtener URL pública
+    const { data: urlData } = supabase.storage
+      .from('productos')
+      .getPublicUrl(filePath)
+
+    if (!urlData || !urlData.publicUrl) {
+      return res.status(500).json({ message: 'Error al obtener la URL pública de la imagen' })
+    }
+
+    res.json({
+      imageUrl: urlData.publicUrl
+    })
+  } catch (e) { next(e) }
 }
