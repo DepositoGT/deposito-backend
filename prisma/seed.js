@@ -28,16 +28,10 @@ async function main() {
   // ========================================
   // 2. CATÁLOGOS - CATEGORÍAS DE PRODUCTOS
   // ========================================
- 
-
-  // Intentar eliminar categorías antiguas que NO estén referenciadas
-  const oldCategories = await prisma.productCategory.findMany({
-    where: { name: { notIn: productCategories } },
-  })
 
   for (const cat of oldCategories) {
     const linkedProducts = await prisma.product.count({ where: { category_id: cat.id } })
-    const linkedSuppliers = await prisma.supplier.count({ where: { category_id: cat.id } })
+    const linkedSuppliers = await prisma.supplierCategory.count({ where: { category_id: cat.id } })
 
     if (linkedProducts === 0 && linkedSuppliers === 0) {
       try {
@@ -56,7 +50,7 @@ async function main() {
   console.log('Creando estados y status...')
   const statuses = ['Activo', 'Inactivo', 'Activa', 'Resuelta', 'Pendiente']
   const stockStatuses = ['Disponible', 'Bajo', 'Agotado']
-  const saleStatuses = ['Completada', 'Pendiente', 'Cancelada', 'Pagado']
+  const saleStatuses = ['Completada', 'Cancelada']
   const paymentMethods = ['Efectivo', 'Tarjeta', 'Transferencia']
   const alertTypes = ['Stock Bajo', 'Sin Stock', 'Vencimiento', 'Precio']
   const alertPriorities = ['Baja', 'Media', 'Alta', 'Crítica']
@@ -66,7 +60,6 @@ async function main() {
   await prisma.stockStatus.createMany({ data: stockStatuses.map(name => ({ name })), skipDuplicates: true })
   await prisma.paymentMethod.createMany({ data: paymentMethods.map(name => ({ name })), skipDuplicates: true })
   await prisma.saleStatus.createMany({ data: saleStatuses.map(name => ({ name })), skipDuplicates: true })
-  await prisma.paymentTerm.createMany({ data: paymentTerms.map(name => ({ name })), skipDuplicates: true })
   await prisma.alertType.createMany({ data: alertTypes.map(name => ({ name })), skipDuplicates: true })
   await prisma.alertPriority.createMany({ data: alertPriorities.map(name => ({ name })), skipDuplicates: true })
   await prisma.returnStatus.createMany({ data: returnStatuses.map(name => ({ name })), skipDuplicates: true })
@@ -185,14 +178,12 @@ async function main() {
     'returns.view',
     'returns.manage',
     'products.view',
-    'products.register_incoming',
     'catalogs.view',
     'alerts.view',
     'cashclosure.view',
     'cashclosure.create',
     'analytics.view',
     'merchandise.view',
-    'merchandise.register',
   ]
 
   for (const sellerRole of sellerRoles) {
@@ -209,6 +200,19 @@ async function main() {
         skipDuplicates: true,
       })
       console.log(`  ${sellerPermissions.length} permisos asignados al rol '${sellerRole.name}'`)
+    }
+
+    // Quitar permisos de registro de mercancía al vendedor (solo ver, no registrar)
+    const permRegisterIncoming = permissionsMap.get('products.register_incoming')
+    const permMerchandiseRegister = permissionsMap.get('merchandise.register')
+    const toRemove = [permRegisterIncoming, permMerchandiseRegister].filter(Boolean)
+    if (toRemove.length > 0) {
+      const deleted = await prisma.rolePermission.deleteMany({
+        where: { role_id: sellerRole.id, permission_id: { in: toRemove } },
+      })
+      if (deleted.count > 0) {
+        console.log(`  Rol '${sellerRole.name}': ${deleted.count} permiso(s) de registro de mercancía quitados`)
+      }
     }
   }
 
@@ -281,7 +285,6 @@ async function main() {
   console.log('')
   console.log('Resumen:')
   console.log(`  - ${roles.length} roles`)
-  console.log(`  - ${productCategories.length} categorías de productos`)
   console.log(`  - ${permissions.length} permisos`)
   console.log(`  - ${allPermissions.length} permisos totales en BD`)
 }
