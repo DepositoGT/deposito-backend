@@ -342,7 +342,7 @@ router.get('/roles', Auth, hasPermission('roles.view', 'roles.manage'), controll
  *       200:
  *         description: Lista de permisos
  */
-router.get('/permissions', Auth, hasPermission('roles.manage'), controller.getPermissions)
+router.get('/permissions', Auth, hasPermission('roles.manage', 'roles.view'), controller.getPermissions)
 
 /**
  * @openapi
@@ -356,7 +356,7 @@ router.get('/permissions', Auth, hasPermission('roles.manage'), controller.getPe
  *       200:
  *         description: Lista de roles con permisos
  */
-router.get('/roles/with-permissions', Auth, hasPermission('roles.manage'), controller.getRolesWithPermissions)
+router.get('/roles/with-permissions', Auth, hasPermission('roles.manage', 'roles.view'), controller.getRolesWithPermissions)
 
 /**
  * @openapi
@@ -377,7 +377,7 @@ router.get('/roles/with-permissions', Auth, hasPermission('roles.manage'), contr
  *       404:
  *         description: Rol no encontrado
  */
-router.get('/roles/:id/with-permissions', Auth, hasPermission('roles.manage'), controller.getRoleWithPermissions)
+router.get('/roles/:id/with-permissions', Auth, hasPermission('roles.manage', 'roles.view'), controller.getRoleWithPermissions)
 
 /**
  * @openapi
