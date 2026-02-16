@@ -311,9 +311,9 @@ exports.create = async (req, res, next) => {
       // Calcular total final
       const total = Math.max(0, subtotal - discountTotal)
 
-      // Get the status ID for 'Pendiente'
-      const pendienteStatus = await tx.saleStatus.findFirst({ where: { name: 'Pendiente' } })
-      if (!pendienteStatus) throw new Error("No existe el estado 'Pendiente'")
+      // Nueva venta se registra directamente como Completada (sin estados Pagado/Pendiente)
+      const completadaStatus = await tx.saleStatus.findFirst({ where: { name: 'Completada' } })
+      if (!completadaStatus) throw new Error("No existe el estado 'Completada'")
 
       // CRITICAL: Sale timestamp handling for Guatemala timezone (UTC-6)
       // PostgreSQL stores all timestamps in UTC by default
@@ -347,7 +347,7 @@ exports.create = async (req, res, next) => {
           total,
           total_returned: 0,  // Nueva venta sin devoluciones
           adjusted_total: total,  // Total ajustado = total (sin devoluciones aún)
-          status_id: pendienteStatus.id,
+          status_id: completadaStatus.id,
         },
       })
 
@@ -360,8 +360,24 @@ exports.create = async (req, res, next) => {
             qty: it.qty,
           },
         })
-        // Stock NO se toca aquí: sólo se descontará cuando la venta pase a 'Completada'.
       }
+
+      // Descontar stock al registrar venta (venta queda Completada directamente)
+      const productQtyMap = new Map()
+      items.forEach(it => {
+        const pid = it.product_id
+        const q = Number(it.qty || 0)
+        productQtyMap.set(pid, (productQtyMap.get(pid) || 0) + q)
+      })
+      const updatePromises = Array.from(productQtyMap.entries()).map(([productId, totalQty]) =>
+        tx.product.update({
+          where: { id: productId },
+          data: { stock: { decrement: totalQty } },
+          select: { id: true, name: true, stock: true, min_stock: true }
+        })
+      )
+      const updatedProducts = await Promise.all(updatePromises)
+      await ensureStockAlertsBatch(tx, updatedProducts)
 
       // 3) Guardar promociones usadas e incrementar contador
       if (appliedPromotions.length > 0) {

@@ -23,7 +23,7 @@ model ProductCategory {
   name      String     @unique @db.VarChar(100)
   deleted   Boolean    @default(false)
   products  Product[]
-  suppliers Supplier[]
+  suppliers SupplierCategory[]
   promotion_categories PromotionCategory[]
 
   @@map("product_categories")
@@ -107,8 +107,6 @@ model Supplier {
   phone            String?         @db.VarChar(50)
   email            String?         @db.VarChar(150)
   address          String?         @db.Text
-  category_id      Int
-  category         ProductCategory @relation(fields: [category_id], references: [id])
   products         Int             @default(0)
   last_order       DateTime?
   total_purchases  Decimal         @default(0) @db.Decimal(12, 2)
@@ -117,6 +115,7 @@ model Supplier {
   status           Status          @relation(fields: [status_id], references: [id])
   payment_terms_id Int
   payment_term     PaymentTerm     @relation(fields: [payment_terms_id], references: [id])
+  categories       SupplierCategory[]
   productsList     Product[]
   purchase_logs    PurchaseLog[]
   incoming_merchandise IncomingMerchandise[]
@@ -283,6 +282,18 @@ model PurchaseLog {
   @@index([product_id])
   @@index([supplier_id])
   @@map("purchase_logs")
+}
+
+/// Relación many-to-many entre proveedores y categorías de producto
+model SupplierCategory {
+  supplier_id String          @db.Uuid
+  category_id Int
+
+  supplier    Supplier        @relation(fields: [supplier_id], references: [id], onDelete: Cascade)
+  category    ProductCategory @relation(fields: [category_id], references: [id])
+
+  @@id([supplier_id, category_id])
+  @@map("supplier_categories")
 }
 
 /// Registro de auditoría para ingresos de mercancía

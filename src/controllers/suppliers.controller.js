@@ -16,9 +16,9 @@ exports.list = async (req, res, next) => {
     const page = Math.max(1, Number(req.query.page ?? 1))
     const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 20)))
     const { search, category_id } = req.query || {}
-    
+
     const where = { deleted: false }
-    
+
     if (search) {
       where.OR = [
         { name: { contains: String(search), mode: 'insensitive' } },
@@ -26,18 +26,33 @@ exports.list = async (req, res, next) => {
         { email: { contains: String(search), mode: 'insensitive' } }
       ]
     }
-    
+
     if (category_id) {
-      where.category_id = Number(category_id)
+      const categoryIdNum = Number(category_id)
+      if (!Number.isNaN(categoryIdNum)) {
+        // filtrar proveedores que tengan al menos una categoría asociada igual a category_id
+        where.categories = {
+          some: { category_id: categoryIdNum },
+        }
+      }
     }
-    
+
     const totalItems = await prisma.supplier.count({ where })
     const totalPages = Math.max(1, Math.ceil(totalItems / pageSize))
     const safePage = Math.min(page, totalPages)
     
     const items = await prisma.supplier.findMany({
       where,
-      include: { category: true, status: true, payment_term: true, productsList: true },
+      include: {
+        categories: {
+          include: {
+            category: true,
+          },
+        },
+        status: true,
+        payment_term: true,
+        productsList: true,
+      },
       orderBy: { name: 'asc' },
       skip: (safePage - 1) * pageSize,
       take: pageSize,
@@ -53,10 +68,22 @@ exports.list = async (req, res, next) => {
           .setLocale('es')
           .toFormat("dd LLL yyyy HH:mm")
       }
+
+      const categories =
+        Array.isArray(s.categories)
+          ? s.categories
+              .map(sc => sc.category)
+              .filter(Boolean)
+          : []
+
+      const categoryNames = categories.map(c => c.name)
+
       return {
         ...s,
         totalPurchases: Number(s.total_purchases || 0),
         lastOrder,
+        categories,
+        categoryNames,
       }
     })
     
@@ -91,8 +118,21 @@ exports.create = async (req, res, next) => {
       rating: data.rating ?? null,
     }
 
-    if (data.category_id != null) {
-      createData.category = { connect: { id: Number(data.category_id) } }
+    // Manejo de categorías (many-to-many)
+    const rawCategoryIds = Array.isArray(data.category_ids)
+      ? data.category_ids
+      : (data.category_id != null ? [data.category_id] : [])
+
+    const categoryIds = rawCategoryIds
+      .map(id => Number(id))
+      .filter(id => Number.isFinite(id))
+
+    if (categoryIds.length > 0) {
+      createData.categories = {
+        create: categoryIds.map(id => ({
+          category: { connect: { id } },
+        })),
+      }
     }
     if (data.payment_terms_id != null) {
       // prisma model uses payment_term relation
@@ -113,12 +153,34 @@ exports.create = async (req, res, next) => {
 
 exports.getOne = async (req, res, next) => {
   try {
-    const item = await prisma.supplier.findUnique({ where: { id: req.params.id }, include: { category: true, status: true, payment_term: true, productsList: true } })
+    const item = await prisma.supplier.findUnique({
+      where: { id: req.params.id },
+      include: {
+        categories: {
+          include: {
+            category: true,
+          },
+        },
+        status: true,
+        payment_term: true,
+        productsList: true,
+      },
+    })
     if (!item || item.deleted) return res.status(404).json({ message: 'No encontrado' })
+    const categories =
+      Array.isArray(item.categories)
+        ? item.categories
+            .map(sc => sc.category)
+            .filter(Boolean)
+        : []
+    const categoryNames = categories.map(c => c.name)
+
     const adapted = {
       ...item,
       totalPurchases: Number(item.total_purchases || 0),
       lastOrder: item.last_order ? DateTime.fromJSDate(item.last_order).setZone('America/Guatemala').setLocale('es').toFormat('dd LLL yyyy HH:mm') : '',
+      categories,
+      categoryNames,
     }
     res.json(adapted)
   } catch (e) { next(e) }
@@ -139,8 +201,22 @@ exports.update = async (req, res, next) => {
     if (data.total_purchases !== undefined) updateData.total_purchases = data.total_purchases
     if (data.rating !== undefined) updateData.rating = data.rating
 
-    if (data.category_id != null) {
-      updateData.category = { connect: { id: Number(data.category_id) } }
+    // Manejo de categorías (many-to-many)
+    if (data.category_ids != null || data.category_id != null) {
+      const rawCategoryIds = Array.isArray(data.category_ids)
+        ? data.category_ids
+        : (data.category_id != null ? [data.category_id] : [])
+
+      const categoryIds = rawCategoryIds
+        .map(id => Number(id))
+        .filter(id => Number.isFinite(id))
+
+      updateData.categories = {
+        deleteMany: {}, // limpiar relaciones actuales
+        create: categoryIds.map(id => ({
+          category: { connect: { id } },
+        })),
+      }
     }
     if (data.payment_terms_id != null) {
       updateData.payment_term = { connect: { id: Number(data.payment_terms_id) } }

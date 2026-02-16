@@ -122,16 +122,35 @@ function validateSupplierRow(row, rowIndex, categoriesMap, paymentTermsMap, exis
         data.address = direccion
     }
 
-    // Required: category (must exist in DB)
+    // Required: category (one or multiple, must exist in DB)
     const categoria = String(normalizedRow.category || '').trim()
     if (!categoria) {
         errors.push('El campo "categoria" es requerido')
     } else {
-        const categoryId = categoriesMap.get(categoria.toLowerCase())
-        if (!categoryId) {
-            errors.push(`Categoría "${categoria}" no existe en el sistema`)
+        // Permitir múltiples categorías separadas por coma, punto y coma o slash
+        const rawNames = categoria
+            .split(/[;,/]/)
+            .map(v => v.trim())
+            .filter(Boolean)
+
+        if (rawNames.length === 0) {
+            errors.push('El campo "categoria" es requerido')
         } else {
-            data.category_id = categoryId
+            const categoryIds = []
+            for (const name of rawNames) {
+                const categoryId = categoriesMap.get(name.toLowerCase())
+                if (!categoryId) {
+                    errors.push(`Categoría "${name}" no existe en el sistema`)
+                } else {
+                    if (!categoryIds.includes(categoryId)) {
+                        categoryIds.push(categoryId)
+                    }
+                }
+            }
+
+            if (categoryIds.length > 0) {
+                data.category_ids = categoryIds
+            }
         }
     }
 
@@ -255,8 +274,12 @@ async function bulkCreateSuppliers(validRows) {
             }
 
             // Connect relations
-            if (row.data.category_id) {
-                createData.category = { connect: { id: row.data.category_id } }
+            if (Array.isArray(row.data.category_ids) && row.data.category_ids.length > 0) {
+                createData.categories = {
+                    create: row.data.category_ids.map(id => ({
+                        category: { connect: { id } }
+                    }))
+                }
             }
             if (row.data.payment_terms_id) {
                 createData.payment_term = { connect: { id: row.data.payment_terms_id } }
