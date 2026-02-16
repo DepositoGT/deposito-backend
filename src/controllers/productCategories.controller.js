@@ -47,7 +47,13 @@ exports.list = async (req, res, next) => {
         _count: { 
           select: { 
             products: { where: { deleted: false } }, 
-            suppliers: { where: { deleted: false } } 
+            // suppliers ahora es una relación a SupplierCategory (tabla intermedia)
+            // contamos solo las relaciones cuyo proveedor no esté eliminado
+            suppliers: { 
+              where: { 
+                supplier: { deleted: false }
+              } 
+            } 
           } 
         } 
       },
@@ -199,8 +205,11 @@ exports.remove = async (req, res, next) => {
     const linkedProducts = await prisma.product.count({ 
       where: { category_id: Number(id), deleted: false }
     })
-    const linkedSuppliers = await prisma.supplier.count({ 
-      where: { category_id: Number(id), deleted: false }
+    const linkedSuppliers = await prisma.supplierCategory.count({ 
+      where: { 
+        category_id: Number(id),
+        supplier: { deleted: false }
+      }
     })
     
     if (linkedProducts > 0 || linkedSuppliers > 0) {
