@@ -217,6 +217,59 @@ exports.create = async (req, res, next) => {
             return res.status(400).json({ message: 'name y type_id son requeridos' })
         }
 
+        // Validate required fields by promotion type
+        const promotionType = await prisma.promotionType.findUnique({ where: { id: Number(type_id) } })
+        if (!promotionType) {
+            return res.status(400).json({ message: 'Tipo de promoción no válido' })
+        }
+        const typeName = promotionType.name
+        if (typeName === 'PERCENTAGE' || typeName === 'MIN_QTY_DISCOUNT') {
+            if (discount_percentage == null || discount_percentage === '' || isNaN(Number(discount_percentage))) {
+                return res.status(400).json({ message: 'Porcentaje de descuento es requerido para este tipo' })
+            }
+            const pct = Number(discount_percentage)
+            if (pct < 0 || pct > 100) {
+                return res.status(400).json({ message: 'El porcentaje debe estar entre 0 y 100' })
+            }
+        }
+        if (typeName === 'MIN_QTY_DISCOUNT') {
+            if (min_quantity == null || min_quantity === '' || !Number(min_quantity) || Number(min_quantity) < 1) {
+                return res.status(400).json({ message: 'Cantidad mínima es requerida para este tipo' })
+            }
+        }
+        if (typeName === 'FIXED_AMOUNT') {
+            if (discount_value == null || discount_value === '' || isNaN(Number(discount_value)) || Number(discount_value) < 0) {
+                return res.status(400).json({ message: 'Monto de descuento (Q) es requerido para este tipo' })
+            }
+        }
+        if (typeName === 'BUY_X_GET_Y') {
+            if (!buy_quantity || Number(buy_quantity) < 1) {
+                return res.status(400).json({ message: 'Cantidad a comprar es requerida (ej: 2 para 2x1)' })
+            }
+            if (get_quantity == null || get_quantity === '' || Number(get_quantity) < 0) {
+                return res.status(400).json({ message: 'Cantidad gratis es requerida (ej: 1 para 2x1)' })
+            }
+        }
+        if (typeName === 'FREE_GIFT') {
+            if (!trigger_product_id) {
+                return res.status(400).json({ message: 'Producto activador es requerido para Regalo Gratis' })
+            }
+            if (!target_product_id) {
+                return res.status(400).json({ message: 'Producto regalo es requerido para Regalo Gratis' })
+            }
+        }
+        if (typeName === 'COMBO_DISCOUNT') {
+            if (!trigger_product_id) {
+                return res.status(400).json({ message: 'Producto A (activador) es requerido para Combo' })
+            }
+            if (!target_product_id) {
+                return res.status(400).json({ message: 'Producto B (con descuento) es requerido para Combo' })
+            }
+            if (discount_percentage == null || discount_percentage === '' || isNaN(Number(discount_percentage))) {
+                return res.status(400).json({ message: 'Porcentaje de descuento en producto B es requerido para Combo' })
+            }
+        }
+
         // Validate custom codes don't already exist
         if (codes.length > 0) {
             const upperCodes = codes.map(c => c.toUpperCase())
