@@ -288,8 +288,8 @@ async function bulkCreateSuppliers(validRows) {
                 createData.rating = row.data.rating
             }
 
-            // Default status to active (id: 1)
-            createData.status = { connect: { id: 1 } }
+            // estado: 1 = activo por defecto
+            createData.estado = 1
 
             await prisma.supplier.create({ data: createData })
             created++

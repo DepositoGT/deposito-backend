@@ -48,7 +48,7 @@ async function main() {
   // 3. CATÁLOGOS - ESTADOS Y STATUS
   // ========================================
   console.log('Creando estados y status...')
-  const statuses = ['Activo', 'Inactivo', 'Activa', 'Resuelta', 'Pendiente']
+  const statuses = ['Activa', 'Resuelta', 'Pendiente']
   const stockStatuses = ['Disponible', 'Bajo', 'Agotado']
   const saleStatuses = ['Completada', 'Cancelada']
   const paymentMethods = ['Efectivo', 'Tarjeta', 'Transferencia']
