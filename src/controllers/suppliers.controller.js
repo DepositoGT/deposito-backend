@@ -49,7 +49,6 @@ exports.list = async (req, res, next) => {
             category: true,
           },
         },
-        status: true,
         payment_term: true,
         productsList: true,
       },
@@ -138,13 +137,8 @@ exports.create = async (req, res, next) => {
       // prisma model uses payment_term relation
       createData.payment_term = { connect: { id: Number(data.payment_terms_id) } }
     }
-    if (data.status_id != null) {
-      createData.status = { connect: { id: Number(data.status_id) } }
-    }
-    // Ensure a status is connected (default to 1 if not provided)
-    if (!createData.status) {
-      createData.status = { connect: { id: 1 } }
-    }
+    // estado: 0 = inactivo, 1 = activo (default 1)
+    createData.estado = data.estado !== undefined && data.estado !== null ? Number(data.estado) : 1
 
     const created = await prisma.supplier.create({ data: createData })
     res.status(201).json(created)
@@ -161,7 +155,6 @@ exports.getOne = async (req, res, next) => {
             category: true,
           },
         },
-        status: true,
         payment_term: true,
         productsList: true,
       },
@@ -221,8 +214,8 @@ exports.update = async (req, res, next) => {
     if (data.payment_terms_id != null) {
       updateData.payment_term = { connect: { id: Number(data.payment_terms_id) } }
     }
-    if (data.status_id != null) {
-      updateData.status = { connect: { id: Number(data.status_id) } }
+    if (data.estado !== undefined && data.estado !== null) {
+      updateData.estado = Number(data.estado)
     }
 
     const updated = await prisma.supplier.update({ where: { id: req.params.id }, data: updateData })

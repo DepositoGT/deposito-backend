@@ -31,10 +31,9 @@ model ProductCategory {
 }
 
 model Status {
-  id        Int        @id @default(autoincrement())
-  name      String     @unique @db.VarChar(50)
-  suppliers Supplier[]
-  alerts    Alert[]
+  id     Int     @id @default(autoincrement())
+  name   String  @unique @db.VarChar(50)
+  alerts Alert[]
 
   @@map("statuses")
 }
@@ -112,8 +111,7 @@ model Supplier {
   last_order       DateTime?
   total_purchases  Decimal         @default(0) @db.Decimal(12, 2)
   rating           Decimal?        @db.Decimal(3, 2)
-  status_id        Int
-  status           Status          @relation(fields: [status_id], references: [id])
+  estado           Int             @default(1) // 0 = inactivo, 1 = activo
   payment_terms_id Int
   payment_term     PaymentTerm     @relation(fields: [payment_terms_id], references: [id])
   categories       SupplierCategory[]
