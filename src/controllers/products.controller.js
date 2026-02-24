@@ -338,8 +338,15 @@ exports.remove = async (req, res, next) => {
 
 exports.reportPdf = async (req, res, next) => {
   try {
+    const where = { deleted: false }
+    const idsParam = req.query.ids
+    if (idsParam && typeof idsParam === 'string' && idsParam.trim()) {
+      const ids = idsParam.split(',').map((id) => id.trim()).filter(Boolean)
+      if (ids.length > 0) where.id = { in: ids }
+    }
+
     const products = await prisma.product.findMany({
-      where: { deleted: false },
+      where,
       include: { category: true, supplier: true, status: true },
       orderBy: { name: 'asc' },
     })
@@ -352,10 +359,44 @@ exports.reportPdf = async (req, res, next) => {
     // Helper formatter
     const money = (v) => new Intl.NumberFormat('es-GT', { style: 'currency', currency: 'GTQ' }).format(Number(v || 0))
 
+    // Optional columns from query (e.g. ?fields=name,category,price,stock for cotización)
+    const fieldsParam = req.query.fields
+    const allowedFields = ['name', 'category', 'brand', 'size', 'barcode', 'price', 'cost', 'stock', 'min_stock', 'supplier', 'status', 'description']
+    const fields = fieldsParam
+      ? String(fieldsParam).split(',').map((f) => f.trim().toLowerCase()).filter((f) => allowedFields.includes(f))
+      : null
+
+    // Optional: include summary block (productos registrados, unidades, valor inventario). Default true.
+    const includeSummaryParam = req.query.includeSummary
+    const includeSummary = includeSummaryParam === undefined || includeSummaryParam === '' ||
+      (String(includeSummaryParam).toLowerCase() === 'true') || (String(includeSummaryParam) === '1')
+
+    const getCellValue = (p, key) => {
+      switch (key) {
+        case 'name': return p.name || '-'
+        case 'category': return p.category?.name || 'Sin categoría'
+        case 'brand': return p.brand || '-'
+        case 'size': return p.size || '-'
+        case 'barcode': return p.barcode || '-'
+        case 'price': return money(p.price)
+        case 'cost': return money(p.cost)
+        case 'stock': return String(Number(p.stock || 0))
+        case 'min_stock': return String(Number(p.min_stock || 0))
+        case 'supplier': return p.supplier?.name || '-'
+        case 'status': return p.status?.name || '-'
+        case 'description': return (p.description || '').toString().slice(0, 80) + ((p.description || '').length > 80 ? '...' : '')
+        default: return '-'
+      }
+    }
+    const headers = { name: 'Nombre', category: 'Categoría', brand: 'Marca', size: 'Tamaño', barcode: 'Código', price: 'Precio', cost: 'Costo', stock: 'Stock', min_stock: 'Mín.', supplier: 'Proveedor', status: 'Estado', description: 'Descripción' }
+
     // Header block
     doc.fillColor('#0b1220').fontSize(22).font('Helvetica-Bold').text('Depósito - Informe de Productos', { align: 'left' })
     doc.moveDown(0.25)
     doc.fontSize(10).font('Helvetica').fillColor('#475569').text(`Generado: ${new Date().toLocaleString('es-GT')}`)
+    if (fields && fields.length > 0) {
+      doc.fontSize(9).fillColor('#64748b').text(`Columnas: ${fields.map((f) => headers[f] || f).join(', ')}`)
+    }
     doc.moveDown(0.6)
 
     // Decorative divider
@@ -363,29 +404,103 @@ exports.reportPdf = async (req, res, next) => {
     doc.save().moveTo(doc.x, doc.y).lineTo(doc.x + pageWidth, doc.y).lineWidth(1).stroke('#e6eef6')
     doc.moveDown(0.8)
 
-    // Summary cards
-    const totalProductos = products.length
-    const totalUnidades = products.reduce((s, p) => s + Number(p.stock || 0), 0)
-    const valorInventario = products.reduce((s, p) => s + Number(p.stock || 0) * Number(p.cost || 0), 0)
+    let gridTop
+    if (includeSummary) {
+      // Summary cards
+      const totalProductos = products.length
+      const totalUnidades = products.reduce((s, p) => s + Number(p.stock || 0), 0)
+      const valorInventario = products.reduce((s, p) => s + Number(p.stock || 0) * Number(p.cost || 0), 0)
 
-    const cardW = (pageWidth - 24) / 3
-    const cardH = 56
-    const startX = doc.x
-    const startY = doc.y
+      const cardW = (pageWidth - 24) / 3
+      const cardH = 56
+      const startX = doc.x
+      const startY = doc.y
 
-    const drawSummary = (x, y, title, value, color = '#0b1220') => {
-      doc.roundedRect(x, y, cardW, cardH, 8).fill('#ffffff').stroke('#e6eef6')
-      doc.fillColor('#0b1220').font('Helvetica').fontSize(9).text(title, x + 10, y + 8, { width: cardW - 20 })
-      doc.fillColor(color).font('Helvetica-Bold').fontSize(14).text(value, x + 10, y + 26, { width: cardW - 20 })
+      const drawSummary = (x, y, title, value, color = '#0b1220') => {
+        doc.roundedRect(x, y, cardW, cardH, 8).fill('#ffffff').stroke('#e6eef6')
+        doc.fillColor('#0b1220').font('Helvetica').fontSize(9).text(title, x + 10, y + 8, { width: cardW - 20 })
+        doc.fillColor(color).font('Helvetica-Bold').fontSize(14).text(value, x + 10, y + 26, { width: cardW - 20 })
+      }
+
+      drawSummary(startX, startY, 'Productos registrados', String(totalProductos), '#0b1220')
+      drawSummary(startX + cardW + 12, startY, 'Unidades en inventario', String(totalUnidades), '#0b1220')
+      drawSummary(startX + (cardW + 12) * 2, startY, 'Valor del inventario (GTQ)', money(valorInventario), '#0b1220')
+
+      gridTop = startY + cardH + 24
+    } else {
+      gridTop = doc.y
     }
 
-    drawSummary(startX, startY, 'Productos registrados', String(totalProductos), '#0b1220')
-    drawSummary(startX + cardW + 12, startY, 'Unidades en inventario', String(totalUnidades), '#0b1220')
-    drawSummary(startX + (cardW + 12) * 2, startY, 'Valor del inventario (GTQ)', money(valorInventario), '#0b1220')
+    if (fields && fields.length > 0) {
+      const colCount = fields.length
+      const fontSize = 8
+      const cellPadding = 8
+      const minRowHeight = 16
+      const colWidth = (pageWidth - 2) / colCount
+      const headerHeight = 22
+      const headerOrange = '#d97706'
+      const headerTextWhite = '#ffffff'
+      const borderColor = '#e2e8f0'
+      const rowBgEven = '#f8fafc'
+      const rowBgOdd = '#ffffff'
+      doc.fontSize(fontSize).font('Helvetica')
 
-    // leave space after the summary cards and start the grid just below them
-    const gridTop = startY + cardH + 24
+      const getCellTextHeight = (text, w) => {
+        if (!text) return minRowHeight - 4
+        const h = doc.heightOfString(String(text), { width: Math.max(20, w - cellPadding * 2) })
+        return Math.max(minRowHeight - 4, h)
+      }
 
+      let tableY = gridTop
+
+      // Header con color naranja de la plataforma
+      doc.rect(doc.page.margins.left, tableY, pageWidth, headerHeight).fill(headerOrange).stroke(borderColor)
+      doc.fillColor(headerTextWhite).font('Helvetica-Bold')
+      let headerX = doc.page.margins.left
+      for (let i = 0; i < fields.length; i++) {
+        const label = headers[fields[i]] || fields[i]
+        doc.text(String(label).slice(0, 25), headerX + cellPadding, tableY + 6, { width: colWidth - cellPadding * 2 })
+        headerX += colWidth
+      }
+      tableY += headerHeight
+
+      for (let rowIndex = 0; rowIndex < products.length; rowIndex++) {
+        const p = products[rowIndex]
+        const values = fields.map((f) => getCellValue(p, f))
+        const cellHeights = values.map((v, i) => getCellTextHeight(v, colWidth))
+        const rowHeight = Math.max(minRowHeight, ...cellHeights) + 10
+
+        if (tableY + rowHeight > doc.page.height - doc.page.margins.bottom - 25) {
+          doc.addPage()
+          tableY = doc.page.margins.top
+          doc.rect(doc.page.margins.left, tableY, pageWidth, headerHeight).fill(headerOrange).stroke(borderColor)
+          doc.fillColor(headerTextWhite).font('Helvetica-Bold')
+          headerX = doc.page.margins.left
+          for (let i = 0; i < fields.length; i++) {
+            doc.text(String(headers[fields[i]] || fields[i]).slice(0, 25), headerX + cellPadding, tableY + 6, { width: colWidth - cellPadding * 2 })
+            headerX += colWidth
+          }
+          tableY += headerHeight
+        }
+
+        const rowBg = rowIndex % 2 === 0 ? rowBgEven : rowBgOdd
+        doc.rect(doc.page.margins.left, tableY, pageWidth, rowHeight).fill(rowBg).stroke(borderColor)
+        doc.fillColor('#374151').font('Helvetica')
+        let cellX = doc.page.margins.left
+        const rightAlignKeys = ['price', 'cost', 'stock', 'min_stock']
+        for (let c = 0; c < values.length; c++) {
+          const cellW = colWidth - cellPadding * 2
+          const val = String(values[c] ?? '-')
+          const align = rightAlignKeys.includes(fields[c]) ? 'right' : 'left'
+          doc.text(val, cellX + cellPadding, tableY + 4, { width: cellW, height: rowHeight - 8, align, ellipsis: true })
+          if (c < values.length - 1) {
+            doc.strokeColor(borderColor).lineWidth(0.3).moveTo(cellX + colWidth, tableY).lineTo(cellX + colWidth, tableY + rowHeight).stroke()
+          }
+          cellX += colWidth
+        }
+        tableY += rowHeight
+      }
+    } else {
     // Product cards grid (2 columns)
     const cols = 2
     const gap = 12
@@ -485,6 +600,7 @@ exports.reportPdf = async (req, res, next) => {
       doc.restore()
 
       x += cardWidth + gap
+    }
     }
 
     // Footer
