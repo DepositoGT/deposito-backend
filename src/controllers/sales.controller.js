@@ -118,7 +118,14 @@ exports.list = async (req, res, next) => {
           orderBy: {
             return_date: 'desc'
           }
-        }
+        },
+        createdBy: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+          }
+        },
       },
       orderBy: { date: 'desc' },
       skip: (safePage - 1) * pageSize,
@@ -178,7 +185,14 @@ exports.getById = async (req, res, next) => {
           orderBy: {
             return_date: 'desc'
           }
-        }
+        },
+        createdBy: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+          }
+        },
       }
     })
 
@@ -195,6 +209,10 @@ exports.getById = async (req, res, next) => {
 exports.create = async (req, res, next) => {
   try {
     console.log(req.body)
+    const user = req.user
+    if (!user || !user.sub) {
+      return res.status(401).json({ message: 'Usuario no autenticado' })
+    }
     const { items, admin_authorized_products = [], promotion_codes = [], ...saleData } = req.body
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ message: 'items es requerido' })
@@ -348,6 +366,7 @@ exports.create = async (req, res, next) => {
           total_returned: 0,  // Nueva venta sin devoluciones
           adjusted_total: total,  // Total ajustado = total (sin devoluciones aún)
           status_id: completadaStatus.id,
+          created_by: user.sub,
         },
       })
 
