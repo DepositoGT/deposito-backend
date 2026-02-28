@@ -26,8 +26,9 @@ async function main() {
   console.log('Roles creados')
 
   // ========================================
-  // 2. CATÁLOGOS - CATEGORÍAS DE PRODUCTOS
+  // 2. CATÁLOGOS - CATEGORÍAS DE PRODUCTOS (limpieza de categorías sin uso)
   // ========================================
+  const oldCategories = await prisma.productCategory.findMany()
 
   for (const cat of oldCategories) {
     const linkedProducts = await prisma.product.count({ where: { category_id: cat.id } })
@@ -105,7 +106,10 @@ async function main() {
 
     // Cierre de caja
     { code: 'cashclosure.view', name: 'Ver cierres de caja', description: 'Puede ver cierres de caja' },
-    { code: 'cashclosure.create', name: 'Crear cierres de caja', description: 'Puede crear cierres de caja' },
+    { code: 'cashclosure.create', name: 'Crear cierres de caja', description: 'Puede crear cierres (acceso completo: día y propio)' },
+    { code: 'cashclosure.create_day', name: 'Generar cierre del día', description: 'Puede generar cierre del día (todos los cajeros)' },
+    { code: 'cashclosure.create_own', name: 'Generar solo mi cierre', description: 'Puede generar solo su cierre (cajero)' },
+    { code: 'cashclosure.approve', name: 'Aprobar/Rechazar cierres', description: 'Puede aprobar o rechazar cierres de caja' },
     { code: 'cashclosure.validate', name: 'Validar cierres de caja', description: 'Puede validar y cerrar cierres de caja' },
 
     // Catálogos, condiciones de pago, categorías
@@ -181,7 +185,7 @@ async function main() {
     'catalogs.view',
     'alerts.view',
     'cashclosure.view',
-    'cashclosure.create',
+    'cashclosure.create_own',  // Cajero: solo puede generar su propio cierre
     'analytics.view',
     'merchandise.view',
   ]
