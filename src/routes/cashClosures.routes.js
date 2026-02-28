@@ -9,6 +9,7 @@
  */
 
 const { Router } = require('express')
+const { Auth, hasPermission } = require('../middlewares/autenticacion')
 const {
   calculateTheoretical,
   create,
@@ -22,24 +23,27 @@ const {
 
 const router = Router()
 
+// Cualquier permiso de crear cierre permite calcular y crear (el controlador valida día vs propio)
+const canCreateAny = hasPermission('cashclosure.create', 'cashclosure.create_day', 'cashclosure.create_own')
+
 // Validar stocks antes de permitir cierre
-router.get('/validate-stocks', validateStocks)
+router.get('/validate-stocks', Auth, validateStocks)
 
-// Calcular cierre teórico
-router.get('/calculate-theoretical', calculateTheoretical)
+// Calcular cierre teórico (Auth + al menos un permiso de crear; el controller valida tipo)
+router.get('/calculate-theoretical', Auth, canCreateAny, calculateTheoretical)
 
-// Obtener fecha del último cierre
-router.get('/last-closure-date', getLastClosureDate)
+// Obtener fecha del último cierre (cualquiera con acceso a cierres)
+router.get('/last-closure-date', Auth, hasPermission('cashclosure.view', 'cashclosure.create', 'cashclosure.create_day', 'cashclosure.create_own'), getLastClosureDate)
 
 // CRUD
-router.get('/', list)
-router.get('/:id', getById)
-router.post('/', create)
+router.get('/', Auth, hasPermission('cashclosure.view'), list)
+router.get('/:id', Auth, hasPermission('cashclosure.view'), getById)
+router.post('/', Auth, canCreateAny, create)
 
 // Validar cierre (firma supervisor)
-router.patch('/:id/validate', validate)
+router.patch('/:id/validate', Auth, hasPermission('cashclosure.validate'), validate)
 
 // Actualizar estado del cierre (Aprobar/Rechazar)
-router.patch('/:id/status', updateStatus)
+router.patch('/:id/status', Auth, hasPermission('cashclosure.approve', 'cashclosure.validate'), updateStatus)
 
 module.exports = router
