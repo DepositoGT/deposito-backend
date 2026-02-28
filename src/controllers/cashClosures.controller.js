@@ -17,6 +17,21 @@ const number = (v) => {
   return Number.isFinite(n) ? n : 0
 }
 
+/** Verifica permiso según tipo de cierre (día = todos, own = solo mi cierre). Devuelve { allowed } o { allowed: false, status, message }. */
+function checkClosureScopePermission(req, isOwnClosure) {
+  const user = req.user
+  if (!user) return { allowed: false, status: 401, message: 'No autenticado' }
+  const perms = Array.isArray(user.permissions) ? user.permissions.map(String) : []
+  const isAdmin = (user.role?.name || user.role_name || '').toLowerCase() === 'admin'
+  if (isAdmin) return { allowed: true }
+  if (isOwnClosure) {
+    const has = perms.includes('cashclosure.create') || perms.includes('cashclosure.create_own')
+    return has ? { allowed: true } : { allowed: false, status: 403, message: 'No tiene permiso para generar solo su cierre' }
+  }
+  const has = perms.includes('cashclosure.create') || perms.includes('cashclosure.create_day')
+  return has ? { allowed: true } : { allowed: false, status: 403, message: 'No tiene permiso para generar cierre del día' }
+}
+
 /**
  * GET /api/cash-closures/validate-stocks
  * Valida que no haya productos con stock negativo antes de permitir el cierre
@@ -66,12 +81,23 @@ exports.validateStocks = async (req, res, next) => {
  */
 exports.calculateTheoretical = async (req, res, next) => {
   try {
-    // Aceptar tanto startDate/endDate como start_date/end_date
+    // Aceptar tanto startDate/endDate como start_date/end_date; cashier_id opcional para filtrar por cajero
     const startDate = req.query.startDate || req.query.start_date
     const endDate = req.query.endDate || req.query.end_date
-    
+    const cashierId = req.query.cashier_id || req.query.cashierId || null
+
     if (!startDate || !endDate) {
       return res.status(400).json({ message: 'startDate y endDate son requeridos' })
+    }
+
+    // Permiso según tipo de cierre: día (sin cashier_id) vs propio (con cashier_id)
+    const isOwn = !!cashierId
+    const permCheck = checkClosureScopePermission(req, isOwn)
+    if (!permCheck.allowed) {
+      return res.status(permCheck.status || 403).json({ message: permCheck.message || 'No autorizado' })
+    }
+    if (isOwn && req.user?.sub && cashierId !== req.user.sub) {
+      return res.status(403).json({ message: 'Solo puede generar el cierre de su propia caja' })
     }
 
     // Parsear fechas en zona horaria de Guatemala (UTC-6)
@@ -100,21 +126,27 @@ exports.calculateTheoretical = async (req, res, next) => {
     console.log('Calculando cierre para período:', {
       startDate,
       endDate,
+      cashier_id: cashierId || '(todos)',
       start: start.toISOString(),
       end: end.toISOString()
     })
-    
+
     // Obtener estado "Completada"
     const completedStatus = await prisma.saleStatus.findFirst({
       where: { name: 'Completada' }
     })
 
-    // Obtener todas las ventas completadas en el período
+    const salesWhere = {
+      sold_at: { gte: start, lte: end },
+      status_id: completedStatus?.id
+    }
+    if (cashierId) {
+      salesWhere.created_by = cashierId
+    }
+
+    // Obtener ventas completadas en el período (opcionalmente filtradas por cajero)
     const sales = await prisma.sale.findMany({
-      where: {
-        sold_at: { gte: start, lte: end },
-        status_id: completedStatus?.id
-      },
+      where: salesWhere,
       include: {
         payment_method: true,
         returns: {
@@ -211,8 +243,10 @@ exports.create = async (req, res, next) => {
       endDate,
       cashierName,
       cashierSignature,
+      cashierId,
       supervisorName,
       supervisorSignature,
+      supervisorId,
       theoreticalTotal,
       theoreticalSales,
       theoreticalReturns,
@@ -224,10 +258,21 @@ exports.create = async (req, res, next) => {
       denominations,      // Array de { denomination, type, quantity }
       notes
     } = req.body
+    const authUser = req.user
 
     // Validaciones
     if (!startDate || !endDate || !cashierName) {
       return res.status(400).json({ message: 'Datos incompletos' })
+    }
+
+    // Permiso según tipo de cierre: día (sin cashierId) vs propio (con cashierId)
+    const isOwnClosure = !!cashierId
+    const permCheck = checkClosureScopePermission(req, isOwnClosure)
+    if (!permCheck.allowed) {
+      return res.status(permCheck.status || 403).json({ message: permCheck.message || 'No autorizado' })
+    }
+    if (isOwnClosure && authUser?.sub && cashierId !== authUser.sub) {
+      return res.status(403).json({ message: 'Solo puede registrar el cierre de su propia caja' })
     }
 
     // Parsear fechas correctamente (sin conversión de zona horaria)
@@ -274,6 +319,9 @@ exports.create = async (req, res, next) => {
       dateGt: nowGuatemala.toFormat('yyyy-MM-dd HH:mm:ss')
     });
 
+    const cashierUuid = cashierId || authUser?.sub || null
+    const supervisorUuid = supervisorId || null
+
     // Crear cierre de caja
     const cashClosure = await prisma.cashClosure.create({
       data: {
@@ -282,9 +330,11 @@ exports.create = async (req, res, next) => {
         end_date: endDateUTC,
         cashier_name: cashierName,
         cashier_signature: cashierSignature || null,
+        cashier_id: cashierUuid || undefined,
         supervisor_name: supervisorName || null,
         supervisor_signature: supervisorSignature || null,
         supervisor_validated_at: supervisorSignature ? dateUTC : null,
+        supervisor_id: supervisorUuid || undefined,
         theoretical_total: theoreticalTotal,
         theoretical_sales: theoreticalSales,
         theoretical_returns: theoreticalReturns,
@@ -295,7 +345,7 @@ exports.create = async (req, res, next) => {
         total_customers: totalCustomers,
         average_ticket: averageTicket,
         notes: notes || null,
-        status: supervisorSignature ? 'Validado' : 'Pendiente'
+        status: 'Pendiente'
       }
     })
 
@@ -475,13 +525,13 @@ exports.validate = async (req, res, next) => {
       nowGuatemala.hour, nowGuatemala.minute, nowGuatemala.second, nowGuatemala.millisecond
     ).toJSDate();
 
+    // status se mantiene (Pendiente); aprobación/rechazo vía PATCH :id/status
     const updated = await prisma.cashClosure.update({
       where: { id },
       data: {
         supervisor_name: supervisorName,
         supervisor_signature: supervisorSignature,
-        supervisor_validated_at: validatedAtUTC,
-        status: 'Validado'
+        supervisor_validated_at: validatedAtUTC
       },
       include: {
         payment_breakdowns: {
@@ -505,7 +555,16 @@ exports.validate = async (req, res, next) => {
  */
 exports.getLastClosureDate = async (req, res, next) => {
   try {
+    const scope = String(req.query.scope || 'day').toLowerCase() === 'mine' ? 'mine' : 'day'
+    const authUser = req.user
+
+    const where =
+      scope === 'mine' && authUser?.sub
+        ? { cashier_id: authUser.sub }
+        : undefined
+
     const lastClosure = await prisma.cashClosure.findFirst({
+      where,
       orderBy: {
         end_date: 'desc'
       },
@@ -515,10 +574,12 @@ exports.getLastClosureDate = async (req, res, next) => {
       }
     })
 
+    const fallbackStart = DateTime.now().setZone('America/Guatemala').startOf('day').toJSDate()
+
     res.json({
       last_end_date: lastClosure?.end_date || null,
       last_closure_number: lastClosure?.closure_number || 0,
-      suggested_start: lastClosure?.end_date || DateTime.now().setZone('America/Guatemala').startOf('day').toJSDate()
+      suggested_start: lastClosure?.end_date || fallbackStart
     })
   } catch (e) {
     next(e)
@@ -532,7 +593,8 @@ exports.getLastClosureDate = async (req, res, next) => {
 exports.updateStatus = async (req, res, next) => {
   try {
     const { id } = req.params
-    const { status, supervisor_name, rejection_reason } = req.body
+    const { status, supervisor_name, supervisor_id: bodySupervisorId, rejection_reason } = req.body
+    const authUser = req.user
 
     // Validar que el estado sea válido
     const validStatuses = ['Aprobado', 'Rechazado', 'Pendiente']
@@ -563,6 +625,10 @@ exports.updateStatus = async (req, res, next) => {
         updateData.supervisor_name = supervisor_name
       }
       updateData.supervisor_validated_at = new Date()
+      const supervisorUuid = bodySupervisorId || authUser?.sub || null
+      if (supervisorUuid) {
+        updateData.supervisor_id = supervisorUuid
+      }
     }
 
     // Si se rechaza, agregar razón en las notas
