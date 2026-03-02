@@ -10,6 +10,7 @@
 
 const { prisma } = require('../models/prisma')
 const { DateTime } = require('luxon')
+const { getTimezone } = require('../utils/getTimezone')
 const { ensureStockAlertsBatch } = require('../services/stockAlerts')
 const { salesOperationLimiter } = require('../utils/concurrencyLimiter')
 
@@ -20,11 +21,11 @@ exports.list = async (req, res, next) => {
     const page = Math.max(1, Number(req.query.page ?? 1))
     const pageSize = Math.min(1000, Math.max(1, Number(req.query.pageSize ?? 100)))
 
-    // determine date range based on Guatemala local time if period provided
     let startDate
     let endDate
     if (period) {
-      const nowGt = DateTime.now().setZone('America/Guatemala')
+      const tz = await getTimezone(prisma)
+      const nowGt = DateTime.now().setZone(tz)
       let startGt
       let endGt
       switch (String(period)) {
@@ -333,11 +334,8 @@ exports.create = async (req, res, next) => {
       const completadaStatus = await tx.saleStatus.findFirst({ where: { name: 'Completada' } })
       if (!completadaStatus) throw new Error("No existe el estado 'Completada'")
 
-      // CRITICAL: Sale timestamp handling for Guatemala timezone (UTC-6)
-      // PostgreSQL stores all timestamps in UTC by default
-      // We want to store the current Guatemala time AS IF it were UTC
-      // Example: If it's 15:28 in Guatemala, we want DB to show 15:28, not 21:28
-      const nowGt = DateTime.now().setZone('America/Guatemala');
+      const tz = await getTimezone(prisma)
+      const nowGt = DateTime.now().setZone(tz);
 
       // Create UTC Date with Guatemala's time values
       // This "tricks" PostgreSQL into storing Guatemala time as UTC

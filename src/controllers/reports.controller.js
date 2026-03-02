@@ -11,6 +11,7 @@
 const { prisma } = require('../models/prisma')
 const { DateTime } = require('luxon')
 const PDFDocument = require('pdfkit')
+const { getSystemConfig } = require('../utils/getTimezone')
 
 // Brand & styles inspired by Products PDF
 const BRAND = {
@@ -92,7 +93,10 @@ function number(v) {
   return Number.isFinite(n) ? n : 0
 }
 
-const money = (v) => 'Q ' + number(v).toLocaleString('es-GT')
+function makeMoney(currencyCode) {
+  const code = (currencyCode && String(currencyCode).trim()) || 'GTQ'
+  return (v) => new Intl.NumberFormat('es-GT', { style: 'currency', currency: code }).format(number(v))
+}
 
 function newDoc(res, title) {
   // Switch to US Letter for better print alignment (612 x 792 points) and slightly smaller margins
@@ -123,20 +127,19 @@ function ensureSpace(doc, needed) {
   if (doc.y + needed > bottom) addPageWithBand(doc)
 }
 
-function header(doc, title, periodLabel) {
+function header(doc, title, periodLabel, companyName = 'Depósito') {
   const left = doc.page.margins.left
   const right = doc.page.width - doc.page.margins.right
-  // More compact header for Letter
   doc.fillColor(BRAND.primary).fontSize(20).text(title, left, 32, { align: 'left' })
   doc.fontSize(9).fillColor(BRAND.muted).text(`Generado: ${DateTime.now().setZone('America/Guatemala').toFormat('yyyy-LL-dd HH:mm')}  |  Período: ${periodLabel}`, { align: 'left' })
   doc.moveTo(left, doc.y + 4).lineTo(right, doc.y + 4).lineWidth(1).strokeColor(BRAND.border).stroke()
   doc.moveDown(0.6)
 }
 
-function footer(doc) {
+function footer(doc, companyName = 'Depósito') {
   const bottom = doc.page.height - doc.page.margins.bottom + 12
   doc.fontSize(8).fillColor(BRAND.muted)
-    .text(`Reporte generado por Depósito GT  |  Página ${doc.page.number}`, doc.page.margins.left, bottom, { align: 'center' })
+    .text(`Reporte generado por ${companyName}  |  Página ${doc.page.number}`, doc.page.margins.left, bottom, { align: 'center' })
 }
 
 function sectionTitle(doc, text) {
@@ -461,6 +464,9 @@ function sendCsv(res, filename, headerLines = [], sections = []) {
 
 async function salesReport(req, res, next) {
   try {
+  const config = await getSystemConfig(prisma)
+  const companyName = config.company_name
+  const money = makeMoney(config.currency_code)
   const { period='month', year, format='pdf', month, quarter, semester } = req.query
   const { startUtc, endUtc, label } = periodRange(period, year, { month, quarter, semester })
     const data = await getSalesData(startUtc, endUtc)
@@ -470,19 +476,19 @@ async function salesReport(req, res, next) {
         'REPORTE DE VENTAS',
         `Periodo,${label}`,
         `Generado,${DateTime.now().setZone('America/Guatemala').toFormat('yyyy-LL-dd HH:mm')}`,
-        `Ventas Brutas,Q ${data.totalRevenueGross.toLocaleString('es-GT')}`,
-        `Devoluciones,Q ${data.totalReturned.toLocaleString('es-GT')}`,
-        `Ventas Netas,Q ${data.totalRevenue.toLocaleString('es-GT')}`,
-        `Costos Totales,Q ${data.totalCost.toLocaleString('es-GT')}`,
-        `Ganancia Neta,Q ${data.totalProfit.toLocaleString('es-GT')}`
+        `Ventas Brutas,${money(data.totalRevenueGross)}`,
+        `Devoluciones,${money(data.totalReturned)}`,
+        `Ventas Netas,${money(data.totalRevenue)}`,
+        `Costos Totales,${money(data.totalCost)}`,
+        `Ganancia Neta,${money(data.totalProfit)}`
       ], [
-        { title: 'Top Productos', columns: ['Producto','Unidades','Ingresos (Q)'], rows: data.topProducts.map(p=>[p.name, p.ventas, p.revenue]) },
-        { title: 'Categorias', columns: ['Categoría','Ingresos (Q)','%'], rows: data.categories.map(c=>[c.category, c.revenue, Math.round((c.revenue/total)*100)+'%']) }
+        { title: 'Top Productos', columns: ['Producto','Unidades','Ingresos'], rows: data.topProducts.map(p=>[p.name, p.ventas, money(p.revenue)]) },
+        { title: 'Categorias', columns: ['Categoría','Ingresos','%'], rows: data.categories.map(c=>[c.category, money(c.revenue), Math.round((c.revenue/total)*100)+'%']) }
       ])
       return
     }
     const doc = newDoc(res, 'Reporte de Ventas')
-    header(doc, 'Reporte de Ventas', label)
+    header(doc, 'Reporte de Ventas', label, companyName)
     sectionTitle(doc, 'Resumen')
     drawSummaryCards(doc, [
       { label: 'Ventas Brutas', value: money(data.totalRevenueGross) },
@@ -492,17 +498,20 @@ async function salesReport(req, res, next) {
       { label: 'Ganancia Neta', value: money(data.totalProfit) },
     ])
   sectionTitle(doc, 'Top Productos (por ingresos)')
-  drawTable(doc, ['Producto','Unidades','Ingresos (Q)'], data.topProducts.map(p=>[p.name, p.ventas, p.revenue.toLocaleString('es-GT')]), [150,80,100], { align: ['left','right','right'], headerAlign: ['left','right','right'] })
+  drawTable(doc, ['Producto','Unidades','Ingresos'], data.topProducts.map(p=>[p.name, p.ventas, money(p.revenue)]), [150,80,100], { align: ['left','right','right'], headerAlign: ['left','right','right'] })
   sectionTitle(doc, 'Categorías (por ingresos)')
   const total = data.totalRevenue || 1
-  drawTable(doc, ['Categoría','Ingresos (Q)','%'], data.categories.map(c=>[c.category, c.revenue.toLocaleString('es-GT'), Math.round((c.revenue/total)*100)+'%']), [150,120,50], { align: ['left','right','right'], headerAlign: ['left','right','right'] })
-    footer(doc)
+  drawTable(doc, ['Categoría','Ingresos','%'], data.categories.map(c=>[c.category, money(c.revenue), Math.round((c.revenue/total)*100)+'%']), [150,120,50], { align: ['left','right','right'], headerAlign: ['left','right','right'] })
+    footer(doc, companyName)
     doc.end()
   } catch(e) { next(e) }
 }
 
 async function inventoryReport(req,res,next){
   try {
+    const config = await getSystemConfig(prisma)
+    const companyName = config.company_name
+    const money = makeMoney(config.currency_code)
     const { format='pdf' } = req.query
     const products = await prisma.product.findMany({ where:{ deleted_at: null }, include:{ category:true } })
     if (String(format).toLowerCase() === 'csv' || String(format).toLowerCase() === 'excel') {
@@ -511,16 +520,16 @@ async function inventoryReport(req,res,next){
         'REPORTE DE INVENTARIO',
         `Generado,${DateTime.now().setZone('America/Guatemala').toFormat('yyyy-LL-dd HH:mm')}`,
         `Total Productos,${products.length}`,
-        `Valor Total,Q ${totalValue.toLocaleString('es-GT')}`
+        `Valor Total,${money(totalValue)}`
       ], [{
         title:'Detalle',
-        columns:['Producto','Categoría','Stock','Costo (Q)','Valor (Q)'],
-        rows: products.map(p=>[p.name, p.category?.name||'—', p.stock, number(p.cost), (number(p.stock)*number(p.cost))])
+        columns:['Producto','Categoría','Stock','Costo','Valor'],
+        rows: products.map(p=>[p.name, p.category?.name||'—', p.stock, money(number(p.cost)), money(number(p.stock)*number(p.cost))])
       }])
       return
     }
     const doc = newDoc(res, 'Reporte de Inventario')
-    header(doc, 'Reporte de Inventario', 'Actual')
+    header(doc, 'Reporte de Inventario', 'Actual', companyName)
     sectionTitle(doc, 'Resumen')
     const totalProducts = products.length
     const totalValue = products.reduce((acc,p)=>acc+ number(p.stock)* number(p.cost),0)
@@ -531,14 +540,16 @@ async function inventoryReport(req,res,next){
       { label: 'Stock Bajo', value: String(lowStock) },
     ])
   sectionTitle(doc,'Detalle de Inventario')
-  drawTable(doc, ['Producto','Categoría','Stock','Costo (Q)','Valor (Q)'], products.slice(0,100).map(p=>[p.name, p.category?.name||'—', p.stock, number(p.cost).toLocaleString('es-GT'), (number(p.stock)*number(p.cost)).toLocaleString('es-GT')]), [170,110,50,70,80], { align: ['left','left','right','right','right'], headerAlign: ['left','left','right','right','right'] })
-    footer(doc)
+  drawTable(doc, ['Producto','Categoría','Stock','Costo','Valor'], products.slice(0,100).map(p=>[p.name, p.category?.name||'—', p.stock, money(number(p.cost)), money(number(p.stock)*number(p.cost))]), [170,110,50,70,80], { align: ['left','left','right','right','right'], headerAlign: ['left','left','right','right','right'] })
+    footer(doc, companyName)
     doc.end()
   } catch(e){ next(e) }
 }
 
 async function suppliersReport(req,res,next){
   try {
+    const config = await getSystemConfig(prisma)
+    const companyName = config.company_name
     const { format='pdf' } = req.query
     const suppliers = await prisma.supplier.findMany({ where:{ deleted_at: null } })
     if (String(format).toLowerCase() === 'csv' || String(format).toLowerCase() === 'excel') {
@@ -554,7 +565,7 @@ async function suppliersReport(req,res,next){
       return
     }
     const doc = newDoc(res, 'Reporte de Proveedores')
-    header(doc, 'Reporte de Proveedores', 'Actual')
+    header(doc, 'Reporte de Proveedores', 'Actual', companyName)
     sectionTitle(doc,'Resumen')
     drawSummaryCards(doc, [
       { label: 'Proveedores Activos', value: String(suppliers.length) },
@@ -563,13 +574,16 @@ async function suppliersReport(req,res,next){
     ])
   sectionTitle(doc,'Listado de Proveedores')
   drawSuppliersGrid(doc, suppliers.slice(0,300))
-    footer(doc)
+    footer(doc, companyName)
     doc.end()
   } catch(e){ next(e) }
 }
 
 async function financialReport(req,res,next){
   try {
+  const config = await getSystemConfig(prisma)
+  const companyName = config.company_name
+  const money = makeMoney(config.currency_code)
   const { period='month', year, format='pdf', month, quarter, semester } = req.query
   const { startUtc, endUtc, label } = periodRange(period, year, { month, quarter, semester })
     const data = await getSalesData(startUtc, endUtc)
@@ -579,20 +593,20 @@ async function financialReport(req,res,next){
       sendCsv(res, 'reporte-financiero', [
         'REPORTE FINANCIERO',
         `Periodo,${label}`,
-        `Ingresos Brutos,Q ${data.totalRevenueGross.toLocaleString('es-GT')}`,
-        `Devoluciones,Q ${data.totalReturned.toLocaleString('es-GT')}`,
-        `Ingresos Netos,Q ${data.totalRevenue.toLocaleString('es-GT')}`,
-        `Costos,Q ${data.totalCost.toLocaleString('es-GT')}`,
-        `Ganancia,Q ${data.totalProfit.toLocaleString('es-GT')}`,
+        `Ingresos Brutos,${money(data.totalRevenueGross)}`,
+        `Devoluciones,${money(data.totalReturned)}`,
+        `Ingresos Netos,${money(data.totalRevenue)}`,
+        `Costos,${money(data.totalCost)}`,
+        `Ganancia,${money(data.totalProfit)}`,
         `Margen,${margin}%`
       ], [
-        { title:'Distribución por Categoría', columns:['Categoría','Ingresos (Q)','% del Total'], rows: data.categories.map(c=>[c.category, c.revenue, ((c.revenue/total)*100).toFixed(1)+'%']) },
-        { title:'Top Productos', columns:['Producto','Unidades','Ingresos (Q)'], rows: data.topProducts.map(p=>[p.name, p.ventas, p.revenue]) }
+        { title:'Distribución por Categoría', columns:['Categoría','Ingresos','% del Total'], rows: data.categories.map(c=>[c.category, money(c.revenue), ((c.revenue/total)*100).toFixed(1)+'%']) },
+        { title:'Top Productos', columns:['Producto','Unidades','Ingresos'], rows: data.topProducts.map(p=>[p.name, p.ventas, money(p.revenue)]) }
       ])
       return
     }
     const doc = newDoc(res, 'Reporte Financiero')
-    header(doc, 'Reporte Financiero', label)
+    header(doc, 'Reporte Financiero', label, companyName)
     sectionTitle(doc,'Métricas Clave')
     const margin = data.totalRevenue ? ((data.totalProfit / data.totalRevenue) * 100).toFixed(1) : '0.0'
     drawSummaryCards(doc, [
@@ -604,16 +618,18 @@ async function financialReport(req,res,next){
     ])
   sectionTitle(doc,'Distribución de Ingresos por Categoría')
   const total = data.totalRevenue || 1
-  drawTable(doc, ['Categoría','Ingresos (Q)','% del Total'], data.categories.map(c=>[c.category, c.revenue.toLocaleString('es-GT'), ((c.revenue/total)*100).toFixed(1)+'%']), [170,120,80], { align: ['left','right','right'], headerAlign: ['left','right','right'] })
+  drawTable(doc, ['Categoría','Ingresos','% del Total'], data.categories.map(c=>[c.category, money(c.revenue), ((c.revenue/total)*100).toFixed(1)+'%']), [170,120,80], { align: ['left','right','right'], headerAlign: ['left','right','right'] })
   sectionTitle(doc,'Top Productos')
-  drawTable(doc, ['Producto','Unidades','Ingresos (Q)'], data.topProducts.map(p=>[p.name, p.ventas, p.revenue.toLocaleString('es-GT')]), [170,70,100], { align: ['left','right','right'], headerAlign: ['left','right','right'] })
-    footer(doc)
+  drawTable(doc, ['Producto','Unidades','Ingresos'], data.topProducts.map(p=>[p.name, p.ventas, money(p.revenue)]), [170,70,100], { align: ['left','right','right'], headerAlign: ['left','right','right'] })
+    footer(doc, companyName)
     doc.end()
   } catch(e){ next(e) }
 }
 
 async function alertsReport(req,res,next){
   try {
+    const config = await getSystemConfig(prisma)
+    const companyName = config.company_name
     const { format='pdf' } = req.query
     const products = await prisma.product.findMany({ where:{ deleted_at:null } })
     const low = products.filter(p=> number(p.stock) <= number(p.min_stock))
@@ -631,7 +647,7 @@ async function alertsReport(req,res,next){
       return
     }
     const doc = newDoc(res, 'Reporte de Alertas')
-    header(doc,'Reporte de Alertas','Actual')
+    header(doc,'Reporte de Alertas','Actual', companyName)
     sectionTitle(doc,'Resumen')
     drawSummaryCards(doc, [
       { label: 'Stock Bajo', value: String(low.length) },
@@ -642,13 +658,16 @@ async function alertsReport(req,res,next){
   drawTable(doc, ['Producto','Stock','Stock Mín.'], low.slice(0,100).map(p=>[p.name, p.stock, p.min_stock]), [180,60,70], { align: ['left','right','right'], headerAlign: ['left','right','right'] })
   sectionTitle(doc,'Productos sin Stock')
   drawTable(doc, ['Producto'], critical.slice(0,80).map(p=>[p.name]), [200], { align: ['left'], headerAlign: ['left'] })
-    footer(doc)
+    footer(doc, companyName)
     doc.end()
   } catch(e){ next(e) }
 }
 
 async function productsReport(req,res,next){
   try {
+    const config = await getSystemConfig(prisma)
+    const companyName = config.company_name
+    const money = makeMoney(config.currency_code)
     const { format='pdf' } = req.query
     const products = await prisma.product.findMany({ where:{ deleted_at:null }, include:{ category:true } })
     if (String(format).toLowerCase() === 'csv' || String(format).toLowerCase() === 'excel') {
@@ -661,12 +680,12 @@ async function productsReport(req,res,next){
         `Total Productos,${total}`
       ], [
         { title:'Distribución por Categoría', columns:['Categoría','Cantidad','%'], rows: Object.entries(categories).map(([cat,count])=>[cat, count, ((count/total)*100).toFixed(1)+'%']) },
-        { title:'Listado', columns:['Producto','Categoría','Stock','Costo (Q)'], rows: products.map(p=>[p.name, p.category?.name||'—', p.stock, number(p.cost)]) }
+        { title:'Listado', columns:['Producto','Categoría','Stock','Costo'], rows: products.map(p=>[p.name, p.category?.name||'—', p.stock, money(number(p.cost))]) }
       ])
       return
     }
     const doc = newDoc(res, 'Reporte de Productos')
-    header(doc,'Reporte de Productos','Actual')
+    header(doc,'Reporte de Productos','Actual', companyName)
   sectionTitle(doc,'Resumen')
   const total = products.length
   const invValue = products.reduce((acc,p)=>acc+ number(p.stock)* number(p.cost),0)
@@ -682,8 +701,8 @@ async function productsReport(req,res,next){
   sectionTitle(doc,'Distribución por Categoría')
   drawTable(doc, ['Categoría','Cantidad','% del Total'], Object.entries(categories).map(([cat,count])=>[cat, count, ((count/total)*100).toFixed(1)+'%']), [180,70,80], { align: ['left','right','right'], headerAlign: ['left','right','right'] })
   sectionTitle(doc,'Listado (máx 120)')
-  drawTable(doc, ['Producto','Categoría','Stock','Costo (Q)'], products.slice(0,120).map(p=>[p.name, p.category?.name||'—', p.stock, number(p.cost).toLocaleString('es-GT')]), [170,120,50,70], { align: ['left','left','right','right'], headerAlign: ['left','left','right','right'] })
-    footer(doc)
+  drawTable(doc, ['Producto','Categoría','Stock','Costo'], products.slice(0,120).map(p=>[p.name, p.category?.name||'—', p.stock, money(number(p.cost))]), [170,120,50,70], { align: ['left','left','right','right'], headerAlign: ['left','left','right','right'] })
+    footer(doc, companyName)
     doc.end()
   } catch(e){ next(e) }
 }
