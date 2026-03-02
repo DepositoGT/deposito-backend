@@ -12,12 +12,11 @@ const { prisma, prismaTransaction } = require('../models/prisma')
 const PDFDocument = require('pdfkit')
 // Luxon DateTime (single import; removed duplicate that caused startup SyntaxError)
 const { DateTime } = require('luxon')
-// Currency formatter helper (destructure format function)
-const { format } = new Intl.NumberFormat('es-GT', { style: 'currency', currency: 'GTQ' })
 const { createClient } = require('@supabase/supabase-js')
 
 // Reuse shared stock alert service
 const { ensureStockAlert } = require('../services/stockAlerts')
+const { getTimezone, getSystemConfig } = require('../utils/getTimezone')
 
 // Bulk import service
 const { parseExcel, validateBulkData, bulkCreateProducts, generateTemplateWithCatalogs } = require('../services/bulkImport')
@@ -154,9 +153,8 @@ exports.create = async (req, res, next) => {
           throw new Error('supplier_id required when initial stock > 0')
         }
 
-        // Build a Date that represents the Guatemala local wall-clock time, but as a UTC instant
-        // so that the DB (timestamptz) will show the same clock time (e.g., 10:00 GT)
-        const nowGt = DateTime.now().setZone('America/Guatemala')
+        const tz = await getTimezone(prisma)
+        const nowGt = DateTime.now().setZone(tz)
         const dateAsUtcWithGtClock = new Date(Date.UTC(
           nowGt.year,
           nowGt.month - 1,
@@ -319,8 +317,8 @@ exports.update = async (req, res, next) => {
 
 exports.remove = async (req, res, next) => {
   try {
-    // Soft-delete: marcar como eliminado y poner timestamp
-    const nowGt = DateTime.now().setZone('America/Guatemala')
+    const tz = await getTimezone(prisma)
+    const nowGt = DateTime.now().setZone(tz)
     const dateAsUtcWithGtClock = new Date(Date.UTC(
       nowGt.year,
       nowGt.month - 1,
@@ -338,6 +336,10 @@ exports.remove = async (req, res, next) => {
 
 exports.reportPdf = async (req, res, next) => {
   try {
+    const config = await getSystemConfig(prisma)
+    const companyName = config.company_name
+    const currencyCode = (config.currency_code && config.currency_code.trim()) || 'GTQ'
+    const money = (v) => new Intl.NumberFormat('es-GT', { style: 'currency', currency: currencyCode }).format(Number(v || 0))
     const where = { deleted: false }
     const idsParam = req.query.ids
     if (idsParam && typeof idsParam === 'string' && idsParam.trim()) {
@@ -355,9 +357,6 @@ exports.reportPdf = async (req, res, next) => {
     res.setHeader('Content-Type', 'application/pdf')
     res.setHeader('Content-Disposition', 'inline; filename="productos_reporte.pdf"')
     doc.pipe(res)
-
-    // Helper formatter
-    const money = (v) => new Intl.NumberFormat('es-GT', { style: 'currency', currency: 'GTQ' }).format(Number(v || 0))
 
     // Optional columns from query (e.g. ?fields=name,category,price,stock for cotización)
     const fieldsParam = req.query.fields
@@ -391,7 +390,7 @@ exports.reportPdf = async (req, res, next) => {
     const headers = { name: 'Nombre', category: 'Categoría', brand: 'Marca', size: 'Tamaño', barcode: 'Código', price: 'Precio', cost: 'Costo', stock: 'Stock', min_stock: 'Mín.', supplier: 'Proveedor', status: 'Estado', description: 'Descripción' }
 
     // Header block
-    doc.fillColor('#0b1220').fontSize(22).font('Helvetica-Bold').text('Depósito - Informe de Productos', { align: 'left' })
+    doc.fillColor('#0b1220').fontSize(22).font('Helvetica-Bold').text(`${companyName} - Informe de Productos`, { align: 'left' })
     doc.moveDown(0.25)
     doc.fontSize(10).font('Helvetica').fillColor('#475569').text(`Generado: ${new Date().toLocaleString('es-GT')}`)
     if (fields && fields.length > 0) {
@@ -424,7 +423,7 @@ exports.reportPdf = async (req, res, next) => {
 
       drawSummary(startX, startY, 'Productos registrados', String(totalProductos), '#0b1220')
       drawSummary(startX + cardW + 12, startY, 'Unidades en inventario', String(totalUnidades), '#0b1220')
-      drawSummary(startX + (cardW + 12) * 2, startY, 'Valor del inventario (GTQ)', money(valorInventario), '#0b1220')
+      drawSummary(startX + (cardW + 12) * 2, startY, `Valor del inventario (${currencyCode})`, money(valorInventario), '#0b1220')
 
       gridTop = startY + cardH + 24
     } else {
@@ -606,7 +605,7 @@ exports.reportPdf = async (req, res, next) => {
     // Footer
     doc.addPage ? null : null
     doc.moveDown(2)
-    doc.fontSize(9).fillColor('#64748b').text('Reporte generado por Depósito GT', { align: 'right' })
+    doc.fontSize(9).fillColor('#64748b').text(`Reporte generado por ${companyName}`, { align: 'right' })
     doc.end()
   } catch (e) { next(e) }
 }
@@ -658,8 +657,8 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
       }
     }
 
-    // Prepare Guatemala local clock time
-    const nowGt = DateTime.now().setZone('America/Guatemala')
+    const tz = await getTimezone(prisma)
+    const nowGt = DateTime.now().setZone(tz)
     const dateAsUtcWithGtClock = new Date(Date.UTC(
       nowGt.year,
       nowGt.month - 1,
