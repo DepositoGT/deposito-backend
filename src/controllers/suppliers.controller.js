@@ -10,6 +10,7 @@
 
 const { prisma } = require('../models/prisma')
 const { DateTime } = require('luxon')
+const { getTimezone } = require('../utils/getTimezone')
 
 exports.list = async (req, res, next) => {
   try {
@@ -57,15 +58,11 @@ exports.list = async (req, res, next) => {
       take: pageSize,
     })
 
-    // Map suppliers adding computed totalPurchases (numeric) and lastOrder (ISO) for frontend expectations
+    const tz = await getTimezone(prisma)
     const adapted = items.map(s => {
       let lastOrder = ''
       if (s.last_order) {
-        // Formato amigable: 07 Nov 2025 14:32
-        lastOrder = DateTime.fromJSDate(s.last_order)
-          .setZone('America/Guatemala')
-          .setLocale('es')
-          .toFormat("dd LLL yyyy HH:mm")
+        lastOrder = DateTime.fromJSDate(s.last_order).setZone(tz).setLocale('es').toFormat("dd LLL yyyy HH:mm")
       }
 
       const categories =
@@ -168,10 +165,11 @@ exports.getOne = async (req, res, next) => {
         : []
     const categoryNames = categories.map(c => c.name)
 
+    const tz = await getTimezone(prisma)
     const adapted = {
       ...item,
       totalPurchases: Number(item.total_purchases || 0),
-      lastOrder: item.last_order ? DateTime.fromJSDate(item.last_order).setZone('America/Guatemala').setLocale('es').toFormat('dd LLL yyyy HH:mm') : '',
+      lastOrder: item.last_order ? DateTime.fromJSDate(item.last_order).setZone(tz).setLocale('es').toFormat('dd LLL yyyy HH:mm') : '',
       categories,
       categoryNames,
     }
@@ -225,8 +223,8 @@ exports.update = async (req, res, next) => {
 
 exports.remove = async (req, res, next) => {
   try {
-    // Soft-delete: marcar como eliminado y fijar timestamp con hora local de Guatemala
-    const nowGt = DateTime.now().setZone('America/Guatemala')
+    const tz = await getTimezone(prisma)
+    const nowGt = DateTime.now().setZone(tz)
     const dateAsUtcWithGtClock = new Date(Date.UTC(
       nowGt.year,
       nowGt.month - 1,

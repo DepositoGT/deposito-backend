@@ -10,6 +10,7 @@
 
 const { prisma } = require('../models/prisma')
 const { DateTime } = require('luxon')
+const { getTimezone } = require('../utils/getTimezone')
 
 const number = (v) => {
   if (v === null || v === undefined) return 0
@@ -100,22 +101,17 @@ exports.calculateTheoretical = async (req, res, next) => {
       return res.status(403).json({ message: 'Solo puede generar el cierre de su propia caja' })
     }
 
-    // Parsear fechas en zona horaria de Guatemala (UTC-6)
-    // Si las fechas vienen sin Z, las tratamos como hora local de Guatemala
+    const tz = await getTimezone(prisma)
+    // Parsear fechas en zona horaria configurada
+    // Si las fechas vienen sin Z, las tratamos como hora local
     let start, end;
     
     if (startDate.includes('Z')) {
-      // Si viene con Z, convertir de UTC a Guatemala
-      start = DateTime.fromISO(startDate, { zone: 'utc' })
-        .setZone('America/Guatemala')
-        .toJSDate();
-      end = DateTime.fromISO(endDate, { zone: 'utc' })
-        .setZone('America/Guatemala')
-        .toJSDate();
+      start = DateTime.fromISO(startDate, { zone: 'utc' }).setZone(tz).toJSDate();
+      end = DateTime.fromISO(endDate, { zone: 'utc' }).setZone(tz).toJSDate();
     } else {
-      // Si no tiene Z, tratarla como hora local de Guatemala
-      start = DateTime.fromISO(startDate, { zone: 'America/Guatemala' }).toJSDate();
-      end = DateTime.fromISO(endDate, { zone: 'America/Guatemala' }).toJSDate();
+      start = DateTime.fromISO(startDate, { zone: tz }).toJSDate();
+      end = DateTime.fromISO(endDate, { zone: tz }).toJSDate();
     }
     
     // Validar que las fechas sean válidas
@@ -275,14 +271,13 @@ exports.create = async (req, res, next) => {
       return res.status(403).json({ message: 'Solo puede registrar el cierre de su propia caja' })
     }
 
-    // Parsear fechas correctamente (sin conversión de zona horaria)
-    // Las fechas vienen sin 'Z', son hora local de Guatemala
+    const tz = await getTimezone(prisma)
+    // Parsear fechas: vienen sin 'Z', son hora local configurada
     const cleanStartDate = String(startDate).replace('Z', '').replace(/[+-]\d{2}:\d{2}$/, '');
     const cleanEndDate = String(endDate).replace('Z', '').replace(/[+-]\d{2}:\d{2}$/, '');
     
-    // Crear fechas UTC con los valores de Guatemala
-    const startDt = DateTime.fromISO(cleanStartDate, { zone: 'America/Guatemala' });
-    const endDt = DateTime.fromISO(cleanEndDate, { zone: 'America/Guatemala' });
+    const startDt = DateTime.fromISO(cleanStartDate, { zone: tz });
+    const endDt = DateTime.fromISO(cleanEndDate, { zone: tz });
     
     const startDateUTC = DateTime.utc(
       startDt.year, startDt.month, startDt.day,
@@ -307,16 +302,15 @@ exports.create = async (req, res, next) => {
       ? (difference / theoreticalTotal) * 100 
       : 0
 
-    // Obtener fecha actual en hora de Guatemala
-    const nowGuatemala = DateTime.now().setZone('America/Guatemala');
+    const nowLocal = DateTime.now().setZone(tz);
     const dateUTC = DateTime.utc(
-      nowGuatemala.year, nowGuatemala.month, nowGuatemala.day,
-      nowGuatemala.hour, nowGuatemala.minute, nowGuatemala.second, nowGuatemala.millisecond
+      nowLocal.year, nowLocal.month, nowLocal.day,
+      nowLocal.hour, nowLocal.minute, nowLocal.second, nowLocal.millisecond
     ).toJSDate();
 
     console.log('[CASH CLOSURE] Fecha de creación:', {
       dateUTC: dateUTC.toISOString(),
-      dateGt: nowGuatemala.toFormat('yyyy-MM-dd HH:mm:ss')
+      dateLocal: nowLocal.toFormat('yyyy-MM-dd HH:mm:ss')
     });
 
     const cashierUuid = cashierId || authUser?.sub || null
@@ -518,11 +512,11 @@ exports.validate = async (req, res, next) => {
       return res.status(400).json({ message: 'Nombre y firma del supervisor son requeridos' })
     }
 
-    // Obtener fecha actual en hora de Guatemala
-    const nowGuatemala = DateTime.now().setZone('America/Guatemala');
+    const tz = await getTimezone(prisma)
+    const nowLocal = DateTime.now().setZone(tz);
     const validatedAtUTC = DateTime.utc(
-      nowGuatemala.year, nowGuatemala.month, nowGuatemala.day,
-      nowGuatemala.hour, nowGuatemala.minute, nowGuatemala.second, nowGuatemala.millisecond
+      nowLocal.year, nowLocal.month, nowLocal.day,
+      nowLocal.hour, nowLocal.minute, nowLocal.second, nowLocal.millisecond
     ).toJSDate();
 
     // status se mantiene (Pendiente); aprobación/rechazo vía PATCH :id/status
@@ -574,7 +568,8 @@ exports.getLastClosureDate = async (req, res, next) => {
       }
     })
 
-    const fallbackStart = DateTime.now().setZone('America/Guatemala').startOf('day').toJSDate()
+    const tz = await getTimezone(prisma)
+    const fallbackStart = DateTime.now().setZone(tz).startOf('day').toJSDate()
 
     res.json({
       last_end_date: lastClosure?.end_date || null,
@@ -631,12 +626,13 @@ exports.updateStatus = async (req, res, next) => {
       }
     }
 
-    // Si se rechaza, agregar razón en las notas
     if (status === 'Rechazado' && rejection_reason) {
+      const tz = await getTimezone(prisma)
+      const nowStr = DateTime.now().setZone(tz).toFormat('dd/MM/yyyy HH:mm')
       const existingNotes = closure.notes || ''
       updateData.notes = existingNotes 
-        ? `${existingNotes}\n\n--- RECHAZADO ---\nRazón: ${rejection_reason}\nFecha: ${DateTime.now().setZone('America/Guatemala').toFormat('dd/MM/yyyy HH:mm')}`
-        : `--- RECHAZADO ---\nRazón: ${rejection_reason}\nFecha: ${DateTime.now().setZone('America/Guatemala').toFormat('dd/MM/yyyy HH:mm')}`
+        ? `${existingNotes}\n\n--- RECHAZADO ---\nRazón: ${rejection_reason}\nFecha: ${nowStr}`
+        : `--- RECHAZADO ---\nRazón: ${rejection_reason}\nFecha: ${nowStr}`
     }
 
     const updatedClosure = await prisma.cashClosure.update({
