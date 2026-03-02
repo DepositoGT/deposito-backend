@@ -116,6 +116,10 @@ async function main() {
     { code: 'catalogs.view', name: 'Ver catálogos', description: 'Puede ver catálogos (categorías, estados, etc.)' },
     { code: 'catalogs.manage', name: 'Gestionar catálogos', description: 'Puede crear/editar catálogos' },
 
+    // Configuración del sistema
+    { code: 'settings.view', name: 'Ver configuración', description: 'Puede ver la configuración del sistema' },
+    { code: 'settings.manage', name: 'Gestionar configuración', description: 'Puede modificar configuración (denominaciones, moneda, empresa)' },
+
     // Alertas y analítica
     { code: 'alerts.view', name: 'Ver alertas', description: 'Puede ver alertas de stock y sistema' },
     { code: 'alerts.manage', name: 'Gestionar alertas', description: 'Puede resolver y reasignar alertas' },
@@ -261,7 +265,45 @@ async function main() {
   }
 
   // ========================================
-  // 7. USUARIO ADMIN POR DEFECTO (OPCIONAL)
+  // 7. CONFIGURACIÓN DEL SISTEMA (valores por defecto)
+  // ========================================
+  console.log('Configurando valores por defecto del sistema...')
+  const defaultDenominations = JSON.stringify([
+    { denomination: 200, type: 'Billete' }, { denomination: 100, type: 'Billete' },
+    { denomination: 50, type: 'Billete' }, { denomination: 20, type: 'Billete' },
+    { denomination: 10, type: 'Billete' }, { denomination: 5, type: 'Billete' }, { denomination: 1, type: 'Billete' },
+    { denomination: 0.5, type: 'Moneda' }, { denomination: 0.25, type: 'Moneda' },
+    { denomination: 0.1, type: 'Moneda' }, { denomination: 0.05, type: 'Moneda' }
+  ])
+  const defaultSettings = [
+    { key: 'currency_code', value: 'GTQ', type: 'string', description: 'Código de moneda principal' },
+    { key: 'currency_name', value: 'Quetzal', type: 'string', description: 'Nombre de la moneda' },
+    { key: 'timezone', value: 'America/Guatemala', type: 'string', description: 'Zona horaria del sistema' },
+    { key: 'company_name', value: 'Mi Empresa', type: 'string', description: 'Nombre o razón social de la empresa' },
+    { key: 'cash_closure_denominations', value: defaultDenominations, type: 'json', description: 'Denominaciones para conteo de cierre de caja' },
+    // Datos fiscales (preparación FEL)
+    { key: 'company_nit', value: '', type: 'string', description: 'NIT del emisor' },
+    { key: 'company_address', value: '', type: 'string', description: 'Dirección fiscal' },
+    { key: 'company_municipality', value: '', type: 'string', description: 'Municipio' },
+    { key: 'company_department', value: '', type: 'string', description: 'Departamento' },
+    { key: 'company_postal_code', value: '', type: 'string', description: 'Código postal' },
+    { key: 'establishment_code', value: '', type: 'string', description: 'Código de establecimiento' },
+    { key: 'vat_affiliation', value: '', type: 'string', description: 'Afiliación IVA (régimen general, pequeño contribuyente, etc.)' },
+    { key: 'date_format', value: 'dd/MM/yyyy', type: 'string', description: 'Formato de fecha por defecto (dd/MM/yyyy o MM/dd/yyyy)' },
+    { key: 'locale', value: 'es-GT', type: 'string', description: 'Locale para números y fechas (ej. es-GT)' },
+    { key: 'cash_closure_max_diff_pct', value: '5', type: 'string', description: 'Diferencia máxima permitida en cierre de caja (%) antes de advertencia' }
+  ]
+  for (const s of defaultSettings) {
+    await prisma.systemSetting.upsert({
+      where: { key: s.key },
+      update: {},
+      create: s
+    })
+  }
+  console.log('  Valores por defecto de configuración listos')
+
+  // ========================================
+  // 8. USUARIO ADMIN POR DEFECTO (OPCIONAL)
   // ========================================
   console.log('Verificando usuario admin...')
   if (adminRole) {

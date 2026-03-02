@@ -11,6 +11,7 @@
 const { prisma } = require('../models/prisma')
 const { DateTime } = require('luxon')
 const PDFDocument = require('pdfkit')
+const { getCompanyName } = require('../utils/getTimezone')
 
 /**
  * List all incoming merchandise records with pagination
@@ -282,7 +283,9 @@ exports.generateReport = async (req, res, next) => {
     res.setHeader('Content-Disposition', 'attachment; filename="reporte-mercancia.pdf"')
     doc.pipe(res)
 
-    // Header
+    const companyName = await getCompanyName(prisma)
+    doc.fontSize(12).text(companyName, { align: 'center' })
+    doc.moveDown(0.3)
     doc.fontSize(20).text('Reporte de Ingresos de Mercancía', { align: 'center' })
     doc.moveDown()
     

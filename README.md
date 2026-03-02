@@ -62,6 +62,8 @@ PORT=3000
   }
   Respuesta: objeto venta actualizado.
 
+
+
 ## Legal
 
 Este proyecto es **propiedad exclusiva de Diego Patzán** y está bajo una [Licencia Propietaria](./LICENSE). El código es visible públicamente pero **NO está permitido** su uso, copia, modificación o distribución sin autorización.

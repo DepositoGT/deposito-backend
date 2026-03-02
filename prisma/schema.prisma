@@ -589,3 +589,18 @@ model SalePromotion {
   @@index([promotion_id])
   @@map("sale_promotions")
 }
+
+// ========================================
+// Configuración del sistema (módulo Configuración)
+// ========================================
+
+model SystemSetting {
+  id          Int      @id @default(autoincrement())
+  key         String   @unique @db.VarChar(100)
+  value       String   @db.Text
+  type        String?  @db.VarChar(50)   // string, json, number
+  description String?  @db.VarChar(255)
+  updated_at  DateTime @updatedAt
+
+  @@map("system_settings")
+}
