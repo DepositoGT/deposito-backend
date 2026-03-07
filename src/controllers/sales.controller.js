@@ -9,6 +9,7 @@
  */
 
 const { prisma } = require('../models/prisma')
+const { Prisma } = require('@prisma/client')
 const { DateTime } = require('luxon')
 const { getTimezone } = require('../utils/getTimezone')
 const { ensureStockAlertsBatch } = require('../services/stockAlerts')
@@ -148,12 +149,22 @@ exports.list = async (req, res, next) => {
   } catch (e) { next(e) }
 }
 
+// Acepta UUID o referencia legible (ej. V-000001, V-00000A)
+const saleWhereIdOrReference = (idOrRef) => {
+  if (!idOrRef) return { id: '' }
+  const s = String(idOrRef).trim()
+  const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s)
+  if (isUuid) return { id: s }
+  return { reference: s }
+}
+
 exports.getById = async (req, res, next) => {
   try {
-    const { id } = req.params
+    const { id: idOrRef } = req.params
+    const where = saleWhereIdOrReference(idOrRef)
 
-    const sale = await prisma.sale.findUnique({
-      where: { id },
+    const sale = await prisma.sale.findFirst({
+      where,
       include: {
         payment_method: true,
         status: true,
@@ -168,6 +179,7 @@ exports.getById = async (req, res, next) => {
             }
           }
         },
+        sale_dtes: true,
         returns: {
           include: {
             status: true,
@@ -352,9 +364,47 @@ exports.create = async (req, res, next) => {
       console.log('[SALE DATE] Guatemala local time:', nowGt.toFormat('yyyy-MM-dd HH:mm:ss'));
       console.log('[SALE DATE] Will be stored in DB as:', DateTime.fromJSDate(saleDate).toUTC().toFormat('yyyy-MM-dd HH:mm:ss'));
 
+      // Referencia en base62 (0-9, A-Z, a-z) = 62 símbolos → muchas más combinaciones sin repetir
+      const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+      const toBase62 = (n) => {
+        if (n <= 0) return '0'
+        let s = ''
+        while (n > 0) {
+          s = BASE62[n % 62] + s
+          n = Math.floor(n / 62)
+        }
+        return s
+      }
+      const fromBase62 = (s) => {
+        let n = 0
+        for (let i = 0; i < s.length; i++) {
+          const idx = BASE62.indexOf(s[i])
+          if (idx === -1) return NaN
+          n = n * 62 + idx
+        }
+        return n
+      }
+
+      const lastSale = await tx.sale.findFirst({
+        where: { reference: { not: null } },
+        orderBy: { reference: 'desc' },
+        select: { reference: true },
+      })
+      let nextRef = 'V-000001'
+      if (lastSale?.reference) {
+        const match = String(lastSale.reference).match(/^V-([0-9A-Za-z]+)$/)
+        if (match) {
+          const num = fromBase62(match[1])
+          if (Number.isFinite(num) && num >= 0) {
+            nextRef = 'V-' + toBase62(num + 1).padStart(6, '0')
+          }
+        }
+      }
+
       const sale = await tx.sale.create({
         data: {
           ...saleData,
+          reference: nextRef,
           date: saleDate,
           sold_at: saleDate,  // Establecer sold_at explícitamente en hora de Guatemala
           items: totalItems,
@@ -368,32 +418,34 @@ exports.create = async (req, res, next) => {
         },
       })
 
-      for (const it of items) {
-        await tx.saleItem.create({
-          data: {
-            sale_id: sale.id,
-            product_id: it.product_id,
-            price: it.price,
-            qty: it.qty,
-          },
-        })
-      }
+      await tx.saleItem.createMany({
+        data: items.map(it => ({
+          sale_id: sale.id,
+          product_id: it.product_id,
+          price: it.price,
+          qty: it.qty,
+        })),
+      })
 
-      // Descontar stock al registrar venta (venta queda Completada directamente)
+      // Descontar stock al registrar venta: un solo UPDATE por lote (rápido con muchos ítems)
       const productQtyMap = new Map()
       items.forEach(it => {
         const pid = it.product_id
         const q = Number(it.qty || 0)
         productQtyMap.set(pid, (productQtyMap.get(pid) || 0) + q)
       })
-      const updatePromises = Array.from(productQtyMap.entries()).map(([productId, totalQty]) =>
-        tx.product.update({
-          where: { id: productId },
-          data: { stock: { decrement: totalQty } },
-          select: { id: true, name: true, stock: true, min_stock: true }
-        })
-      )
-      const updatedProducts = await Promise.all(updatePromises)
+      let updatedProducts = []
+      const entries = Array.from(productQtyMap.entries())
+      if (entries.length > 0) {
+        const values = Prisma.join(entries.map(([id, qty]) => Prisma.sql`(${id}::uuid, ${Number(qty)}::int)`))
+        updatedProducts = await tx.$queryRaw`
+          UPDATE products p
+          SET stock = p.stock - v.qty
+          FROM (VALUES ${values}) AS v(id, qty)
+          WHERE p.id = v.id
+          RETURNING p.id, p.name, p.stock, p.min_stock
+        `
+      }
       await ensureStockAlertsBatch(tx, updatedProducts)
 
       // 3) Guardar promociones usadas e incrementar contador
@@ -429,6 +481,9 @@ exports.create = async (req, res, next) => {
       }
 
       return sale
+    }, {
+      timeout: 20000,
+      maxWait: 10000
     })
 
     res.status(201).json(created)
@@ -456,12 +511,14 @@ exports.updateStatus = async (req, res, next) => {
 
     if (!targetStatusId) return res.status(400).json({ message: 'status_id inválido' })
 
+    const where = saleWhereIdOrReference(id)
+
     // Usar limitador de concurrencia para evitar sobrecarga
     const result = await salesOperationLimiter.run(async () => {
       return await prisma.$transaction(async (tx) => {
-        // Cargar venta actual con su status e items
-        const current = await tx.sale.findUnique({
-          where: { id },
+        // Cargar venta actual con su status e items (por id o por reference)
+        const current = await tx.sale.findFirst({
+          where,
           include: { status: true, sale_items: true }
         })
         if (!current) throw new Error('Venta no encontrada')
@@ -538,9 +595,9 @@ exports.updateStatus = async (req, res, next) => {
           console.log(`[STOCK REVERT] Alertas de stock actualizadas después de reversión`)
         }
 
-        // Actualizar estado de la venta
+        // Actualizar estado de la venta (siempre por id interno)
         const updated = await tx.sale.update({
-          where: { id },
+          where: { id: current.id },
           data: { status_id: targetStatusId },
           include: { payment_method: true, status: true }
         })
