@@ -12,10 +12,23 @@ const { prisma } = require('../models/prisma')
 const { DateTime } = require('luxon')
 const { ensureStockAlertsBatch } = require('../services/stockAlerts')
 
+/** Resuelve sale_id (UUID o referencia ej. V-000001) al id interno de la venta */
+async function resolveSaleId(saleIdOrRef) {
+  if (!saleIdOrRef) return null
+  const s = String(saleIdOrRef).trim()
+  const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s)
+  if (isUuid) {
+    const sale = await prisma.sale.findUnique({ where: { id: s }, select: { id: true } })
+    return sale?.id ?? null
+  }
+  const sale = await prisma.sale.findFirst({ where: { reference: s }, select: { id: true } })
+  return sale?.id ?? null
+}
+
 /**
  * GET /api/returns
  * List all returns with optional filtering
- * Query params: status, page, pageSize, sale_id
+ * Query params: status, page, pageSize, sale_id (UUID o referencia)
  */
 exports.list = async (req, res, next) => {
   try {
@@ -30,7 +43,8 @@ exports.list = async (req, res, next) => {
     }
 
     if (sale_id) {
-      where.sale_id = String(sale_id)
+      const resolvedId = await resolveSaleId(sale_id)
+      if (resolvedId) where.sale_id = resolvedId
     }
 
     const totalItems = await prisma.return.count({ where })
@@ -131,12 +145,17 @@ exports.getById = async (req, res, next) => {
  */
 exports.create = async (req, res, next) => {
   try {
-    const { sale_id, reason, items, notes } = req.body
+    const { sale_id: saleIdOrRef, reason, items, notes } = req.body
 
-    if (!sale_id || !Array.isArray(items) || items.length === 0) {
+    if (!saleIdOrRef || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({
         message: 'sale_id e items son requeridos. items debe ser un array no vacío.'
       })
+    }
+
+    const sale_id = await resolveSaleId(saleIdOrRef)
+    if (!sale_id) {
+      return res.status(404).json({ message: 'Venta no encontrada' })
     }
 
     const created = await prisma.$transaction(async (tx) => {

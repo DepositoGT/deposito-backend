@@ -1,0 +1,189 @@
+-- =============================================================================
+-- ÍNDICES PARA RENDIMIENTO - Depósito (Ventas, InFile, listados pesados)
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- VENTAS (crítico: listado 5-10 seg → debe bajar mucho con estos índices)
+-- -----------------------------------------------------------------------------
+
+-- Filtro por rango de fecha + orden por date DESC (listado de ventas)
+CREATE INDEX IF NOT EXISTS idx_sales_date_desc ON sales (date DESC);
+
+-- Filtro por estado (status_id) + fecha para listado
+CREATE INDEX IF NOT EXISTS idx_sales_status_id ON sales (status_id);
+
+-- Compuesto: listado por período y estado, ordenado por fecha
+CREATE INDEX IF NOT EXISTS idx_sales_date_status ON sales (date DESC, status_id);
+
+-- JOIN con createdBy (getById, list)
+CREATE INDEX IF NOT EXISTS idx_sales_created_by ON sales (created_by);
+
+-- payment_method_id para JOIN en includes
+CREATE INDEX IF NOT EXISTS idx_sales_payment_method_id ON sales (payment_method_id);
+
+
+-- -----------------------------------------------------------------------------
+-- SALE_ITEMS (cargados en cada venta del listado y en getById)
+-- -----------------------------------------------------------------------------
+
+CREATE INDEX IF NOT EXISTS idx_sale_items_sale_id ON sale_items (sale_id);
+CREATE INDEX IF NOT EXISTS idx_sale_items_product_id ON sale_items (product_id);
+
+
+-- -----------------------------------------------------------------------------
+-- SALE_DTES (InFile: lookup por venta en GET /sales/:id)
+-- -----------------------------------------------------------------------------
+
+CREATE INDEX IF NOT EXISTS idx_sale_dtes_sale_id ON sale_dtes (sale_id);
+
+
+-- -----------------------------------------------------------------------------
+-- RETURNS (incluidos en cada venta del listado, filtro por status y orderBy)
+-- -----------------------------------------------------------------------------
+
+CREATE INDEX IF NOT EXISTS idx_returns_sale_id ON returns (sale_id);
+CREATE INDEX IF NOT EXISTS idx_returns_status_id ON returns (status_id);
+CREATE INDEX IF NOT EXISTS idx_returns_return_date_desc ON returns (return_date DESC);
+-- Compuesto para "returns de una venta ordenados por fecha"
+CREATE INDEX IF NOT EXISTS idx_returns_sale_id_return_date ON returns (sale_id, return_date DESC);
+
+
+-- -----------------------------------------------------------------------------
+-- RETURN_ITEMS (incluidos dentro de returns)
+-- -----------------------------------------------------------------------------
+
+CREATE INDEX IF NOT EXISTS idx_return_items_return_id ON return_items (return_id);
+CREATE INDEX IF NOT EXISTS idx_return_items_sale_item_id ON return_items (sale_item_id);
+CREATE INDEX IF NOT EXISTS idx_return_items_product_id ON return_items (product_id);
+
+
+-- -----------------------------------------------------------------------------
+-- SALE_PROMOTIONS (incluidos en cada venta del listado)
+-- -----------------------------------------------------------------------------
+
+CREATE INDEX IF NOT EXISTS idx_sale_promotions_sale_id ON sale_promotions (sale_id);
+CREATE INDEX IF NOT EXISTS idx_sale_promotions_promotion_id ON sale_promotions (promotion_id);
+
+
+-- -----------------------------------------------------------------------------
+-- PRODUCTS (listados, filtros por categoría/supplier/deleted, orden por nombre)
+-- -----------------------------------------------------------------------------
+
+CREATE INDEX IF NOT EXISTS idx_products_category_id ON products (category_id);
+CREATE INDEX IF NOT EXISTS idx_products_supplier_id ON products (supplier_id);
+CREATE INDEX IF NOT EXISTS idx_products_status_id ON products (status_id);
+CREATE INDEX IF NOT EXISTS idx_products_deleted ON products (deleted);
+-- Listado típico: no eliminados + orden por nombre
+CREATE INDEX IF NOT EXISTS idx_products_deleted_name ON products (deleted, name);
+-- Búsqueda por nombre en listados
+CREATE INDEX IF NOT EXISTS idx_products_name ON products (name);
+
+
+-- -----------------------------------------------------------------------------
+-- PROMOTION_CODES (create sale: findMany por código y activo)
+-- -----------------------------------------------------------------------------
+
+CREATE INDEX IF NOT EXISTS idx_promotion_codes_code ON promotion_codes (code);
+CREATE INDEX IF NOT EXISTS idx_promotion_codes_promotion_id ON promotion_codes (promotion_id);
+CREATE INDEX IF NOT EXISTS idx_promotion_codes_code_active ON promotion_codes (code, active) WHERE active = true;
+
+
+-- -----------------------------------------------------------------------------
+-- PROMOTIONS (join desde promotion_codes y sale_promotions)
+-- -----------------------------------------------------------------------------
+
+CREATE INDEX IF NOT EXISTS idx_promotions_type_id ON promotions (type_id);
+CREATE INDEX IF NOT EXISTS idx_promotions_active_dates ON promotions (active, start_date, end_date) WHERE deleted = false;
+
+
+-- -----------------------------------------------------------------------------
+-- SALE_STATUSES / RETURN_STATUSES (findFirst por name)
+-- -----------------------------------------------------------------------------
+
+CREATE INDEX IF NOT EXISTS idx_sale_statuses_name ON sale_statuses (name);
+CREATE INDEX IF NOT EXISTS idx_return_statuses_name ON return_statuses (name);
+
+
+-- -----------------------------------------------------------------------------
+-- ALERTS (listados y filtros por producto, estado, asignado)
+-- -----------------------------------------------------------------------------
+
+CREATE INDEX IF NOT EXISTS idx_alerts_product_id ON alerts (product_id);
+CREATE INDEX IF NOT EXISTS idx_alerts_status_id ON alerts (status_id);
+CREATE INDEX IF NOT EXISTS idx_alerts_type_id ON alerts (type_id);
+CREATE INDEX IF NOT EXISTS idx_alerts_assigned_to ON alerts (assigned_to);
+CREATE INDEX IF NOT EXISTS idx_alerts_resolved ON alerts (resolved);
+CREATE INDEX IF NOT EXISTS idx_alerts_timestamp ON alerts (timestamp DESC);
+
+
+-- -----------------------------------------------------------------------------
+-- CASH_CLOSURES (listados por fecha y status)
+-- -----------------------------------------------------------------------------
+
+CREATE INDEX IF NOT EXISTS idx_cash_closures_date ON cash_closures (date);
+CREATE INDEX IF NOT EXISTS idx_cash_closures_status ON cash_closures (status);
+CREATE INDEX IF NOT EXISTS idx_cash_closures_date_status ON cash_closures (date DESC, status);
+CREATE INDEX IF NOT EXISTS idx_cash_closures_cashier_id ON cash_closures (cashier_id);
+CREATE INDEX IF NOT EXISTS idx_cash_closures_supervisor_id ON cash_closures (supervisor_id);
+
+
+-- -----------------------------------------------------------------------------
+-- CASH_CLOSURE_PAYMENTS / DENOMINATIONS
+-- -----------------------------------------------------------------------------
+
+CREATE INDEX IF NOT EXISTS idx_cash_closure_payments_cash_closure_id ON cash_closure_payments (cash_closure_id);
+CREATE INDEX IF NOT EXISTS idx_cash_closure_payments_payment_method_id ON cash_closure_payments (payment_method_id);
+CREATE INDEX IF NOT EXISTS idx_cash_closure_denominations_cash_closure_id ON cash_closure_denominations (cash_closure_id);
+
+
+-- -----------------------------------------------------------------------------
+-- INCOMING_MERCHANDISE (listados por supplier y fecha)
+-- -----------------------------------------------------------------------------
+
+CREATE INDEX IF NOT EXISTS idx_incoming_merchandise_supplier_id ON incoming_merchandise (supplier_id);
+CREATE INDEX IF NOT EXISTS idx_incoming_merchandise_registered_by ON incoming_merchandise (registered_by);
+CREATE INDEX IF NOT EXISTS idx_incoming_merchandise_date ON incoming_merchandise (date);
+CREATE INDEX IF NOT EXISTS idx_incoming_merchandise_date_desc ON incoming_merchandise (date DESC);
+
+
+-- -----------------------------------------------------------------------------
+-- INCOMING_MERCHANDISE_ITEMS
+-- -----------------------------------------------------------------------------
+
+CREATE INDEX IF NOT EXISTS idx_incoming_merchandise_items_im_id ON incoming_merchandise_items (incoming_merchandise_id);
+CREATE INDEX IF NOT EXISTS idx_incoming_merchandise_items_product_id ON incoming_merchandise_items (product_id);
+
+
+-- -----------------------------------------------------------------------------
+-- PURCHASE_LOGS (reportes / historial)
+-- -----------------------------------------------------------------------------
+
+CREATE INDEX IF NOT EXISTS idx_purchase_logs_product_id ON purchase_logs (product_id);
+CREATE INDEX IF NOT EXISTS idx_purchase_logs_supplier_id ON purchase_logs (supplier_id);
+CREATE INDEX IF NOT EXISTS idx_purchase_logs_date ON purchase_logs (date);
+
+
+-- -----------------------------------------------------------------------------
+-- SUPPLIERS (listados, filtro deleted)
+-- -----------------------------------------------------------------------------
+
+CREATE INDEX IF NOT EXISTS idx_suppliers_deleted ON suppliers (deleted);
+CREATE INDEX IF NOT EXISTS idx_suppliers_payment_terms_id ON suppliers (payment_terms_id);
+CREATE INDEX IF NOT EXISTS idx_suppliers_name ON suppliers (name);
+
+
+-- -----------------------------------------------------------------------------
+-- USERS (auth, createdBy en ventas)
+-- -----------------------------------------------------------------------------
+
+CREATE INDEX IF NOT EXISTS idx_users_role_id ON users (role_id);
+
+
+
+-- -----------------------------------------------------------------------------
+-- SYSTEM_SETTINGS (configuración por key)
+-- -----------------------------------------------------------------------------
+
+-- key es UNIQUE, suele tener índice implícito. Por si acaso:
+CREATE INDEX IF NOT EXISTS idx_system_settings_key ON system_settings (key);
+

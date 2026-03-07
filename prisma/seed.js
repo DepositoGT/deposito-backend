@@ -99,6 +99,8 @@ async function main() {
 
     // Ventas y devoluciones
     { code: 'sales.view', name: 'Ver ventas', description: 'Puede ver ventas' },
+    { code: 'sales.view_detail', name: 'Ver detalle de venta', description: 'Puede ver el detalle de una venta' },
+    { code: 'sales.view_invoice', name: 'Ver factura', description: 'Puede consultar la factura de una venta' },
     { code: 'sales.create', name: 'Crear ventas', description: 'Puede registrar nuevas ventas' },
     { code: 'sales.cancel', name: 'Anular / actualizar ventas', description: 'Puede anular o actualizar ventas' },
     { code: 'returns.view', name: 'Ver devoluciones', description: 'Puede ver devoluciones' },
@@ -182,6 +184,8 @@ async function main() {
   // Seller/Vendedor tiene un subconjunto de permisos
   const sellerPermissionCodes = [
     'sales.view',
+    'sales.view_detail',
+    'sales.view_invoice',
     'sales.create',
     'returns.view',
     'returns.manage',
