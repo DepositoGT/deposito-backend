@@ -15,6 +15,50 @@ const { getTimezone } = require('../utils/getTimezone')
 const { ensureStockAlertsBatch } = require('../services/stockAlerts')
 const { salesOperationLimiter } = require('../utils/concurrencyLimiter')
 
+/** Misma forma que GET /sales/:id — reutilizado al responder POST /sales (evita un GET extra en el cliente). */
+const SALE_DETAIL_INCLUDE = {
+  payment_method: true,
+  status: true,
+  sale_items: {
+    include: {
+      product: {
+        select: {
+          id: true,
+          name: true,
+          barcode: true
+        }
+      }
+    }
+  },
+  sale_dtes: true,
+  returns: {
+    include: {
+      status: true,
+      return_items: {
+        include: {
+          product: {
+            select: {
+              id: true,
+              name: true,
+              barcode: true
+            }
+          }
+        }
+      }
+    },
+    orderBy: {
+      return_date: 'desc'
+    }
+  },
+  createdBy: {
+    select: {
+      id: true,
+      name: true,
+      email: true
+    }
+  }
+}
+
 exports.list = async (req, res, next) => {
   try {
     // Query params: period (today|week|month|year), status, page, pageSize
@@ -165,48 +209,7 @@ exports.getById = async (req, res, next) => {
 
     const sale = await prisma.sale.findFirst({
       where,
-      include: {
-        payment_method: true,
-        status: true,
-        sale_items: {
-          include: {
-            product: {
-              select: {
-                id: true,
-                name: true,
-                barcode: true
-              }
-            }
-          }
-        },
-        sale_dtes: true,
-        returns: {
-          include: {
-            status: true,
-            return_items: {
-              include: {
-                product: {
-                  select: {
-                    id: true,
-                    name: true,
-                    barcode: true
-                  }
-                }
-              }
-            }
-          },
-          orderBy: {
-            return_date: 'desc'
-          }
-        },
-        createdBy: {
-          select: {
-            id: true,
-            name: true,
-            email: true,
-          }
-        },
-      }
+      include: SALE_DETAIL_INCLUDE
     })
 
     if (!sale) {
@@ -486,7 +489,12 @@ exports.create = async (req, res, next) => {
       maxWait: 10000
     })
 
-    res.status(201).json(created)
+    const fullSale = await prisma.sale.findFirst({
+      where: { id: created.id },
+      include: SALE_DETAIL_INCLUDE
+    })
+
+    res.status(201).json(fullSale || created)
   } catch (e) { next(e) }
 }
 
