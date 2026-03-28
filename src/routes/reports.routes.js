@@ -9,13 +9,16 @@
  */
 
 const { Router } = require('express')
+const { Auth, hasPermission } = require('../middlewares/autenticacion')
 const {
   salesReport,
   inventoryReport,
   suppliersReport,
   financialReport,
   alertsReport,
-  productsReport
+  productsReport,
+  inventoryCountSessionReport,
+  inventoryCountsHistoryReport,
 } = require('../controllers/reports.controller')
 
 const router = Router()
@@ -26,5 +29,17 @@ router.get('/suppliers', suppliersReport)
 router.get('/financial', financialReport)
 router.get('/alerts', alertsReport)
 router.get('/products', productsReport)
+router.get(
+  '/inventory-count-session/:id',
+  Auth,
+  hasPermission('inventory_count.export', 'reports.view', 'inventory_count.view'),
+  inventoryCountSessionReport
+)
+router.get(
+  '/inventory-counts',
+  Auth,
+  hasPermission('inventory_count.export', 'reports.view', 'inventory_count.view'),
+  inventoryCountsHistoryReport
+)
 
 module.exports = router
