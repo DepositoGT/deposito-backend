@@ -90,6 +90,15 @@ async function main() {
     { code: 'products.import', name: 'Importar productos', description: 'Puede realizar importaciones masivas de productos' },
     { code: 'products.export', name: 'Exportar productos', description: 'Puede exportar listados de productos' },
 
+    // Inventariado (conteo físico)
+    { code: 'inventory_count.view', name: 'Ver inventariados', description: 'Puede ver sesiones y líneas de inventariado' },
+    { code: 'inventory_count.create', name: 'Crear inventariado', description: 'Puede crear sesiones e iniciar conteo' },
+    { code: 'inventory_count.count', name: 'Registrar conteos', description: 'Puede ingresar cantidades contadas físicamente' },
+    { code: 'inventory_count.submit', name: 'Enviar inventariado a revisión', description: 'Puede cerrar el conteo y enviar a revisión' },
+    { code: 'inventory_count.approve', name: 'Aprobar inventariado', description: 'Puede aprobar y aplicar ajustes de stock' },
+    { code: 'inventory_count.cancel', name: 'Cancelar inventariado', description: 'Puede cancelar sesiones sin aplicar cambios' },
+    { code: 'inventory_count.export', name: 'Exportar reportes de inventariado', description: 'Puede exportar CSV/PDF de sesiones de inventario' },
+
     // Proveedores
     { code: 'suppliers.view', name: 'Ver proveedores', description: 'Puede ver proveedores' },
     { code: 'suppliers.create', name: 'Crear proveedores', description: 'Puede crear proveedores' },
@@ -196,6 +205,11 @@ async function main() {
     'cashclosure.create_own',  // Cajero: solo puede generar su propio cierre
     'analytics.view',
     'merchandise.view',
+    // Inventariado: contar y enviar a revisión (sin crear ni aprobar por defecto)
+    'inventory_count.view',
+    'inventory_count.count',
+    'inventory_count.submit',
+    'inventory_count.export',
   ]
 
   for (const sellerRole of sellerRoles) {

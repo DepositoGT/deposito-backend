@@ -1893,11 +1893,330 @@ async function productsReport(req, res, next) {
   }
 }
 
+/**
+ * GET /reports/inventory-count-session/:id?format=pdf|csv
+ * Resumen de una sesión de inventariado (teórico vs contado, diferencias y valor).
+ */
+async function inventoryCountSessionReport(req, res, next) {
+  try {
+    const { id } = req.params
+    const format = String(req.query.format || 'pdf').toLowerCase()
+
+    const session = await prisma.inventoryCountSession.findUnique({
+      where: { id },
+      include: {
+        createdBy: { select: { name: true, email: true } },
+        approvedBy: { select: { name: true, email: true } },
+      },
+    })
+    if (!session) {
+      return res.status(404).json({ message: 'Sesión de inventariado no encontrada' })
+    }
+
+    const lines = await prisma.inventoryCountLine.findMany({
+      where: { session_id: id },
+      orderBy: { product: { name: 'asc' } },
+      include: {
+        product: {
+          select: {
+            name: true,
+            barcode: true,
+            cost: true,
+            category: { select: { name: true } },
+          },
+        },
+      },
+    })
+
+    const config = await getSystemConfig(prisma)
+    const companyName = config.company_name
+    const money = makeMoney(config.currency_code)
+
+    if (format === 'csv' || format === 'excel') {
+      const rows = lines.map((L) => {
+        const diff = L.qty_counted != null ? L.qty_counted - L.stock_snapshot : ''
+        const vd =
+          L.qty_counted != null
+            ? (L.qty_counted - L.stock_snapshot) * number(L.product.cost)
+            : ''
+        return [
+          L.product.name,
+          L.product.barcode || '—',
+          L.product.category?.name || '—',
+          L.stock_snapshot,
+          L.qty_counted ?? '—',
+          diff === '' ? '—' : diff,
+          vd === '' ? '—' : money(vd),
+          (L.note || '').replace(/\n/g, ' '),
+        ]
+      })
+      return sendCsv(
+        res,
+        `inventariado-${String(session.name || id).slice(0, 24).replace(/\s+/g, '-') || id.slice(0, 8)}`,
+        [
+          'REPORTE DE INVENTARIADO',
+          `Sesión,${session.name || id}`,
+          `Estado,${session.status}`,
+          `Creado por,${session.createdBy?.name || '—'}`,
+          `Generado,${DateTime.now().setZone(config.timezone || 'America/Guatemala').toFormat('yyyy-LL-dd HH:mm')}`,
+        ],
+        [
+          {
+            title: 'Líneas',
+            columns: ['Producto', 'Código', 'Categoría', 'Teórico', 'Contado', 'Diferencia', 'Valor diff.', 'Nota'],
+            rows,
+          },
+        ]
+      )
+    }
+
+    const doc = newDoc(res, `Inventariado ${session.name || id.slice(0, 8)}`)
+    doc.fontSize(16).fillColor(BRAND.primary).text('Inventariado (conteo físico)', { align: 'left' })
+    doc.moveDown(0.3)
+    doc
+      .fontSize(9)
+      .fillColor(BRAND.muted)
+      .text(`${companyName} · ${session.status}`, { continued: false })
+    doc.text(
+      `Sesión: ${session.name || id} · Creado: ${session.createdBy?.name || '—'} · ${DateTime.fromJSDate(session.created_at).setZone(config.timezone || 'America/Guatemala').toFormat('dd/LL/yyyy HH:mm')}`
+    )
+    if (session.approved_at) {
+      doc.text(
+        `Aprobado: ${DateTime.fromJSDate(session.approved_at).setZone(config.timezone || 'America/Guatemala').toFormat('dd/LL/yyyy HH:mm')} · ${session.approvedBy?.name || '—'}`
+      )
+    }
+    doc.moveDown(0.8)
+
+    const tableRows = lines.map((L) => {
+      const diff = L.qty_counted != null ? L.qty_counted - L.stock_snapshot : null
+      const vd = diff != null ? diff * number(L.product.cost) : null
+      return [
+        String(L.product.name).slice(0, 28),
+        L.product.barcode || '—',
+        String(L.product.category?.name || '—').slice(0, 12),
+        L.stock_snapshot,
+        L.qty_counted ?? '—',
+        diff != null ? diff : '—',
+        vd != null ? money(vd) : '—',
+      ]
+    })
+
+    sectionTitle(doc, 'Detalle de líneas')
+    drawTable(
+      doc,
+      ['Producto', 'Cód.', 'Cat.', 'Teór.', 'Cont.', 'Diff.', 'Valor'],
+      tableRows.slice(0, 100),
+      [130, 62, 54, 36, 36, 36, 52],
+      {
+        align: ['left', 'left', 'left', 'right', 'right', 'right', 'right'],
+        headerAlign: ['left', 'left', 'left', 'right', 'right', 'right', 'right'],
+      }
+    )
+    if (lines.length > 100) {
+      ensureSpace(doc, 20)
+      doc.fontSize(8).fillColor(BRAND.muted).text(`… ${lines.length - 100} líneas más (ver CSV).`, doc.page.margins.left)
+    }
+
+    footer(doc, companyName)
+    doc.end()
+  } catch (e) {
+    next(e)
+  }
+}
+
+function inventoryCountStatusLabel(status) {
+  const m = {
+    DRAFT: 'Borrador',
+    IN_PROGRESS: 'En curso',
+    IN_REVIEW: 'En revisión',
+    APPROVED: 'Aprobado',
+    CANCELLED: 'Cancelado',
+  }
+  return m[status] || String(status)
+}
+
+/**
+ * GET /reports/inventory-counts?period=...&year=...&format=pdf|csv
+ * Resumen de sesiones de inventariado creadas en el rango: líneas, contadas, valor de diferencias y mermas.
+ */
+async function inventoryCountsHistoryReport(req, res, next) {
+  try {
+    const config = await getSystemConfig(prisma)
+    const companyName = config.company_name
+    const money = makeMoney(config.currency_code)
+    const zone = config.timezone || 'America/Guatemala'
+    const { period = 'month', year, format = 'pdf', month, quarter, semester } = req.query
+    const { startUtc, endUtc, label } = periodRange(period, year, { month, quarter, semester }, zone)
+
+    const sessions = await prisma.inventoryCountSession.findMany({
+      where: {
+        created_at: { gte: startUtc, lte: endUtc },
+      },
+      include: {
+        createdBy: { select: { name: true } },
+        approvedBy: { select: { name: true } },
+        _count: { select: { lines: true } },
+      },
+      orderBy: { created_at: 'desc' },
+    })
+
+    const sessionIds = sessions.map((s) => s.id)
+    const countedBySession = new Map()
+    const valueAgg = new Map()
+
+    if (sessionIds.length) {
+      const countedAgg = await prisma.inventoryCountLine.groupBy({
+        by: ['session_id'],
+        where: { session_id: { in: sessionIds }, qty_counted: { not: null } },
+        _count: { id: true },
+      })
+      for (const c of countedAgg) countedBySession.set(c.session_id, c._count.id)
+
+      const allLines = await prisma.inventoryCountLine.findMany({
+        where: { session_id: { in: sessionIds }, qty_counted: { not: null } },
+        select: {
+          session_id: true,
+          stock_snapshot: true,
+          qty_counted: true,
+          product: { select: { cost: true } },
+        },
+      })
+      for (const L of allLines) {
+        const d = L.qty_counted - L.stock_snapshot
+        const v = d * number(L.product.cost)
+        const prev = valueAgg.get(L.session_id) || { valueDiff: 0, mermaValue: 0 }
+        prev.valueDiff += v
+        if (d < 0) prev.mermaValue += Math.abs(v)
+        valueAgg.set(L.session_id, prev)
+      }
+    }
+
+    const genAt = DateTime.now().setZone(zone).toFormat('yyyy-LL-dd HH:mm')
+    const fmtDate = (d) =>
+      d ? DateTime.fromJSDate(d).setZone(zone).toFormat('dd/LL/yyyy HH:mm') : '—'
+
+    const tableData = sessions.map((s) => {
+      const agg = valueAgg.get(s.id) || { valueDiff: 0, mermaValue: 0 }
+      const counted = countedBySession.get(s.id) || 0
+      return {
+        s,
+        counted,
+        ...agg,
+      }
+    })
+
+    let sumValueDiff = 0
+    let sumMerma = 0
+    for (const row of tableData) {
+      sumValueDiff += row.valueDiff
+      sumMerma += row.mermaValue
+    }
+    const byStatus = sessions.reduce((acc, s) => {
+      acc[s.status] = (acc[s.status] || 0) + 1
+      return acc
+    }, {})
+
+    if (String(format).toLowerCase() === 'csv' || String(format).toLowerCase() === 'excel') {
+      const rows = tableData.map(({ s, counted, valueDiff, mermaValue }) => [
+        s.name || s.id.slice(0, 8),
+        inventoryCountStatusLabel(s.status),
+        fmtDate(s.created_at),
+        s._count.lines,
+        counted,
+        money(valueDiff),
+        money(mermaValue),
+        s.approved_at ? fmtDate(s.approved_at) : '—',
+        s.approvedBy?.name || '—',
+        s.createdBy?.name || '—',
+      ])
+      return sendCsv(
+        res,
+        `historial-inventariados-${label.replace(/\s+/g, '-').slice(0, 40)}`,
+        [
+          'HISTORIAL DE INVENTARIADOS',
+          `Periodo,${label}`,
+          `Generado,${genAt}`,
+          `Sesiones,${sessions.length}`,
+          `Suma valor diferencias (contado),${money(sumValueDiff)}`,
+          `Suma mermas (valor),${money(sumMerma)}`,
+        ],
+        [
+          {
+            title: 'Sesiones',
+            columns: [
+              'Sesión',
+              'Estado',
+              'Creado',
+              'Líneas',
+              'Contadas',
+              'Valor diff.',
+              'Merma ($)',
+              'Aprobado',
+              'Aprobador',
+              'Creado por',
+            ],
+            rows,
+          },
+        ]
+      )
+    }
+
+    const doc = newDoc(res, `Historial inventariados ${label}`)
+    doc.fontSize(16).fillColor(BRAND.primary).text('Historial de inventariados', { align: 'left' })
+    doc.moveDown(0.3)
+    doc.fontSize(9).fillColor(BRAND.muted).text(`${companyName} · ${label}`)
+    doc.text(`Generado: ${genAt}`)
+    doc.moveDown(0.6)
+
+    sectionTitle(doc, 'Resumen')
+    drawSummaryCards(doc, [
+      { label: 'Sesiones', value: String(sessions.length) },
+      { label: 'Aprobadas', value: String(byStatus.APPROVED || 0) },
+      { label: 'En curso / revisión', value: String((byStatus.IN_PROGRESS || 0) + (byStatus.IN_REVIEW || 0)) },
+      { label: 'Valor dif. (contado)', value: money(sumValueDiff) },
+      { label: 'Mermas (valor)', value: money(sumMerma) },
+    ])
+    doc.moveDown(0.5)
+
+    sectionTitle(doc, 'Sesiones')
+    const pdfRows = tableData.map(({ s, counted, valueDiff, mermaValue }) => [
+      String(s.name || s.id.slice(0, 8)).slice(0, 26),
+      inventoryCountStatusLabel(s.status).slice(0, 12),
+      fmtDate(s.created_at).slice(0, 16),
+      s._count.lines,
+      counted,
+      money(valueDiff),
+      money(mermaValue),
+    ])
+    drawTable(
+      doc,
+      ['Sesión', 'Estado', 'Creado', 'Lín.', 'Cont.', 'Val.diff', 'Merma'],
+      pdfRows.slice(0, 80),
+      [118, 52, 72, 28, 28, 58, 58],
+      {
+        align: ['left', 'left', 'left', 'right', 'right', 'right', 'right'],
+        headerAlign: ['left', 'left', 'left', 'right', 'right', 'right', 'right'],
+      }
+    )
+    if (tableData.length > 80) {
+      ensureSpace(doc, 18)
+      doc.fontSize(8).fillColor(BRAND.muted).text(`… ${tableData.length - 80} sesiones más (ver CSV).`, doc.page.margins.left)
+    }
+
+    footer(doc, companyName)
+    doc.end()
+  } catch (e) {
+    next(e)
+  }
+}
+
 module.exports = {
   salesReport,
   inventoryReport,
   suppliersReport,
   financialReport,
   alertsReport,
-  productsReport
+  productsReport,
+  inventoryCountSessionReport,
+  inventoryCountsHistoryReport,
 }
