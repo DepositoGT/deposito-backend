@@ -45,6 +45,8 @@ router.use('/settings', require('./settings.routes'))
 router.use('/promotions', require('./promotions.routes'))
 // Incoming Merchandise (registro de mercancía)
 router.use('/incoming-merchandise', require('./incomingMerchandise.routes'))
+// Inventariado (conteo físico)
+router.use('/inventory-counts', require('./inventoryCounts.routes'))
 
 
 module.exports = router
