@@ -100,13 +100,30 @@ model AlertPriority {
 // Entidades principales
 // ========================================
 
+enum SupplierPartyType {
+  SUPPLIER
+  CUSTOMER
+}
+
+/// Persona física vs empresa (razón social) para facturación y UI
+enum ContactEntityKind {
+  PERSON
+  ORGANIZATION
+}
+
 model Supplier {
   id                   String                @id @default(uuid()) @db.Uuid
+  /// Proveedor (compras / productos) o cliente (maestro de ventas)
+  party_type           SupplierPartyType     @default(SUPPLIER)
+  /// Persona individual o empresa (nombre = razón social o nombre completo según tipo)
+  entity_kind          ContactEntityKind     @default(ORGANIZATION)
   name                 String                @db.VarChar(150)
   contact              String                @db.VarChar(100)
   phone                String?               @db.VarChar(50)
   email                String?               @db.VarChar(150)
   address              String?               @db.Text
+  /// ID fiscal para facturación (NIT, VAT, RFC, EIN, etc.; formato según país)
+  tax_id               String?               @db.VarChar(100)
   products             Int                   @default(0)
   last_order           DateTime?
   total_purchases      Decimal               @default(0) @db.Decimal(12, 2)
@@ -121,6 +138,7 @@ model Supplier {
   deleted              Boolean               @default(false)
   deleted_at           DateTime?
 
+  @@index([party_type])
   @@map("suppliers")
 }
 

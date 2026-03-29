@@ -684,7 +684,7 @@ async function getFinancialData(startUtc, endUtc) {
 /** Agrega por proveedor: conteo de SKUs activos, unidades en stock y valor de inventario (stock × costo). */
 async function getSuppliersReportData() {
   const suppliers = await prisma.supplier.findMany({
-    where: { deleted_at: null },
+    where: { deleted: false, party_type: 'SUPPLIER' },
     include: { payment_term: true },
     orderBy: { name: 'asc' }
   })
