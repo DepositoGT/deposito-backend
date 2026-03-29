@@ -11,27 +11,82 @@
 const { prisma } = require('../models/prisma')
 const { DateTime } = require('luxon')
 const { getTimezone } = require('../utils/getTimezone')
+const {
+  assertPartyAction,
+  listablePartyTypes,
+  normalizePartyType,
+  PARTY,
+} = require('../utils/contactsPermissions')
+
+function normalizeTaxId(raw) {
+  if (raw === undefined) return undefined
+  if (raw === null || raw === '') return null
+  const s = String(raw).trim()
+  return s.length ? s : null
+}
+
+/** @returns {'PERSON'|'ORGANIZATION'} */
+function normalizeEntityKind(raw) {
+  if (raw === undefined || raw === null || raw === '') return 'ORGANIZATION'
+  const s = String(raw).toUpperCase().trim()
+  if (s === 'PERSON' || s === 'INDIVIDUAL' || s === 'NATURAL') return 'PERSON'
+  if (s === 'ORGANIZATION' || s === 'ORG' || s === 'COMPANY' || s === 'EMPRESA') return 'ORGANIZATION'
+  return 'ORGANIZATION'
+}
+
+/**
+ * @param {{ entityKind: 'PERSON'|'ORGANIZATION', name: string, contact?: string|null }} p
+ * @returns {{ ok: true, name: string, contact: string } | { ok: false, message: string }}
+ */
+function resolveContactForEntityKind(p) {
+  const name = String(p.name || '').trim()
+  let contact = p.contact != null ? String(p.contact).trim() : ''
+  if (p.entityKind === 'PERSON') {
+    if (!name) return { ok: false, message: 'El nombre es requerido' }
+    if (!contact) contact = name
+    return { ok: true, name, contact }
+  }
+  if (!name) return { ok: false, message: 'El nombre o razón social es requerido' }
+  if (!contact) return { ok: false, message: 'La persona de contacto es requerida para una empresa' }
+  return { ok: true, name, contact }
+}
 
 exports.list = async (req, res, next) => {
   try {
+    const lt = listablePartyTypes(req.user, req.query.party_type)
+    if (lt.error) return res.status(lt.error).json({ message: lt.message })
+
     const page = Math.max(1, Number(req.query.page ?? 1))
     const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 20)))
     const { search, category_id } = req.query || {}
 
-    const where = { deleted: false }
+    if (lt.types.length === 0) {
+      return res.json({
+        items: [],
+        page: 1,
+        pageSize,
+        totalPages: 1,
+        totalItems: 0,
+        nextPage: null,
+        prevPage: null,
+      })
+    }
+
+    const where = { deleted: false, party_type: { in: lt.types } }
 
     if (search) {
+      const q = String(search)
       where.OR = [
-        { name: { contains: String(search), mode: 'insensitive' } },
-        { contact: { contains: String(search), mode: 'insensitive' } },
-        { email: { contains: String(search), mode: 'insensitive' } }
+        { name: { contains: q, mode: 'insensitive' } },
+        { contact: { contains: q, mode: 'insensitive' } },
+        { email: { contains: q, mode: 'insensitive' } },
+        { tax_id: { contains: q, mode: 'insensitive' } },
       ]
     }
 
     if (category_id) {
       const categoryIdNum = Number(category_id)
       if (!Number.isNaN(categoryIdNum)) {
-        // filtrar proveedores que tengan al menos una categoría asociada igual a category_id
         where.categories = {
           some: { category_id: categoryIdNum },
         }
@@ -102,10 +157,28 @@ exports.create = async (req, res, next) => {
   try {
     const body = req.body || {}
     const { productsList, ...data } = body
-    // Build create payload mapping foreign keys to relation connects
-    const createData = {
+    const partyType = normalizePartyType(data.party_type)
+    try {
+      assertPartyAction(req.user, partyType, 'create')
+    } catch (err) {
+      return res.status(err.statusCode || 403).json({ message: err.message })
+    }
+
+    const entityKind = normalizeEntityKind(data.entity_kind)
+    const resolved = resolveContactForEntityKind({
+      entityKind,
       name: data.name,
       contact: data.contact,
+    })
+    if (!resolved.ok) {
+      return res.status(400).json({ message: resolved.message })
+    }
+
+    const createData = {
+      party_type: partyType,
+      entity_kind: entityKind,
+      name: resolved.name,
+      contact: resolved.contact,
       phone: data.phone,
       email: data.email,
       address: data.address,
@@ -113,28 +186,34 @@ exports.create = async (req, res, next) => {
       total_purchases: data.total_purchases ?? 0,
       rating: data.rating ?? null,
     }
+    if (data.tax_id !== undefined) {
+      createData.tax_id = normalizeTaxId(data.tax_id)
+    }
 
-    // Manejo de categorías (many-to-many)
-    const rawCategoryIds = Array.isArray(data.category_ids)
-      ? data.category_ids
-      : (data.category_id != null ? [data.category_id] : [])
+    if (partyType === PARTY.SUPPLIER) {
+      const rawCategoryIds = Array.isArray(data.category_ids)
+        ? data.category_ids
+        : (data.category_id != null ? [data.category_id] : [])
 
-    const categoryIds = rawCategoryIds
-      .map(id => Number(id))
-      .filter(id => Number.isFinite(id))
+      const categoryIds = rawCategoryIds
+        .map(id => Number(id))
+        .filter(id => Number.isFinite(id))
 
-    if (categoryIds.length > 0) {
+      if (categoryIds.length === 0) {
+        return res.status(400).json({ message: 'Debe indicar al menos una categoría para un proveedor' })
+      }
       createData.categories = {
         create: categoryIds.map(id => ({
           category: { connect: { id } },
         })),
       }
     }
-    if (data.payment_terms_id != null) {
-      // prisma model uses payment_term relation
-      createData.payment_term = { connect: { id: Number(data.payment_terms_id) } }
+
+    if (data.payment_terms_id == null || data.payment_terms_id === '') {
+      return res.status(400).json({ message: 'payment_terms_id es requerido' })
     }
-    // estado: 0 = inactivo, 1 = activo (default 1)
+    createData.payment_term = { connect: { id: Number(data.payment_terms_id) } }
+
     createData.estado = data.estado !== undefined && data.estado !== null ? Number(data.estado) : 1
 
     const created = await prisma.supplier.create({ data: createData })
@@ -157,6 +236,11 @@ exports.getOne = async (req, res, next) => {
       },
     })
     if (!item || item.deleted) return res.status(404).json({ message: 'No encontrado' })
+    try {
+      assertPartyAction(req.user, item.party_type, 'view')
+    } catch (err) {
+      return res.status(err.statusCode || 403).json({ message: err.message })
+    }
     const categories =
       Array.isArray(item.categories)
         ? item.categories
@@ -179,21 +263,75 @@ exports.getOne = async (req, res, next) => {
 
 exports.update = async (req, res, next) => {
   try {
+    const existing = await prisma.supplier.findUnique({
+      where: { id: req.params.id },
+      include: { productsList: { select: { id: true } } },
+    })
+    if (!existing || existing.deleted) {
+      return res.status(404).json({ message: 'No encontrado' })
+    }
+    try {
+      assertPartyAction(req.user, existing.party_type, 'edit')
+    } catch (err) {
+      return res.status(err.statusCode || 403).json({ message: err.message })
+    }
+
     const body = req.body || {}
     const { productsList, ...data } = body
 
     const updateData = {}
-    if (data.name !== undefined) updateData.name = data.name
-    if (data.contact !== undefined) updateData.contact = data.contact
+    const nextEntityKind =
+      data.entity_kind !== undefined ? normalizeEntityKind(data.entity_kind) : existing.entity_kind
+    const nextName = data.name !== undefined ? String(data.name).trim() : existing.name
+    const nextContact =
+      data.contact !== undefined ? String(data.contact).trim() : existing.contact
+
+    if (
+      data.entity_kind !== undefined ||
+      data.name !== undefined ||
+      data.contact !== undefined
+    ) {
+      const resolved = resolveContactForEntityKind({
+        entityKind: nextEntityKind,
+        name: nextName,
+        contact: nextContact,
+      })
+      if (!resolved.ok) {
+        return res.status(400).json({ message: resolved.message })
+      }
+      updateData.entity_kind = nextEntityKind
+      updateData.name = resolved.name
+      updateData.contact = resolved.contact
+    }
     if (data.phone !== undefined) updateData.phone = data.phone
     if (data.email !== undefined) updateData.email = data.email
     if (data.address !== undefined) updateData.address = data.address
+    if (data.tax_id !== undefined) updateData.tax_id = normalizeTaxId(data.tax_id)
     if (data.products !== undefined) updateData.products = data.products
     if (data.total_purchases !== undefined) updateData.total_purchases = data.total_purchases
     if (data.rating !== undefined) updateData.rating = data.rating
 
-    // Manejo de categorías (many-to-many)
-    if (data.category_ids != null || data.category_id != null) {
+    const effectiveParty =
+      data.party_type !== undefined ? normalizePartyType(data.party_type) : existing.party_type
+
+    if (data.party_type !== undefined && effectiveParty !== existing.party_type) {
+      if (effectiveParty === PARTY.CUSTOMER && (existing.productsList?.length ?? 0) > 0) {
+        return res.status(400).json({
+          message: 'No se puede marcar como cliente: tiene productos asignados como proveedor',
+        })
+      }
+      try {
+        assertPartyAction(req.user, effectiveParty, 'edit')
+      } catch (err) {
+        return res.status(err.statusCode || 403).json({ message: err.message })
+      }
+      updateData.party_type = effectiveParty
+    }
+
+    if (
+      effectiveParty === PARTY.SUPPLIER &&
+      (data.category_ids != null || data.category_id != null)
+    ) {
       const rawCategoryIds = Array.isArray(data.category_ids)
         ? data.category_ids
         : (data.category_id != null ? [data.category_id] : [])
@@ -203,11 +341,13 @@ exports.update = async (req, res, next) => {
         .filter(id => Number.isFinite(id))
 
       updateData.categories = {
-        deleteMany: {}, // limpiar relaciones actuales
+        deleteMany: {},
         create: categoryIds.map(id => ({
           category: { connect: { id } },
         })),
       }
+    } else if (effectiveParty === PARTY.CUSTOMER && (data.category_ids != null || data.category_id != null)) {
+      updateData.categories = { deleteMany: {} }
     }
     if (data.payment_terms_id != null) {
       updateData.payment_term = { connect: { id: Number(data.payment_terms_id) } }
@@ -223,6 +363,14 @@ exports.update = async (req, res, next) => {
 
 exports.remove = async (req, res, next) => {
   try {
+    const row = await prisma.supplier.findUnique({ where: { id: req.params.id } })
+    if (!row || row.deleted) return res.status(404).json({ message: 'No encontrado' })
+    try {
+      assertPartyAction(req.user, row.party_type, 'delete')
+    } catch (err) {
+      return res.status(err.statusCode || 403).json({ message: err.message })
+    }
+
     const tz = await getTimezone(prisma)
     const nowGt = DateTime.now().setZone(tz)
     const dateAsUtcWithGtClock = new Date(Date.UTC(

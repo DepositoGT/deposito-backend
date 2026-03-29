@@ -84,7 +84,7 @@ const router = Router()
  *                 totalItems: { type: integer }
  *                 nextPage: { type: integer, nullable: true }
  */
-router.get('/', Sales.list)
+router.get('/', Auth, hasPermission('sales.view'), Sales.list)
 
 /**
  * @openapi

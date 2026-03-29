@@ -14,6 +14,11 @@ const { DateTime } = require('luxon')
 const { getTimezone } = require('../utils/getTimezone')
 const { ensureStockAlertsBatch } = require('../services/stockAlerts')
 const { salesOperationLimiter } = require('../utils/concurrencyLimiter')
+const {
+  assertPartyAction,
+  PARTY,
+  userHasPerm,
+} = require('../utils/contactsPermissions')
 
 /** Misma forma que GET /sales/:id — reutilizado al responder POST /sales (evita un GET extra en el cliente). */
 const SALE_DETAIL_INCLUDE = {
@@ -61,8 +66,8 @@ const SALE_DETAIL_INCLUDE = {
 
 exports.list = async (req, res, next) => {
   try {
-    // Query params: period (today|week|month|year), status, page, pageSize
-    const { period, status } = req.query || {}
+    // Query params: period (today|week|month|year), status, page, pageSize, customer_contact_id
+    const { period, status, customer_contact_id: customerContactId } = req.query || {}
     const page = Math.max(1, Number(req.query.page ?? 1))
     const pageSize = Math.min(1000, Math.max(1, Number(req.query.pageSize ?? 100)))
 
@@ -124,6 +129,53 @@ exports.list = async (req, res, next) => {
     if (status) {
       // filter by related status name (e.g., ?status=pendiente)
       where.status = { name: String(status) }
+    }
+
+    if (customerContactId) {
+      if (!req.user) {
+        return res.status(401).json({ message: 'No autenticado' })
+      }
+      if (!userHasPerm(req.user, 'sales.view')) {
+        return res.status(403).json({ message: 'No autorizado' })
+      }
+      try {
+        assertPartyAction(req.user, PARTY.CUSTOMER, 'view')
+      } catch (err) {
+        return res.status(err.statusCode || 403).json({ message: err.message })
+      }
+      const contact = await prisma.supplier.findFirst({
+        where: {
+          id: String(customerContactId),
+          deleted: false,
+          party_type: 'CUSTOMER',
+        },
+        select: { id: true, name: true, tax_id: true },
+      })
+      if (!contact) {
+        return res.status(404).json({ message: 'Cliente no encontrado' })
+      }
+      const nameTrim = String(contact.name || '').trim()
+      const orClauses = []
+      if (nameTrim) {
+        orClauses.push({ customer: { equals: nameTrim, mode: 'insensitive' } })
+      }
+      const tid = contact.tax_id != null ? String(contact.tax_id).trim() : ''
+      if (tid) {
+        orClauses.push({ customer_nit: { equals: tid, mode: 'insensitive' } })
+      }
+      if (orClauses.length === 0) {
+        return res.json({
+          items: [],
+          page: 1,
+          pageSize,
+          totalPages: 1,
+          totalItems: 0,
+          nextPage: null,
+          prevPage: null,
+        })
+      }
+      const prevAnd = Array.isArray(where.AND) ? where.AND : []
+      where.AND = [...prevAnd, { OR: orClauses }]
     }
 
     const totalItems = await prisma.sale.count({ where })
