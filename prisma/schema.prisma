@@ -100,13 +100,30 @@ model AlertPriority {
 // Entidades principales
 // ========================================
 
+enum SupplierPartyType {
+  SUPPLIER
+  CUSTOMER
+}
+
+/// Persona física vs empresa (razón social) para facturación y UI
+enum ContactEntityKind {
+  PERSON
+  ORGANIZATION
+}
+
 model Supplier {
   id                   String                @id @default(uuid()) @db.Uuid
+  /// Proveedor (compras / productos) o cliente (maestro de ventas)
+  party_type           SupplierPartyType     @default(SUPPLIER)
+  /// Persona individual o empresa (nombre = razón social o nombre completo según tipo)
+  entity_kind          ContactEntityKind     @default(ORGANIZATION)
   name                 String                @db.VarChar(150)
   contact              String                @db.VarChar(100)
   phone                String?               @db.VarChar(50)
   email                String?               @db.VarChar(150)
   address              String?               @db.Text
+  /// ID fiscal para facturación (NIT, VAT, RFC, EIN, etc.; formato según país)
+  tax_id               String?               @db.VarChar(100)
   products             Int                   @default(0)
   last_order           DateTime?
   total_purchases      Decimal               @default(0) @db.Decimal(12, 2)
@@ -121,6 +138,7 @@ model Supplier {
   deleted              Boolean               @default(false)
   deleted_at           DateTime?
 
+  @@index([party_type])
   @@map("suppliers")
 }
 
@@ -150,6 +168,7 @@ model Product {
   return_items               ReturnItem[]
   promotion_products         PromotionProduct[]
   incoming_merchandise_items IncomingMerchandiseItem[]
+  inventory_count_lines      InventoryCountLine[]
 
   @@map("products")
 }
@@ -197,6 +216,9 @@ model User {
   sales_created        Sale[]                @relation("SaleCreatedBy")
   cash_closures_as_cashier    CashClosure[]  @relation("CashClosureCashier")
   cash_closures_as_supervisor CashClosure[]  @relation("CashClosureSupervisor")
+  inventory_counts_created    InventoryCountSession[] @relation("InventoryCountCreatedBy")
+  inventory_counts_approved   InventoryCountSession[] @relation("InventoryCountApprovedBy")
+  inventory_count_lines_counted InventoryCountLine[] @relation("InventoryCountLineCountedBy")
 
   // Campos de empleado
   is_employee Boolean   @default(false)
@@ -610,6 +632,62 @@ model SalePromotion {
   @@index([sale_id])
   @@index([promotion_id])
   @@map("sale_promotions")
+}
+
+// ========================================
+// Inventariado (conteo físico vs stock teórico)
+// ========================================
+
+enum InventoryCountSessionStatus {
+  DRAFT
+  IN_PROGRESS
+  IN_REVIEW
+  APPROVED
+  CANCELLED
+}
+
+model InventoryCountSession {
+  id             String                      @id @default(uuid()) @db.Uuid
+  name           String?                     @db.VarChar(200)
+  status         InventoryCountSessionStatus @default(DRAFT)
+  /// { categoryIds?: number[], supplierIds?: string[] } — vacío = todos los productos activos (no eliminados)
+  scope_json     Json?
+  created_by_id  String                      @db.Uuid
+  createdBy      User                        @relation("InventoryCountCreatedBy", fields: [created_by_id], references: [id])
+  started_at     DateTime?
+  submitted_at   DateTime?
+  approved_at    DateTime?
+  approved_by_id String?                     @db.Uuid
+  approvedBy     User?                       @relation("InventoryCountApprovedBy", fields: [approved_by_id], references: [id])
+  cancelled_at   DateTime?
+  cancel_reason  String?                     @db.Text
+  notes          String?                     @db.Text
+  lines          InventoryCountLine[]
+  created_at     DateTime                    @default(now())
+  updated_at     DateTime                    @updatedAt
+
+  @@index([status])
+  @@index([created_by_id])
+  @@map("inventory_count_sessions")
+}
+
+model InventoryCountLine {
+  id             String                @id @default(uuid()) @db.Uuid
+  session_id     String                @db.Uuid
+  session        InventoryCountSession @relation(fields: [session_id], references: [id], onDelete: Cascade)
+  product_id     String                @db.Uuid
+  product        Product               @relation(fields: [product_id], references: [id])
+  stock_snapshot Int
+  qty_counted    Int?
+  counted_at     DateTime?
+  counted_by_id  String?               @db.Uuid
+  countedBy      User?                 @relation("InventoryCountLineCountedBy", fields: [counted_by_id], references: [id])
+  note           String?               @db.VarChar(500)
+
+  @@unique([session_id, product_id])
+  @@index([session_id])
+  @@index([product_id])
+  @@map("inventory_count_lines")
 }
 
 // ========================================

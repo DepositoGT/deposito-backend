@@ -15,6 +15,33 @@
 const XLSX = require('xlsx')
 const { prisma } = require('../models/prisma')
 
+function stripDiacritics(s) {
+    return String(s).normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+}
+
+/**
+ * @param {unknown} raw
+ * @returns {{ kind: 'PERSON'|'ORGANIZATION' } | { error: string }}
+ */
+function parseEntityKindFromExcel(raw) {
+    const s = stripDiacritics(String(raw ?? '').trim()).toLowerCase()
+    if (!s) return { kind: 'ORGANIZATION' }
+    const personTokens = new Set(['persona', 'individual', 'natural', 'pf', 'fisica', 'person'])
+    const orgTokens = new Set([
+        'empresa',
+        'organizacion',
+        'juridica',
+        'pj',
+        'moral',
+        'organization',
+        'company',
+        'org',
+    ])
+    if (personTokens.has(s)) return { kind: 'PERSON' }
+    if (orgTokens.has(s)) return { kind: 'ORGANIZATION' }
+    return { error: `Naturaleza "${String(raw).trim()}" no válida. Use empresa o persona.` }
+}
+
 /**
  * Parse Excel buffer and extract supplier rows
  * @param {Buffer} buffer - Excel file buffer
@@ -44,14 +71,22 @@ function validateSupplierRow(row, rowIndex, categoriesMap, paymentTermsMap, exis
 
     // Field aliases - support both Spanish headers and English system names
     const fieldAliases = {
-        'name': ['nombre', 'name', 'empresa'],
+        'entity_kind': [
+            'naturaleza_contacto',
+            'naturaleza',
+            'tipo_entidad',
+            'entidad',
+            'tipo_contacto',
+            'entity_kind',
+        ],
+        'name': ['nombre', 'name', 'empresa', 'razon_social'],
         'contact': ['contacto', 'contact', 'persona_contacto'],
         'phone': ['telefono', 'phone', 'tel'],
         'email': ['email', 'correo', 'correo_electronico'],
         'address': ['direccion', 'address', 'domicilio'],
         'category': ['categoria', 'category'],
         'payment_terms': ['terminos_pago', 'payment_terms', 'pago'],
-        'rating': ['calificacion', 'rating', 'puntuacion']
+        'tax_id': ['id_fiscal', 'nit', 'tax_id', 'rfc'],
     }
 
     // Normalize row keys (lowercase, trim) and resolve aliases
@@ -71,6 +106,18 @@ function validateSupplierRow(row, rowIndex, categoriesMap, paymentTermsMap, exis
         }
     }
 
+    let entityKind = 'ORGANIZATION'
+    const rawEntity = normalizedRow.entity_kind
+    if (rawEntity !== undefined && rawEntity !== null && String(rawEntity).trim() !== '') {
+        const parsed = parseEntityKindFromExcel(rawEntity)
+        if (parsed.error) {
+            errors.push(parsed.error)
+        } else {
+            entityKind = parsed.kind
+        }
+    }
+    data.entity_kind = entityKind
+
     // Required: name
     const nombre = String(normalizedRow.name || '').trim()
     if (!nombre) {
@@ -79,12 +126,16 @@ function validateSupplierRow(row, rowIndex, categoriesMap, paymentTermsMap, exis
         data.name = nombre
     }
 
-    // Required: contact
+    // Contacto: obligatorio para empresa; para persona se replica el nombre si va vacío
     const contacto = String(normalizedRow.contact || '').trim()
-    if (!contacto) {
-        errors.push('El campo "contacto" es requerido')
+    if (entityKind === 'ORGANIZATION') {
+        if (!contacto) {
+            errors.push('El campo "contacto" es requerido cuando la naturaleza es empresa')
+        } else {
+            data.contact = contacto
+        }
     } else {
-        data.contact = contacto
+        data.contact = contacto || nombre
     }
 
     // Required: phone
@@ -154,9 +205,11 @@ function validateSupplierRow(row, rowIndex, categoriesMap, paymentTermsMap, exis
         }
     }
 
-    // Optional: payment_terms (if provided, must exist)
+    // Required: payment_terms (must exist in DB)
     const terminosPago = String(normalizedRow.payment_terms || '').trim()
-    if (terminosPago) {
+    if (!terminosPago) {
+        errors.push('El campo "terminos_pago" es requerido')
+    } else {
         const paymentTermId = paymentTermsMap.get(terminosPago.toLowerCase())
         if (!paymentTermId) {
             errors.push(`Términos de pago "${terminosPago}" no existe en el sistema`)
@@ -165,15 +218,10 @@ function validateSupplierRow(row, rowIndex, categoriesMap, paymentTermsMap, exis
         }
     }
 
-    // Optional: rating (0-5)
-    const calificacion = normalizedRow.rating
-    if (calificacion !== undefined && calificacion !== '') {
-        const rating = parseFloat(calificacion)
-        if (isNaN(rating) || rating < 0 || rating > 5) {
-            errors.push('La calificación debe ser un número entre 0 y 5')
-        } else {
-            data.rating = rating
-        }
+    // Optional: tax_id
+    const taxRaw = normalizedRow.tax_id
+    if (taxRaw !== undefined && taxRaw !== null && String(taxRaw).trim() !== '') {
+        data.tax_id = String(taxRaw).trim()
     }
 
     return {
@@ -264,6 +312,8 @@ async function bulkCreateSuppliers(validRows) {
     for (const row of validRows) {
         try {
             const createData = {
+                party_type: 'SUPPLIER',
+                entity_kind: row.data.entity_kind || 'ORGANIZATION',
                 name: row.data.name,
                 contact: row.data.contact,
                 phone: row.data.phone,
@@ -271,6 +321,9 @@ async function bulkCreateSuppliers(validRows) {
                 address: row.data.address,
                 products: 0,
                 total_purchases: 0,
+            }
+            if (row.data.tax_id) {
+                createData.tax_id = row.data.tax_id
             }
 
             // Connect relations
@@ -283,9 +336,6 @@ async function bulkCreateSuppliers(validRows) {
             }
             if (row.data.payment_terms_id) {
                 createData.payment_term = { connect: { id: row.data.payment_terms_id } }
-            }
-            if (row.data.rating !== undefined) {
-                createData.rating = row.data.rating
             }
 
             // estado: 1 = activo por defecto
@@ -325,6 +375,7 @@ async function generateSupplierTemplate() {
     ])
 
     const headers = [
+        'naturaleza_contacto',
         'nombre',
         'contacto',
         'telefono',
@@ -332,10 +383,11 @@ async function generateSupplierTemplate() {
         'direccion',
         'categoria',
         'terminos_pago',
-        'calificacion'
+        'id_fiscal',
     ]
 
-    const example = [
+    const exampleOrg = [
+        'empresa',
         'Distribuidora Ejemplo',
         'Juan Pérez',
         '+502 5555-1234',
@@ -343,27 +395,38 @@ async function generateSupplierTemplate() {
         'Zona 10, Ciudad de Guatemala',
         categories[0]?.name || 'Cervezas',
         paymentTerms[0]?.name || '30 días',
-        '4.5'
+        '',
+    ]
+
+    const examplePerson = [
+        'persona',
+        'María López',
+        '',
+        '+502 5555-9999',
+        'maria@email.com',
+        'Ciudad',
+        categories[0]?.name || 'Cervezas',
+        paymentTerms[0]?.name || '30 días',
+        '12345678-9',
     ]
 
     const workbook = XLSX.utils.book_new()
-    const worksheet = XLSX.utils.aoa_to_sheet([headers, example])
+    const worksheet = XLSX.utils.aoa_to_sheet([headers, exampleOrg, examplePerson])
 
-    // Set column widths
     worksheet['!cols'] = [
-        { wch: 25 }, // nombre
-        { wch: 20 }, // contacto
-        { wch: 18 }, // telefono
-        { wch: 30 }, // email
-        { wch: 35 }, // direccion
-        { wch: 20 }, // categoria
-        { wch: 20 }, // terminos_pago
-        { wch: 12 }, // calificacion
+        { wch: 20 },
+        { wch: 28 },
+        { wch: 22 },
+        { wch: 18 },
+        { wch: 30 },
+        { wch: 35 },
+        { wch: 20 },
+        { wch: 22 },
+        { wch: 18 },
     ]
 
     XLSX.utils.book_append_sheet(workbook, worksheet, 'Proveedores')
 
-    // Catálogos sheet - list of valid categories and payment terms
     const maxRows = Math.max(categories.length, paymentTerms.length)
     const catalogData = [['Categorías Válidas', 'Términos de Pago Válidos']]
     for (let i = 0; i < maxRows; i++) {
@@ -375,6 +438,21 @@ async function generateSupplierTemplate() {
     const catalogsWs = XLSX.utils.aoa_to_sheet(catalogData)
     catalogsWs['!cols'] = [{ wch: 25 }, { wch: 25 }]
     XLSX.utils.book_append_sheet(workbook, catalogsWs, 'Catálogos')
+
+    const helpRows = [
+        ['Instrucciones'],
+        [''],
+        ['naturaleza_contacto: empresa o persona (igual que en el alta manual). Vacío = empresa.'],
+        ['  También acepta la columna tipo_entidad o naturaleza con los mismos valores.'],
+        ['nombre: razón social (empresa) o nombre completo (persona).'],
+        ['contacto: obligatorio para empresa. Para persona puede dejarse vacío (se usa el nombre).'],
+        ['terminos_pago: obligatorio; debe coincidir exactamente con un valor de la hoja Catálogos.'],
+        ['id_fiscal: opcional (NIT, RFC, etc.).'],
+        ['Esta plantilla es solo para proveedores (party_type SUPPLIER).'],
+    ]
+    const helpWs = XLSX.utils.aoa_to_sheet(helpRows)
+    helpWs['!cols'] = [{ wch: 72 }]
+    XLSX.utils.book_append_sheet(workbook, helpWs, 'Instrucciones')
 
     const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' })
     return buffer

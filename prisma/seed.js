@@ -90,12 +90,26 @@ async function main() {
     { code: 'products.import', name: 'Importar productos', description: 'Puede realizar importaciones masivas de productos' },
     { code: 'products.export', name: 'Exportar productos', description: 'Puede exportar listados de productos' },
 
-    // Proveedores
-    { code: 'suppliers.view', name: 'Ver proveedores', description: 'Puede ver proveedores' },
-    { code: 'suppliers.create', name: 'Crear proveedores', description: 'Puede crear proveedores' },
-    { code: 'suppliers.edit', name: 'Editar proveedores', description: 'Puede editar proveedores' },
-    { code: 'suppliers.delete', name: 'Eliminar proveedores', description: 'Puede eliminar proveedores' },
-    { code: 'suppliers.import', name: 'Importar proveedores', description: 'Puede importar proveedores' },
+    // Inventariado (conteo físico)
+    { code: 'inventory_count.view', name: 'Ver inventariados', description: 'Puede ver sesiones y líneas de inventariado' },
+    { code: 'inventory_count.create', name: 'Crear inventariado', description: 'Puede crear sesiones e iniciar conteo' },
+    { code: 'inventory_count.count', name: 'Registrar conteos', description: 'Puede ingresar cantidades contadas físicamente' },
+    { code: 'inventory_count.submit', name: 'Enviar inventariado a revisión', description: 'Puede cerrar el conteo y enviar a revisión' },
+    { code: 'inventory_count.approve', name: 'Aprobar inventariado', description: 'Puede aprobar y aplicar ajustes de stock' },
+    { code: 'inventory_count.cancel', name: 'Cancelar inventariado', description: 'Puede cancelar sesiones sin aplicar cambios' },
+    { code: 'inventory_count.export', name: 'Exportar reportes de inventariado', description: 'Puede exportar CSV/PDF de sesiones de inventario' },
+
+    // Contactos — proveedores (tabla suppliers, party_type SUPPLIER)
+    { code: 'contacts.suppliers.view', name: 'Ver proveedores', description: 'Puede ver contactos tipo proveedor' },
+    { code: 'contacts.suppliers.create', name: 'Crear proveedores', description: 'Puede crear contactos tipo proveedor' },
+    { code: 'contacts.suppliers.edit', name: 'Editar proveedores', description: 'Puede editar contactos tipo proveedor' },
+    { code: 'contacts.suppliers.delete', name: 'Eliminar proveedores', description: 'Puede eliminar contactos tipo proveedor' },
+    { code: 'contacts.suppliers.import', name: 'Importar proveedores', description: 'Puede importar proveedores desde archivos' },
+    // Contactos — clientes (tabla suppliers, party_type CUSTOMER)
+    { code: 'contacts.clients.view', name: 'Ver clientes', description: 'Puede ver contactos tipo cliente' },
+    { code: 'contacts.clients.create', name: 'Crear clientes', description: 'Puede crear contactos tipo cliente' },
+    { code: 'contacts.clients.edit', name: 'Editar clientes', description: 'Puede editar contactos tipo cliente' },
+    { code: 'contacts.clients.delete', name: 'Eliminar clientes', description: 'Puede eliminar contactos tipo cliente' },
 
     // Ventas y devoluciones
     { code: 'sales.view', name: 'Ver ventas', description: 'Puede ver ventas' },
@@ -152,6 +166,43 @@ async function main() {
   }
   console.log('Permisos creados')
 
+  // Migrar permisos legacy suppliers.* → contacts.suppliers.* (roles que ya los tenían)
+  const suppliersToContactsSuppliers = [
+    ['suppliers.view', 'contacts.suppliers.view'],
+    ['suppliers.create', 'contacts.suppliers.create'],
+    ['suppliers.edit', 'contacts.suppliers.edit'],
+    ['suppliers.delete', 'contacts.suppliers.delete'],
+    ['suppliers.import', 'contacts.suppliers.import'],
+  ]
+  for (const [oldCode, newCode] of suppliersToContactsSuppliers) {
+    const oldP = await prisma.permission.findUnique({ where: { code: oldCode } })
+    const newP = await prisma.permission.findUnique({ where: { code: newCode } })
+    if (!oldP || !newP) continue
+    const oldRolePerms = await prisma.rolePermission.findMany({ where: { permission_id: oldP.id } })
+    for (const rp of oldRolePerms) {
+      await prisma.rolePermission.upsert({
+        where: {
+          role_id_permission_id: {
+            role_id: rp.role_id,
+            permission_id: newP.id,
+          },
+        },
+        update: {},
+        create: {
+          role_id: rp.role_id,
+          permission_id: newP.id,
+        },
+      })
+    }
+    await prisma.rolePermission.deleteMany({ where: { permission_id: oldP.id } })
+    try {
+      await prisma.permission.delete({ where: { id: oldP.id } })
+      console.log(`  Permiso migrado: ${oldCode} → ${newCode}`)
+    } catch (err) {
+      console.log(`  No se pudo eliminar permiso legacy ${oldCode}: ${err.message}`)
+    }
+  }
+
   // ========================================
   // 5. ASIGNACIÓN DE PERMISOS A ROLES
   // ========================================
@@ -196,6 +247,11 @@ async function main() {
     'cashclosure.create_own',  // Cajero: solo puede generar su propio cierre
     'analytics.view',
     'merchandise.view',
+    // Inventariado: contar y enviar a revisión (sin crear ni aprobar por defecto)
+    'inventory_count.view',
+    'inventory_count.count',
+    'inventory_count.submit',
+    'inventory_count.export',
   ]
 
   for (const sellerRole of sellerRoles) {
