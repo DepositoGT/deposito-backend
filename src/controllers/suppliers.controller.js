@@ -404,25 +404,23 @@ const { bulkValidateSuppliers, bulkCreateSuppliers, generateSupplierTemplate } =
  */
 exports.bulkImportMapped = async (req, res, next) => {
   try {
-    const { suppliers } = req.body
+    const { suppliers, importOptions } = req.body
 
     if (!suppliers || !Array.isArray(suppliers) || suppliers.length === 0) {
-      return res.status(400).json({ message: 'No se proporcionaron proveedores' })
+      return res.status(400).json({ message: 'No se proporcionaron contactos' })
     }
 
-    // Validate all suppliers
-    const validation = await bulkValidateSuppliers(suppliers)
+    const validation = await bulkValidateSuppliers(suppliers, importOptions)
 
     if (validation.invalidRows.length > 0) {
       return res.status(400).json({
         ok: false,
-        message: `${validation.invalidRows.length} proveedores tienen errores`,
+        message: `${validation.invalidRows.length} filas tienen errores`,
         ...validation
       })
     }
 
-    // All valid, proceed to import
-    const result = await bulkCreateSuppliers(validation.validRows)
+    const result = await bulkCreateSuppliers(validation.validRows, importOptions)
 
     res.json({
       ok: true,
@@ -430,8 +428,8 @@ exports.bulkImportMapped = async (req, res, next) => {
       skipped: result.skipped || 0,
       errors: result.errors || [],
       message: result.skipped > 0
-        ? `Se importaron ${result.created} proveedores (${result.skipped} omitidos por duplicados)`
-        : `Se importaron ${result.created} proveedores exitosamente`
+        ? `Se importaron ${result.created} contactos (${result.skipped} omitidos por error)`
+        : `Se importaron ${result.created} contactos exitosamente`
     })
   } catch (e) {
     next(e)
@@ -450,13 +448,13 @@ exports.bulkImportMapped = async (req, res, next) => {
  */
 exports.validateImportMapped = async (req, res, next) => {
   try {
-    const { suppliers } = req.body
+    const { suppliers, importOptions } = req.body
 
     if (!suppliers || !Array.isArray(suppliers) || suppliers.length === 0) {
-      return res.status(400).json({ message: 'No se proporcionaron proveedores' })
+      return res.status(400).json({ message: 'No se proporcionaron contactos' })
     }
 
-    const validation = await bulkValidateSuppliers(suppliers)
+    const validation = await bulkValidateSuppliers(suppliers, importOptions)
 
     res.json({
       ok: validation.invalidRows.length === 0,
@@ -488,7 +486,7 @@ exports.downloadTemplate = async (req, res, next) => {
     const buffer = await generateSupplierTemplate()
 
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-    res.setHeader('Content-Disposition', 'attachment; filename="plantilla_proveedores.xlsx"')
+    res.setHeader('Content-Disposition', 'attachment; filename="plantilla_contactos.xlsx"')
     res.send(buffer)
   } catch (e) {
     next(e)
