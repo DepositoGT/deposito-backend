@@ -304,6 +304,26 @@ function calculateMinQtyDiscount(promotion, cartItems) {
  */
 function applyPromotion(promotion, cartItems) {
     const typeName = promotion.type?.name || ''
+    const cartTotal = (cartItems || []).reduce(
+        (sum, item) => sum + (Number(item.price) * Number(item.qty || 0)),
+        0
+    )
+
+    // Enforce minimum purchase amount for ALL promotion types
+    if (promotion.min_purchase_amount != null && promotion.min_purchase_amount !== '') {
+        const required = Number(promotion.min_purchase_amount)
+        if (!isNaN(required) && required > 0 && cartTotal < required) {
+            return {
+                discount: 0,
+                details: {
+                    type: typeName || 'UNKNOWN',
+                    reason: 'Compra mínima no alcanzada',
+                    required,
+                    current: Math.round(cartTotal * 100) / 100
+                }
+            }
+        }
+    }
 
     switch (typeName) {
         case PROMOTION_TYPES.PERCENTAGE:
