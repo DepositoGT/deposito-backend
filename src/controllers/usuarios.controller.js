@@ -727,26 +727,36 @@ exports.downloadTemplate = async (req, res, next) => {
 // POST /api/auth/users/validate-import-mapped - Validar datos mapeados
 exports.validateImportMapped = async (req, res, next) => {
   try {
-    const { rows } = req.body || {}
+    const { rows, importOptions } = req.body || {}
     if (!rows || !Array.isArray(rows)) {
       return res.status(400).json({ message: 'Se requiere un array de filas en "rows"' })
     }
 
-    const result = await bulkValidateUsers(rows)
-    res.json(result)
+    const result = await bulkValidateUsers(rows, importOptions)
+    res.json({
+      ok: result.invalidRows.length === 0,
+      validRows: result.validRows,
+      invalidRows: result.invalidRows.map((r) => ({
+        rowIndex: r.rowIndex,
+        errors: r.errors,
+        hints: r.hints,
+      })),
+      skippedRows: result.skippedRows,
+      resolutionHints: result.resolutionHints,
+      totals: result.totals,
+    })
   } catch (e) { next(e) }
 }
 
 // POST /api/auth/users/bulk-import-mapped - Importar usuarios validados
 exports.bulkImportMapped = async (req, res, next) => {
   try {
-    const { rows } = req.body || {}
+    const { rows, importOptions } = req.body || {}
     if (!rows || !Array.isArray(rows) || rows.length === 0) {
       return res.status(400).json({ message: 'Se requiere un array de filas válidas en "rows"' })
     }
 
-    // Validar primero
-    const validation = await bulkValidateUsers(rows)
+    const validation = await bulkValidateUsers(rows, importOptions)
     if (validation.invalidRows.length > 0) {
       return res.status(400).json({
         message: 'Hay filas inválidas. Por favor, corrija los errores antes de importar.',

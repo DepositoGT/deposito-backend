@@ -15,6 +15,65 @@
 const XLSX = require('xlsx')
 const { prisma } = require('../models/prisma')
 
+function normalizeImportOptions(raw) {
+    const o = raw && typeof raw === 'object' ? raw : {}
+    const createCategories = Array.isArray(o.createCategories)
+        ? o.createCategories.map(s => String(s).trim()).filter(Boolean)
+        : []
+    const createSuppliers = Array.isArray(o.createSuppliers)
+        ? o.createSuppliers.map(s => String(s).trim()).filter(Boolean)
+        : []
+    const skipRowIndexes = Array.isArray(o.skipRowIndexes)
+        ? o.skipRowIndexes.map(n => Number(n)).filter(n => Number.isFinite(n) && n >= 2)
+        : []
+    return {
+        createCategorySet: new Set(createCategories.map(s => s.toLowerCase())),
+        createSupplierSet: new Set(createSuppliers.map(s => s.toLowerCase())),
+        skipRowSet: new Set(skipRowIndexes),
+        createCategories,
+        createSuppliers,
+        skipRowIndexes,
+    }
+}
+
+function mergeResolutionHints(invalidRows) {
+    const catMap = new Map()
+    const supMap = new Map()
+    for (const ir of invalidRows) {
+        const h = ir.hints || { unknownCategories: [], unknownSuppliers: [] }
+        for (const c of h.unknownCategories || []) {
+            const display = String(c).trim()
+            if (!display) continue
+            const k = display.toLowerCase()
+            if (!catMap.has(k)) catMap.set(k, { value: display, rowIndexes: new Set() })
+            catMap.get(k).rowIndexes.add(ir.rowIndex)
+        }
+        for (const s of h.unknownSuppliers || []) {
+            const display = String(s).trim()
+            if (!display) continue
+            const k = display.toLowerCase()
+            if (!supMap.has(k)) supMap.set(k, { value: display, rowIndexes: new Set() })
+            supMap.get(k).rowIndexes.add(ir.rowIndex)
+        }
+    }
+    const resolutionHints = []
+    for (const { value, rowIndexes } of catMap.values()) {
+        resolutionHints.push({
+            kind: 'category',
+            value,
+            rowIndexes: [...rowIndexes].sort((a, b) => a - b),
+        })
+    }
+    for (const { value, rowIndexes } of supMap.values()) {
+        resolutionHints.push({
+            kind: 'supplier',
+            value,
+            rowIndexes: [...rowIndexes].sort((a, b) => a - b),
+        })
+    }
+    return resolutionHints
+}
+
 /**
  * Parse Excel buffer and extract product rows
  * @param {Buffer} buffer - Excel file buffer
@@ -29,18 +88,12 @@ function parseExcel(buffer) {
 }
 
 /**
- * Validate a single product row against business rules and database
- * @param {Object} row - Product row data
- * @param {number} rowIndex - Row index for error reporting
- * @param {Map} categoriesMap - Map of category names to IDs
- * @param {Map} suppliersMap - Map of supplier names to IDs
- * @param {Set} existingBarcodes - Set of existing barcodes in DB
- * @param {Set} batchBarcodes - Set of barcodes seen in current batch (to detect duplicates in file)
- * @returns {Object} { valid: boolean, errors: string[], data: Object }
+ * @param {number} i - Índice 0-based de fila de datos (fila Excel = i + 2)
  */
-function validateRow(row, rowIndex, categoriesMap, suppliersMap, existingBarcodes, batchBarcodes) {
+function validateRow(row, i, categoriesMap, suppliersMap, existingBarcodes, batchBarcodes, importOptions) {
     const errors = []
     const data = {}
+    const hints = { unknownCategories: [], unknownSuppliers: [] }
 
     // Field aliases - support both Spanish headers and English system names
     const fieldAliases = {
@@ -82,29 +135,39 @@ function validateRow(row, rowIndex, categoriesMap, suppliersMap, existingBarcode
         data.name = nombre
     }
 
-    // Required: category (must exist in DB)
+    // Required: category (existente, o aprobada para crear, u omitir fila)
     const categoria = String(normalizedRow.category || '').trim()
     if (!categoria) {
         errors.push('El campo "categoria" es requerido')
     } else {
         const categoryId = categoriesMap.get(categoria.toLowerCase())
-        if (!categoryId) {
-            errors.push(`Categoría "${categoria}" no existe en el sistema`)
-        } else {
+        if (categoryId) {
             data.category_id = categoryId
+        } else if (importOptions.createCategorySet.has(categoria.toLowerCase())) {
+            data.category_create_name = categoria
+        } else {
+            errors.push(
+                `Categoría "${categoria}" no existe. Cree este valor en catálogo u omita las filas donde aparece.`,
+            )
+            hints.unknownCategories.push(categoria)
         }
     }
 
-    // Required: supplier (must exist in DB)
+    // Required: supplier (proveedor SUPPLIER en BD, o aprobado para crear)
     const proveedor = String(normalizedRow.supplier || '').trim()
     if (!proveedor) {
         errors.push('El campo "proveedor" es requerido')
     } else {
         const supplierId = suppliersMap.get(proveedor.toLowerCase())
-        if (!supplierId) {
-            errors.push(`Proveedor "${proveedor}" no existe en el sistema`)
-        } else {
+        if (supplierId) {
             data.supplier_id = supplierId
+        } else if (importOptions.createSupplierSet.has(proveedor.toLowerCase())) {
+            data.supplier_create_name = proveedor
+        } else {
+            errors.push(
+                `Proveedor "${proveedor}" no existe. Cree este contacto como proveedor u omita las filas donde aparece.`,
+            )
+            hints.unknownSuppliers.push(proveedor)
         }
     }
 
@@ -196,25 +259,30 @@ function validateRow(row, rowIndex, categoriesMap, suppliersMap, existingBarcode
         valid: errors.length === 0,
         errors,
         data,
-        rowIndex: rowIndex + 2 // +2 because Excel is 1-indexed and has header row
+        rowIndex: i + 2,
+        hints,
     }
 }
 
 /**
- * Validate all rows from Excel file
- * @param {Object[]} rows - Array of product rows from Excel
- * @returns {Promise<Object>} { validRows: Object[], invalidRows: Object[], totals: Object }
+ * @param {Object[]} rows
+ * @param {object} [importOptionsRaw]
  */
-async function validateBulkData(rows) {
-    // Fetch all categories and suppliers for validation
-    // NOTE: For barcodes, we check ALL products (including deleted) because the DB unique constraint applies to all
+async function validateBulkData(rows, importOptionsRaw) {
+    const importOptions = normalizeImportOptions(importOptionsRaw)
+
     const [categories, suppliers, products] = await Promise.all([
-        prisma.productCategory.findMany({ select: { id: true, name: true } }),
-        prisma.supplier.findMany({ select: { id: true, name: true } }),
-        prisma.product.findMany({ select: { barcode: true } }) // No deleted filter - check ALL barcodes
+        prisma.productCategory.findMany({
+            where: { deleted: false },
+            select: { id: true, name: true },
+        }),
+        prisma.supplier.findMany({
+            where: { deleted: false, party_type: 'SUPPLIER' },
+            select: { id: true, name: true },
+        }),
+        prisma.product.findMany({ select: { barcode: true } }),
     ])
 
-    // Create lookup maps (lowercase names for case-insensitive matching)
     const categoriesMap = new Map(categories.map(c => [c.name.toLowerCase(), c.id]))
     const suppliersMap = new Map(suppliers.map(s => [s.name.toLowerCase(), s.id]))
     const existingBarcodes = new Set(products.filter(p => p.barcode).map(p => p.barcode))
@@ -222,9 +290,23 @@ async function validateBulkData(rows) {
 
     const validRows = []
     const invalidRows = []
+    const skippedRows = []
 
     for (let i = 0; i < rows.length; i++) {
-        const result = validateRow(rows[i], i, categoriesMap, suppliersMap, existingBarcodes, batchBarcodes)
+        const excelRow = i + 2
+        if (importOptions.skipRowSet.has(excelRow)) {
+            skippedRows.push({ rowIndex: excelRow, reason: 'Omitida por el usuario' })
+            continue
+        }
+        const result = validateRow(
+            rows[i],
+            i,
+            categoriesMap,
+            suppliersMap,
+            existingBarcodes,
+            batchBarcodes,
+            importOptions,
+        )
         if (result.valid) {
             validRows.push(result)
         } else {
@@ -232,44 +314,121 @@ async function validateBulkData(rows) {
         }
     }
 
+    const resolutionHints = mergeResolutionHints(invalidRows)
+
     return {
         validRows,
         invalidRows,
+        skippedRows,
+        resolutionHints,
         totals: {
             total: rows.length,
             valid: validRows.length,
-            invalid: invalidRows.length
+            invalid: invalidRows.length,
+            skipped: skippedRows.length,
         },
         catalogs: {
             categories: categories.map(c => c.name),
-            suppliers: suppliers.map(s => s.name)
-        }
+            suppliers: suppliers.map(s => s.name),
+        },
     }
 }
 
+async function getIdForSupplierPlaceholderCategory() {
+    const found = await prisma.productCategory.findFirst({
+        where: { deleted: false },
+        orderBy: { id: 'asc' },
+    })
+    if (found) return found.id
+    const created = await prisma.productCategory.create({ data: { name: 'General' } })
+    return created.id
+}
+
+async function ensureProductCategoryIdImport(name, cache) {
+    const trimmed = String(name || '').trim()
+    if (!trimmed) throw new Error('Categoría vacía')
+    const key = trimmed.toLowerCase()
+    if (cache.has(key)) return cache.get(key)
+    let cat = await prisma.productCategory.findFirst({
+        where: { deleted: false, name: { equals: trimmed, mode: 'insensitive' } },
+    })
+    if (!cat) {
+        cat = await prisma.productCategory.create({ data: { name: trimmed.slice(0, 100) } })
+    }
+    cache.set(key, cat.id)
+    return cat.id
+}
+
+async function ensureSupplierIdForProductImport(name, cache) {
+    const trimmed = String(name || '').trim()
+    if (!trimmed) throw new Error('Proveedor vacío')
+    const key = trimmed.toLowerCase()
+    if (cache.has(key)) return cache.get(key)
+    let sup = await prisma.supplier.findFirst({
+        where: {
+            deleted: false,
+            party_type: 'SUPPLIER',
+            name: { equals: trimmed, mode: 'insensitive' },
+        },
+    })
+    if (sup) {
+        cache.set(key, sup.id)
+        return sup.id
+    }
+    const defaultPt = await prisma.paymentTerm.findFirst({
+        where: { deleted: false },
+        orderBy: { id: 'asc' },
+    })
+    if (!defaultPt) throw new Error('No hay términos de pago en el sistema')
+    const catIdForSupplier = await getIdForSupplierPlaceholderCategory()
+    const safeName = trimmed.slice(0, 150)
+    sup = await prisma.supplier.create({
+        data: {
+            party_type: 'SUPPLIER',
+            entity_kind: 'ORGANIZATION',
+            name: safeName,
+            contact: safeName,
+            address: '—',
+            payment_term: { connect: { id: defaultPt.id } },
+            categories: { create: [{ category: { connect: { id: catIdForSupplier } } }] },
+            estado: 1,
+            products: 0,
+            total_purchases: 0,
+        },
+    })
+    cache.set(key, sup.id)
+    return sup.id
+}
+
 /**
- * Import validated products - create each one individually
- * Continues on error, skipping failed products
- * @param {Object[]} validRows - Array of validated product data objects
- * @returns {Promise<Object>} { created: number, skipped: number, errors: Object[] }
+ * @param {Object[]} validRows
  */
 async function bulkCreateProducts(validRows) {
     const errors = []
     let created = 0
     let skipped = 0
+    const categoryCache = new Map()
+    const supplierCache = new Map()
 
-    // Create products one by one, continuing on errors
     for (const row of validRows) {
         try {
-            await prisma.product.create({ data: row.data })
+            const d = { ...row.data }
+            if (d.category_create_name) {
+                d.category_id = await ensureProductCategoryIdImport(d.category_create_name, categoryCache)
+                delete d.category_create_name
+            }
+            if (d.supplier_create_name) {
+                d.supplier_id = await ensureSupplierIdForProductImport(d.supplier_create_name, supplierCache)
+                delete d.supplier_create_name
+            }
+            await prisma.product.create({ data: d })
             created++
         } catch (err) {
             skipped++
             errors.push({
                 rowIndex: row.rowIndex,
-                error: err.message
+                error: err.message,
             })
-            // Continue with next product instead of stopping
         }
     }
 
@@ -327,8 +486,16 @@ function generateTemplate() {
  */
 async function generateTemplateWithCatalogs() {
     const [categories, suppliers] = await Promise.all([
-        prisma.productCategory.findMany({ select: { name: true }, orderBy: { name: 'asc' } }),
-        prisma.supplier.findMany({ select: { name: true }, orderBy: { name: 'asc' } })
+        prisma.productCategory.findMany({
+            where: { deleted: false },
+            select: { name: true },
+            orderBy: { name: 'asc' },
+        }),
+        prisma.supplier.findMany({
+            where: { deleted: false, party_type: 'SUPPLIER' },
+            select: { name: true },
+            orderBy: { name: 'asc' },
+        }),
     ])
 
     const headers = [
