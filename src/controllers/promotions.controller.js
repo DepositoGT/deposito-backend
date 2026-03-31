@@ -697,6 +697,19 @@ exports.validateCode = async (req, res, next) => {
         // Calculate discount
         const result = applyPromotion(promotion, items)
 
+        if (!result || !result.details) {
+            return res.json({ valid: false, message: 'No se pudo calcular la promoción' })
+        }
+
+        if (!result.discount || Number(result.discount) <= 0) {
+            const reason = result.details?.reason
+            return res.json({
+                valid: false,
+                message: reason || 'La promoción no aplica para este carrito',
+                details: result.details
+            })
+        }
+
         res.json({
             valid: true,
             promotion: {
