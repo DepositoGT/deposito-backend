@@ -270,6 +270,22 @@ exports.create = async (req, res, next) => {
             }
         }
 
+        const supportsRestrictedScope = ['PERCENTAGE', 'BUY_X_GET_Y', 'MIN_QTY_DISCOUNT'].includes(typeName)
+        const appliesAll = applies_to_all !== undefined && applies_to_all !== null
+            ? Boolean(applies_to_all)
+            : false
+        if (supportsRestrictedScope && !appliesAll) {
+            const p = Array.isArray(product_ids) ? product_ids.filter(Boolean) : []
+            const c = Array.isArray(category_ids)
+                ? category_ids.map((x) => Number(x)).filter((x) => Number.isFinite(x))
+                : []
+            if (p.length === 0 && c.length === 0) {
+                return res.status(400).json({
+                    message: 'Si la promoción no aplica a todo el carrito, indique al menos un producto o una categoría.',
+                })
+            }
+        }
+
         // Validate custom codes don't already exist
         if (codes.length > 0) {
             const upperCodes = codes.map(c => c.toUpperCase())
@@ -472,28 +488,132 @@ exports.generateCodes = async (req, res, next) => {
 exports.update = async (req, res, next) => {
     try {
         const { id } = req.params
-        const { codes, code_count, code_prefix, ...updateData } = req.body
+        const body = req.body || {}
+        const {
+            codes: _c,
+            code_count: _cc,
+            code_prefix: _cp,
+            product_ids: productIdsBody,
+            category_ids: categoryIdsBody,
+            id: _bodyId,
+            ...raw
+        } = body
 
-        const existing = await prisma.promotion.findUnique({ where: { id } })
+        const existing = await prisma.promotion.findUnique({
+            where: { id },
+            include: { type: true },
+        })
         if (!existing || existing.deleted) {
             return res.status(404).json({ message: 'Promoción no encontrada' })
         }
 
-        const updated = await prisma.promotion.update({
+        const typeName = existing.type.name
+        const supportsRestrictedScope = ['PERCENTAGE', 'BUY_X_GET_Y', 'MIN_QTY_DISCOUNT'].includes(typeName)
+
+        const data = {}
+        if (raw.name !== undefined) data.name = raw.name
+        if (raw.description !== undefined) data.description = raw.description
+        if (raw.type_id !== undefined) data.type_id = Number(raw.type_id)
+        if (raw.discount_value !== undefined) {
+            data.discount_value = raw.discount_value === null || raw.discount_value === ''
+                ? null
+                : Number(raw.discount_value)
+        }
+        if (raw.discount_percentage !== undefined) {
+            data.discount_percentage = raw.discount_percentage === null || raw.discount_percentage === ''
+                ? null
+                : Number(raw.discount_percentage)
+        }
+        if (raw.buy_quantity !== undefined) {
+            data.buy_quantity = raw.buy_quantity == null || raw.buy_quantity === '' ? null : Number(raw.buy_quantity)
+        }
+        if (raw.get_quantity !== undefined) {
+            data.get_quantity = raw.get_quantity == null || raw.get_quantity === '' ? null : Number(raw.get_quantity)
+        }
+        if (raw.min_quantity !== undefined) {
+            data.min_quantity = raw.min_quantity == null || raw.min_quantity === '' ? null : Number(raw.min_quantity)
+        }
+        if (raw.applies_to_all !== undefined) data.applies_to_all = Boolean(raw.applies_to_all)
+        if (raw.trigger_product_id !== undefined) data.trigger_product_id = raw.trigger_product_id || null
+        if (raw.target_product_id !== undefined) data.target_product_id = raw.target_product_id || null
+        if (raw.start_date !== undefined) {
+            data.start_date = raw.start_date ? new Date(raw.start_date) : undefined
+        }
+        if (raw.end_date !== undefined) {
+            data.end_date = raw.end_date ? new Date(raw.end_date) : null
+        }
+        if (raw.max_uses !== undefined) {
+            data.max_uses = raw.max_uses == null || raw.max_uses === '' ? null : Number(raw.max_uses)
+        }
+        if (raw.max_uses_per_customer !== undefined) {
+            data.max_uses_per_customer = raw.max_uses_per_customer == null || raw.max_uses_per_customer === ''
+                ? null
+                : Number(raw.max_uses_per_customer)
+        }
+        if (raw.min_purchase_amount !== undefined) {
+            data.min_purchase_amount = raw.min_purchase_amount == null || raw.min_purchase_amount === ''
+                ? null
+                : Number(raw.min_purchase_amount)
+        }
+        if (raw.active !== undefined) data.active = Boolean(raw.active)
+
+        const nextAppliesAll = data.applies_to_all !== undefined ? data.applies_to_all : existing.applies_to_all
+
+        const productIds = Array.isArray(productIdsBody) ? [...new Set(productIdsBody.filter(Boolean))] : null
+        const categoryIds = Array.isArray(categoryIdsBody)
+            ? [...new Set(categoryIdsBody.map((x) => Number(x)).filter((x) => Number.isFinite(x)))]
+            : null
+
+        if (
+            supportsRestrictedScope &&
+            !nextAppliesAll &&
+            productIds !== null &&
+            categoryIds !== null &&
+            productIds.length === 0 &&
+            categoryIds.length === 0
+        ) {
+            return res.status(400).json({
+                message: 'Si la promoción no aplica a todo el carrito, indique al menos un producto o una categoría.',
+            })
+        }
+
+        await prisma.$transaction(async (tx) => {
+            if (Object.keys(data).length > 0) {
+                await tx.promotion.update({ where: { id }, data })
+            }
+
+            if (supportsRestrictedScope && nextAppliesAll) {
+                await tx.promotionProduct.deleteMany({ where: { promotion_id: id } })
+                await tx.promotionCategory.deleteMany({ where: { promotion_id: id } })
+            } else if (supportsRestrictedScope && !nextAppliesAll) {
+                if (productIds !== null) {
+                    await tx.promotionProduct.deleteMany({ where: { promotion_id: id } })
+                    if (productIds.length > 0) {
+                        await tx.promotionProduct.createMany({
+                            data: productIds.map((pid) => ({ promotion_id: id, product_id: pid })),
+                            skipDuplicates: true,
+                        })
+                    }
+                }
+                if (categoryIds !== null) {
+                    await tx.promotionCategory.deleteMany({ where: { promotion_id: id } })
+                    if (categoryIds.length > 0) {
+                        await tx.promotionCategory.createMany({
+                            data: categoryIds.map((cid) => ({ promotion_id: id, category_id: cid })),
+                        })
+                    }
+                }
+            }
+        })
+
+        const updated = await prisma.promotion.findUnique({
             where: { id },
-            data: {
-                ...updateData,
-                discount_value: updateData.discount_value !== undefined ? Number(updateData.discount_value) : undefined,
-                discount_percentage: updateData.discount_percentage !== undefined ? Number(updateData.discount_percentage) : undefined,
-                start_date: updateData.start_date ? new Date(updateData.start_date) : undefined,
-                end_date: updateData.end_date ? new Date(updateData.end_date) : undefined
-            },
             include: {
                 type: true,
                 codes: { orderBy: { created_at: 'desc' } },
                 applicable_products: { include: { product: { select: { id: true, name: true } } } },
-                applicable_categories: { include: { category: { select: { id: true, name: true } } } }
-            }
+                applicable_categories: { include: { category: { select: { id: true, name: true } } } },
+            },
         })
 
         res.json(updated)
@@ -576,6 +696,35 @@ exports.validateCode = async (req, res, next) => {
 
         // Calculate discount
         const result = applyPromotion(promotion, items)
+
+        if (!result || !result.details) {
+            return res.json({ valid: false, message: 'No se pudo calcular la promoción' })
+        }
+
+        if (!result.discount || Number(result.discount) <= 0) {
+            if (result.freeGift && result.freeGift.mustAddToCart) {
+                return res.json({
+                    valid: true,
+                    promotion: {
+                        id: promotion.id,
+                        code: promotionCode.code,
+                        code_id: promotionCode.id,
+                        name: promotion.name,
+                        description: promotion.description,
+                        type: promotion.type
+                    },
+                    discount: 0,
+                    details: result.details,
+                    freeGift: result.freeGift
+                })
+            }
+            const reason = result.details?.reason
+            return res.json({
+                valid: false,
+                message: reason || 'La promoción no aplica para este carrito',
+                details: result.details
+            })
+        }
 
         res.json({
             valid: true,
