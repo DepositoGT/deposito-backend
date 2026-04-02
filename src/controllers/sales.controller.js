@@ -276,7 +276,6 @@ exports.getById = async (req, res, next) => {
 
 exports.create = async (req, res, next) => {
   try {
-    console.log(req.body)
     const user = req.user
     if (!user || !user.sub) {
       return res.status(401).json({ message: 'Usuario no autenticado' })
@@ -338,59 +337,132 @@ exports.create = async (req, res, next) => {
 
       // 2) Procesar códigos de promoción
       let discountTotal = 0
-      const appliedPromotions = []
+      /** Fila por promo aplicada con descuento > 0 (para sale_promotions + incremento de usos) */
+      let promotionRowsToRecord = []
 
-      if (Array.isArray(promotion_codes) && promotion_codes.length > 0) {
+      const requestedCodes = [
+        ...new Set(
+          (promotion_codes || [])
+            .map((c) => String(c || '').toUpperCase().trim())
+            .filter(Boolean)
+        ),
+      ]
+
+      if (requestedCodes.length > 0) {
+        const rawMax = process.env.MAX_PROMOTION_CODES_PER_SALE
+        let maxPromoCodes = Infinity
+        if (rawMax !== undefined && rawMax !== '') {
+          const n = parseInt(String(rawMax), 10)
+          if (Number.isFinite(n) && n >= 1) maxPromoCodes = n
+        }
+        if (requestedCodes.length > maxPromoCodes) {
+          const err = new Error(
+            maxPromoCodes === 1
+              ? 'Solo se permite un código de promoción por venta'
+              : `Máximo ${maxPromoCodes} códigos de promoción por venta`
+          )
+          err.status = 400
+          throw err
+        }
+
         const { applyMultiplePromotions } = require('../services/promotionCalculator')
         const now = new Date()
 
-        // Preparar items con category_id para el cálculo
-        const itemsWithCategory = items.map(it => ({
+        const itemsWithCategory = items.map((it) => ({
           ...it,
-          category_id: prodMap.get(it.product_id)?.category_id
+          category_id: prodMap.get(String(it.product_id))?.category_id,
         }))
 
-        // Buscar promociones por código a través de la tabla PromotionCode
-        const promotionCodes = await tx.promotionCode.findMany({
+        const promotionCodeRows = await tx.promotionCode.findMany({
           where: {
-            code: { in: promotion_codes.map(c => c.toUpperCase()) },
+            code: { in: requestedCodes },
             active: true,
             promotion: {
               active: true,
-              deleted: false
-            }
+              deleted: false,
+            },
           },
           include: {
             promotion: {
               include: {
                 type: true,
                 applicable_products: true,
-                applicable_categories: true
-              }
-            }
-          }
+                applicable_categories: true,
+              },
+            },
+          },
         })
 
-        // Validar y aplicar cada promoción
-        for (const promoCode of promotionCodes) {
-          const promo = promoCode.promotion
-          // Agregar el código utilizado a la promoción para tracking
-          promo.usedCode = promoCode.code
-          promo.usedCodeId = promoCode.id
+        const byCode = new Map(
+          promotionCodeRows.map((row) => [String(row.code).toUpperCase(), row])
+        )
 
-          // Validar fechas
-          if (promo.start_date && now < promo.start_date) continue
-          if (promo.end_date && now > promo.end_date) continue
-          // Validar usos máximos (por código individual)
-          if (promo.max_uses && promoCode.current_uses >= promo.max_uses) continue
-
-          appliedPromotions.push(promo)
+        for (const code of requestedCodes) {
+          if (!byCode.has(code)) {
+            const err = new Error(`Código de promoción no válido o inactivo: ${code}`)
+            err.status = 400
+            throw err
+          }
         }
 
-        if (appliedPromotions.length > 0) {
-          const result = applyMultiplePromotions(appliedPromotions, itemsWithCategory)
-          discountTotal = result.totalDiscount
-          console.log(`[PROMOTIONS] Applied ${appliedPromotions.length} promotions, discount: Q${discountTotal}`)
+        const candidatePromotions = []
+        const seenPromotionIds = new Set()
+        for (const code of requestedCodes) {
+          const promoCodeRow = byCode.get(code)
+          const promo = promoCodeRow.promotion
+          promo.usedCode = promoCodeRow.code
+          promo.usedCodeId = promoCodeRow.id
+
+          if (seenPromotionIds.has(promo.id)) {
+            const err = new Error(
+              'No se pueden aplicar dos códigos de la misma promoción en una sola venta'
+            )
+            err.status = 400
+            throw err
+          }
+          seenPromotionIds.add(promo.id)
+
+          if (promo.start_date && now < promo.start_date) {
+            const err = new Error(`El código ${code} aún no está vigente`)
+            err.status = 400
+            throw err
+          }
+          if (promo.end_date && now > promo.end_date) {
+            const err = new Error(`El código ${code} ha expirado`)
+            err.status = 400
+            throw err
+          }
+          if (promo.max_uses && promoCodeRow.current_uses >= promo.max_uses) {
+            const err = new Error(`El código ${code} alcanzó su límite de usos`)
+            err.status = 400
+            throw err
+          }
+
+          candidatePromotions.push(promo)
+        }
+
+        const multiResult = applyMultiplePromotions(candidatePromotions, itemsWithCategory)
+
+        const needsGiftInCart = (multiResult.freeGifts || []).some(
+          (fg) => fg && fg.mustAddToCart === true
+        )
+        if (needsGiftInCart) {
+          const err = new Error(
+            'Un código de promoción requiere el producto regalo en el carrito. Agréguelo y vuelva a intentar.'
+          )
+          err.status = 400
+          throw err
+        }
+
+        discountTotal = multiResult.totalDiscount
+        promotionRowsToRecord = multiResult.appliedPromotions || []
+
+        if (discountTotal <= 0) {
+          const err = new Error(
+            'Los códigos de promoción no aplican descuento con los productos actuales del carrito'
+          )
+          err.status = 400
+          throw err
         }
       }
 
@@ -503,36 +575,25 @@ exports.create = async (req, res, next) => {
       }
       await ensureStockAlertsBatch(tx, updatedProducts)
 
-      // 3) Guardar promociones usadas e incrementar contador
-      if (appliedPromotions.length > 0) {
-        const { applyPromotion } = require('../services/promotionCalculator')
-        const itemsWithCategory = items.map(it => ({
-          ...it,
-          category_id: prodMap.get(it.product_id)?.category_id
-        }))
-
-        for (const promo of appliedPromotions) {
-          const result = applyPromotion(promo, itemsWithCategory)
-
-          // Crear registro de uso
+      // 3) Guardar promociones con descuento efectivo e incrementar solo esos códigos
+      if (promotionRowsToRecord.length > 0) {
+        for (const row of promotionRowsToRecord) {
           await tx.salePromotion.create({
             data: {
               sale_id: sale.id,
-              promotion_id: promo.id,
-              discount_applied: result.discount
-              // Note: code_used field available after server restart
-            }
+              promotion_id: row.promotionId,
+              discount_applied: row.discount,
+              code_used: row.usedCode || null,
+            },
           })
 
-          // Incrementar contador de usos en el código específico
-          if (promo.usedCodeId) {
+          if (row.usedCodeId) {
             await tx.promotionCode.update({
-              where: { id: promo.usedCodeId },
-              data: { current_uses: { increment: 1 } }
+              where: { id: row.usedCodeId },
+              data: { current_uses: { increment: 1 } },
             })
           }
         }
-        console.log(`[PROMOTIONS] Saved ${appliedPromotions.length} promotion records for sale ${sale.id}`)
       }
 
       return sale

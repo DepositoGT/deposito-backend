@@ -702,6 +702,22 @@ exports.validateCode = async (req, res, next) => {
         }
 
         if (!result.discount || Number(result.discount) <= 0) {
+            if (result.freeGift && result.freeGift.mustAddToCart) {
+                return res.json({
+                    valid: true,
+                    promotion: {
+                        id: promotion.id,
+                        code: promotionCode.code,
+                        code_id: promotionCode.id,
+                        name: promotion.name,
+                        description: promotion.description,
+                        type: promotion.type
+                    },
+                    discount: 0,
+                    details: result.details,
+                    freeGift: result.freeGift
+                })
+            }
             const reason = result.details?.reason
             return res.json({
                 valid: false,
