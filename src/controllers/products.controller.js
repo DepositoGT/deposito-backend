@@ -972,14 +972,13 @@ exports.bulkImport = async (req, res, next) => {
  */
 exports.bulkImportMapped = async (req, res, next) => {
   try {
-    const { products } = req.body || {}
+    const { products, importOptions } = req.body || {}
 
     if (!products || !Array.isArray(products) || products.length === 0) {
       return res.status(400).json({ message: 'No se proporcionaron productos para importar' })
     }
 
-    // Validate by calling the existing validation service
-    const validation = await validateBulkData(products)
+    const validation = await validateBulkData(products, importOptions)
 
     if (validation.invalidRows.length > 0) {
       return res.status(400).json({
@@ -1031,24 +1030,26 @@ exports.bulkImportMapped = async (req, res, next) => {
  */
 exports.validateImportMapped = async (req, res, next) => {
   try {
-    const { products } = req.body || {}
+    const { products, importOptions } = req.body || {}
 
     if (!products || !Array.isArray(products) || products.length === 0) {
       return res.status(400).json({ message: 'No se proporcionaron productos para validar' })
     }
 
-    // Validate without importing
-    const validation = await validateBulkData(products)
+    const validation = await validateBulkData(products, importOptions)
 
     res.json({
-      ok: true,
-      totals: {
-        total: products.length,
-        valid: validation.validRows.length,
-        invalid: validation.invalidRows.length
-      },
+      ok: validation.invalidRows.length === 0,
+      totals: validation.totals,
       validRows: validation.validRows,
-      invalidRows: validation.invalidRows
+      invalidRows: validation.invalidRows.map((r) => ({
+        rowIndex: r.rowIndex,
+        errors: r.errors,
+        hints: r.hints,
+      })),
+      resolutionHints: validation.resolutionHints,
+      skippedRows: validation.skippedRows,
+      catalogs: validation.catalogs,
     })
   } catch (e) {
     next(e)

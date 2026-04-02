@@ -22,6 +22,44 @@ const PROMOTION_TYPES = {
     MIN_QTY_DISCOUNT: 'MIN_QTY_DISCOUNT'
 }
 
+/** Línea del carrito coincide con alcance por producto/categoría (promo no “aplica a todos”) */
+function itemMatchesRestrictedScope(promotion, item) {
+    const applicableProductIds = new Set(
+        (promotion.applicable_products || []).map(pp => pp.product_id)
+    )
+    const applicableCategoryIds = new Set(
+        (promotion.applicable_categories || []).map(pc => Number(pc.category_id))
+    )
+    const cid = item.category_id != null && item.category_id !== ''
+        ? Number(item.category_id)
+        : null
+    return (
+        applicableProductIds.has(item.product_id) ||
+        (cid != null && !Number.isNaN(cid) && applicableCategoryIds.has(cid))
+    )
+}
+
+/**
+ * Subtotal sobre el que exige min_purchase cuando el tipo tiene alcance restringido.
+ * null → usar total del carrito.
+ */
+function eligibleSubtotalForMinPurchase(promotion, cartItems, typeName) {
+    const scopedTypes = [
+        PROMOTION_TYPES.PERCENTAGE,
+        PROMOTION_TYPES.BUY_X_GET_Y,
+        PROMOTION_TYPES.MIN_QTY_DISCOUNT
+    ]
+    if (!scopedTypes.includes(typeName)) return null
+    if (promotion.applies_to_all) return null
+    let sum = 0
+    for (const item of cartItems || []) {
+        if (itemMatchesRestrictedScope(promotion, item)) {
+            sum += Number(item.price) * Number(item.qty || 0)
+        }
+    }
+    return Math.round(sum * 100) / 100
+}
+
 /**
  * Calculate percentage discount
  * @param {Object} promotion - The promotion object
@@ -38,19 +76,8 @@ function calculatePercentageDiscount(promotion, cartItems) {
         applicableTotal = cartItems.reduce((sum, item) => sum + (Number(item.price) * item.qty), 0)
         itemsAffected.push(...cartItems.map(item => item.product_id))
     } else {
-        // Apply to specific products/categories
-        const applicableProductIds = new Set(
-            (promotion.applicable_products || []).map(pp => pp.product_id)
-        )
-        const applicableCategoryIds = new Set(
-            (promotion.applicable_categories || []).map(pc => pc.category_id)
-        )
-
         for (const item of cartItems) {
-            const isProductApplicable = applicableProductIds.has(item.product_id)
-            const isCategoryApplicable = item.category_id && applicableCategoryIds.has(item.category_id)
-
-            if (isProductApplicable || isCategoryApplicable) {
+            if (itemMatchesRestrictedScope(promotion, item)) {
                 applicableTotal += Number(item.price) * item.qty
                 itemsAffected.push(item.product_id)
             }
@@ -77,19 +104,6 @@ function calculateFixedDiscount(promotion, cartItems) {
     const cartTotal = cartItems.reduce((sum, item) => sum + (Number(item.price) * item.qty), 0)
     const discountValue = Number(promotion.discount_value)
 
-    // Check minimum purchase amount
-    if (promotion.min_purchase_amount && cartTotal < Number(promotion.min_purchase_amount)) {
-        return {
-            discount: 0,
-            details: {
-                type: PROMOTION_TYPES.FIXED_AMOUNT,
-                reason: 'Compra mínima no alcanzada',
-                required: Number(promotion.min_purchase_amount),
-                current: cartTotal
-            }
-        }
-    }
-
     // Don't discount more than the cart total
     const discount = Math.min(discountValue, cartTotal)
 
@@ -111,13 +125,8 @@ function calculateBuyXGetY(promotion, cartItems) {
     let totalDiscount = 0
     const itemsAffected = []
 
-    // Determine applicable products
-    const applicableProductIds = new Set(
-        (promotion.applicable_products || []).map(pp => pp.product_id)
-    )
-
     for (const item of cartItems) {
-        const isApplicable = promotion.applies_to_all || applicableProductIds.has(item.product_id)
+        const isApplicable = promotion.applies_to_all || itemMatchesRestrictedScope(promotion, item)
 
         if (isApplicable && item.qty >= buyQty) {
             // Calculate how many "sets" of buyQty the customer is getting
@@ -266,12 +275,8 @@ function calculateMinQtyDiscount(promotion, cartItems) {
     let totalDiscount = 0
     const itemsAffected = []
 
-    const applicableProductIds = new Set(
-        (promotion.applicable_products || []).map(pp => pp.product_id)
-    )
-
     for (const item of cartItems) {
-        const isApplicable = promotion.applies_to_all || applicableProductIds.has(item.product_id)
+        const isApplicable = promotion.applies_to_all || itemMatchesRestrictedScope(promotion, item)
 
         if (isApplicable && item.qty >= minQty) {
             const itemTotal = Number(item.price) * item.qty
@@ -304,6 +309,31 @@ function calculateMinQtyDiscount(promotion, cartItems) {
  */
 function applyPromotion(promotion, cartItems) {
     const typeName = promotion.type?.name || ''
+    const cartTotal = (cartItems || []).reduce(
+        (sum, item) => sum + (Number(item.price) * Number(item.qty || 0)),
+        0
+    )
+
+    // Compra mínima: en %, 2×1 y cantidad mínima con alcance restringido → subtotal elegible; si no, total carrito
+    if (promotion.min_purchase_amount != null && promotion.min_purchase_amount !== '') {
+        const required = Number(promotion.min_purchase_amount)
+        if (!isNaN(required) && required > 0) {
+            const eligible = eligibleSubtotalForMinPurchase(promotion, cartItems, typeName)
+            const basis = eligible !== null ? eligible : cartTotal
+            if (basis < required) {
+                return {
+                    discount: 0,
+                    details: {
+                        type: typeName || 'UNKNOWN',
+                        reason: 'Compra mínima no alcanzada',
+                        required,
+                        current: Math.round(basis * 100) / 100,
+                        basisType: eligible !== null ? 'eligible_subtotal' : 'cart_total'
+                    }
+                }
+            }
+        }
+    }
 
     switch (typeName) {
         case PROMOTION_TYPES.PERCENTAGE:
@@ -346,8 +376,9 @@ function applyMultiplePromotions(promotions, cartItems) {
         if (result.discount > 0) {
             totalDiscount += result.discount
             appliedPromotions.push({
-                id: promotion.id,
-                code: promotion.code,
+                promotionId: promotion.id,
+                usedCodeId: promotion.usedCodeId ?? null,
+                usedCode: promotion.usedCode ?? null,
                 name: promotion.name,
                 discount: result.discount,
                 details: result.details

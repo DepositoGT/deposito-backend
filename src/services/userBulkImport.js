@@ -15,18 +15,48 @@
 const bcrypt = require('bcryptjs')
 const { prisma } = require('../models/prisma')
 
+function normalizeImportOptions(raw) {
+    const o = raw && typeof raw === 'object' ? raw : {}
+    const createRoles = Array.isArray(o.createRoles)
+        ? o.createRoles.map(s => String(s).trim()).filter(Boolean)
+        : []
+    const skipRowIndexes = Array.isArray(o.skipRowIndexes)
+        ? o.skipRowIndexes.map(n => Number(n)).filter(n => Number.isFinite(n) && n >= 2)
+        : []
+    return {
+        createRoleSet: new Set(createRoles.map(s => s.toLowerCase())),
+        skipRowSet: new Set(skipRowIndexes),
+        createRoles,
+        skipRowIndexes,
+    }
+}
+
+function mergeResolutionHints(invalidRows) {
+    const roleMap = new Map()
+    for (const ir of invalidRows) {
+        const unknown = ir.hints?.unknownRoles || []
+        for (const r of unknown) {
+            const display = String(r).trim()
+            if (!display) continue
+            const k = display.toLowerCase()
+            if (!roleMap.has(k)) roleMap.set(k, { value: display, rowIndexes: new Set() })
+            roleMap.get(k).rowIndexes.add(ir.rowIndex)
+        }
+    }
+    return [...roleMap.values()].map(({ value, rowIndexes }) => ({
+        kind: 'role',
+        value,
+        rowIndexes: [...rowIndexes].sort((a, b) => a - b),
+    }))
+}
+
 /**
- * Validate a single user row
- * @param {Object} row - User row data
- * @param {number} rowIndex - Row index for error reporting
- * @param {Map} rolesMap - Map of role names to IDs
- * @param {Set} existingEmails - Set of existing emails in DB
- * @param {Set} batchEmails - Set of emails seen in current batch
- * @returns {Object} { valid: boolean, errors: string[], data: Object }
+ * @param {number} excelRow - Número de fila en Excel (fila 1 = encabezado; primera fila de datos = 2)
  */
-function validateUserRow(row, rowIndex, rolesMap, existingEmails, batchEmails) {
+function validateUserRow(row, excelRow, rolesMap, existingEmails, batchEmails, importOptions) {
     const errors = []
     const data = {}
+    const hints = { unknownRoles: [] }
 
     // Field aliases - support both Spanish headers and English system names
     const fieldAliases = {
@@ -98,16 +128,21 @@ function validateUserRow(row, rowIndex, rolesMap, existingEmails, batchEmails) {
         data.password = password // Will be hashed later
     }
 
-    // Required: role (must exist in DB)
+    // Required: rol existente, aprobado para crear, u omitir fila
     const roleName = String(normalizedRow.role || '').trim()
     if (!roleName) {
         errors.push('El campo "rol" es requerido')
     } else {
         const roleId = rolesMap.get(roleName.toLowerCase())
-        if (!roleId) {
-            errors.push(`Rol "${roleName}" no existe en el sistema`)
-        } else {
+        if (roleId) {
             data.role_id = roleId
+        } else if (importOptions.createRoleSet.has(roleName.toLowerCase())) {
+            data.role_create_name = roleName
+        } else {
+            errors.push(
+                `Rol "${roleName}" no existe. Cree este rol en catálogo u omita las filas donde aparece.`,
+            )
+            hints.unknownRoles.push(roleName)
         }
     }
 
@@ -173,59 +208,67 @@ function validateUserRow(row, rowIndex, rolesMap, existingEmails, batchEmails) {
     return {
         valid: errors.length === 0,
         errors,
-        data: errors.length === 0 ? data : null
+        data: errors.length === 0 ? data : null,
+        hints,
+        rowIndex: excelRow,
     }
 }
 
 /**
- * Validate multiple users
- * @param {Array} rows - Array of user rows
- * @returns {Object} Validation result with validRows and invalidRows
+ * @param {Array} rows - Filas ya mapeadas (sin encabezado Excel; fila índice 0 → Excel fila 2)
+ * @param {object} [importOptionsRaw]
  */
-async function bulkValidateUsers(rows) {
+async function bulkValidateUsers(rows, importOptionsRaw) {
     if (!rows || !Array.isArray(rows) || rows.length === 0) {
         return {
             validRows: [],
             invalidRows: [],
-            totals: { total: 0, valid: 0, invalid: 0 }
+            skippedRows: [],
+            resolutionHints: [],
+            totals: { total: 0, valid: 0, invalid: 0, skipped: 0 },
         }
     }
 
-    // Fetch roles from database
+    const importOptions = normalizeImportOptions(importOptionsRaw)
+
     const roles = await prisma.role.findMany({
-        select: { id: true, name: true }
+        select: { id: true, name: true },
     })
     const rolesMap = new Map()
     roles.forEach(role => {
         rolesMap.set(role.name.toLowerCase(), role.id)
     })
 
-    // Fetch existing emails from database
     const existingUsers = await prisma.user.findMany({
-        select: { email: true }
+        select: { email: true },
     })
     const existingEmails = new Set(existingUsers.map(u => u.email.toLowerCase()))
 
-    // Track emails in current batch to detect duplicates
     const batchEmails = new Set()
 
     const validRows = []
     const invalidRows = []
+    const skippedRows = []
 
     rows.forEach((row, index) => {
-        const rowIndex = index + 1 // 1-based for user display
-        const validation = validateUserRow(row, rowIndex, rolesMap, existingEmails, batchEmails)
+        const excelRow = index + 2
+        if (importOptions.skipRowSet.has(excelRow)) {
+            skippedRows.push({ rowIndex: excelRow, reason: 'Omitida por el usuario' })
+            return
+        }
+        const validation = validateUserRow(row, excelRow, rolesMap, existingEmails, batchEmails, importOptions)
 
         if (validation.valid && validation.data) {
             validRows.push({
-                rowIndex,
-                data: validation.data
+                rowIndex: validation.rowIndex,
+                data: validation.data,
             })
         } else {
             invalidRows.push({
-                rowIndex,
+                rowIndex: validation.rowIndex,
                 errors: validation.errors,
-                data: row
+                hints: validation.hints,
+                data: row,
             })
         }
     })
@@ -233,12 +276,31 @@ async function bulkValidateUsers(rows) {
     return {
         validRows,
         invalidRows,
+        skippedRows,
+        resolutionHints: mergeResolutionHints(invalidRows),
         totals: {
             total: rows.length,
             valid: validRows.length,
-            invalid: invalidRows.length
-        }
+            invalid: invalidRows.length,
+            skipped: skippedRows.length,
+        },
     }
+}
+
+async function ensureRoleIdImport(name, cache) {
+    const trimmed = String(name || '').trim()
+    if (!trimmed) throw new Error('Rol vacío')
+    const key = trimmed.toLowerCase()
+    if (cache.has(key)) return cache.get(key)
+    let role = await prisma.role.findFirst({
+        where: { name: { equals: trimmed, mode: 'insensitive' } },
+    })
+    if (!role) {
+        const safeName = trimmed.slice(0, 50)
+        role = await prisma.role.create({ data: { name: safeName } })
+    }
+    cache.set(key, role.id)
+    return role.id
 }
 
 /**
@@ -254,15 +316,20 @@ async function bulkCreateUsers(validRows) {
     let created = 0
     let skipped = 0
     const errors = []
+    const roleCache = new Map()
 
     for (const row of validRows) {
         try {
-            // Hash password
-            const hashedPassword = await bcrypt.hash(row.data.password, 10)
+            const d = { ...row.data }
+            if (d.role_create_name) {
+                d.role_id = await ensureRoleIdImport(d.role_create_name, roleCache)
+                delete d.role_create_name
+            }
 
-            // Check if email already exists (race condition check)
+            const hashedPassword = await bcrypt.hash(d.password, 10)
+
             const existing = await prisma.user.findUnique({
-                where: { email: row.data.email }
+                where: { email: d.email },
             })
 
             if (existing) {
@@ -270,18 +337,17 @@ async function bulkCreateUsers(validRows) {
                 continue
             }
 
-            // Create user
             await prisma.user.create({
                 data: {
-                    name: row.data.name,
-                    email: row.data.email,
+                    name: d.name,
+                    email: d.email,
                     password: hashedPassword,
-                    role_id: row.data.role_id,
-                    is_employee: row.data.is_employee || false,
-                    ...(row.data.phone && { phone: row.data.phone }),
-                    ...(row.data.address && { address: row.data.address }),
-                    ...(row.data.hire_date && { hire_date: row.data.hire_date })
-                }
+                    role_id: d.role_id,
+                    is_employee: d.is_employee || false,
+                    ...(d.phone && { phone: d.phone }),
+                    ...(d.address && { address: d.address }),
+                    ...(d.hire_date && { hire_date: d.hire_date }),
+                },
             })
             created++
         } catch (e) {
