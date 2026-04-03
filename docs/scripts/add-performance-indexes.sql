@@ -1,19 +1,34 @@
 -- =============================================================================
 -- ÍNDICES PARA RENDIMIENTO - Depósito (Ventas, InFile, listados pesados)
 -- =============================================================================
+-- Actualización 2026-04: contactos (histórico ventas por nombre/NIT), mercancía
+-- por proveedor + fecha, inventariado por estado/fecha, purchase_logs compuesto.
+-- Nota: en PostgreSQL un btree en (date) sirve para ORDER BY ASC y DESC; se evitan
+-- duplicados date + date DESC. La migración Prisma 20260401140000_* aplica lo mismo
+-- que este script salvo ajustes de nombres (IF NOT EXISTS vs migraciones).
+-- =============================================================================
+
+-- Limpieza si aplicaste una versión antigua de este script (mismas columnas, nombre viejo)
+DROP INDEX IF EXISTS idx_sales_date_desc;
+DROP INDEX IF EXISTS idx_incoming_merchandise_date_desc;
 
 -- -----------------------------------------------------------------------------
 -- VENTAS (crítico: listado 5-10 seg → debe bajar mucho con estos índices)
 -- -----------------------------------------------------------------------------
 
--- Filtro por rango de fecha + orden por date DESC (listado de ventas)
-CREATE INDEX IF NOT EXISTS idx_sales_date_desc ON sales (date DESC);
+-- Filtro por estado (status_id) + fecha para listado y resumen de cliente (Completada + última fecha)
+CREATE INDEX IF NOT EXISTS idx_sales_status_id_date_desc ON sales (status_id, date DESC);
 
--- Filtro por estado (status_id) + fecha para listado
+-- Filtro por estado (status_id) — útil si solo se filtra por estado sin orden explícito por fecha
 CREATE INDEX IF NOT EXISTS idx_sales_status_id ON sales (status_id);
 
--- Compuesto: listado por período y estado, ordenado por fecha
+-- Compuesto: listado por período y estado, ordenado por fecha (date es prefijo útil con rango de fechas)
 CREATE INDEX IF NOT EXISTS idx_sales_date_status ON sales (date DESC, status_id);
+
+-- Histórico de compras en ficha de cliente: GET /sales?customer_contact_id=…
+-- Prisma compara con igualdad case-insensitive vía LOWER("customer") = LOWER($n)
+CREATE INDEX IF NOT EXISTS idx_sales_customer_lower ON sales (LOWER(customer)) WHERE customer IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_sales_customer_nit_lower ON sales (LOWER(customer_nit)) WHERE customer_nit IS NOT NULL;
 
 -- JOIN con createdBy (getById, list)
 CREATE INDEX IF NOT EXISTS idx_sales_created_by ON sales (created_by);
@@ -137,13 +152,14 @@ CREATE INDEX IF NOT EXISTS idx_cash_closure_denominations_cash_closure_id ON cas
 
 
 -- -----------------------------------------------------------------------------
--- INCOMING_MERCHANDISE (listados por supplier y fecha)
+-- INCOMING_MERCHANDISE (listados por supplier y fecha; ficha proveedor)
 -- -----------------------------------------------------------------------------
 
-CREATE INDEX IF NOT EXISTS idx_incoming_merchandise_supplier_id ON incoming_merchandise (supplier_id);
+DROP INDEX IF EXISTS incoming_merchandise_supplier_id_idx;
+DROP INDEX IF EXISTS idx_incoming_merchandise_supplier_id;
 CREATE INDEX IF NOT EXISTS idx_incoming_merchandise_registered_by ON incoming_merchandise (registered_by);
 CREATE INDEX IF NOT EXISTS idx_incoming_merchandise_date ON incoming_merchandise (date);
-CREATE INDEX IF NOT EXISTS idx_incoming_merchandise_date_desc ON incoming_merchandise (date DESC);
+CREATE INDEX IF NOT EXISTS idx_incoming_merchandise_supplier_date ON incoming_merchandise (supplier_id, date DESC);
 
 
 -- -----------------------------------------------------------------------------
@@ -155,21 +171,36 @@ CREATE INDEX IF NOT EXISTS idx_incoming_merchandise_items_product_id ON incoming
 
 
 -- -----------------------------------------------------------------------------
--- PURCHASE_LOGS (reportes / historial)
+-- PURCHASE_LOGS (reportes / historial por proveedor ordenado por fecha)
 -- -----------------------------------------------------------------------------
 
+-- Sustituye índice solo supplier_id: el compuesto cubre filtro por proveedor y orden/tiempos
+DROP INDEX IF EXISTS purchase_logs_supplier_id_idx;
+DROP INDEX IF EXISTS idx_purchase_logs_supplier_id;
+CREATE INDEX IF NOT EXISTS idx_purchase_logs_supplier_date ON purchase_logs (supplier_id, date DESC);
+
 CREATE INDEX IF NOT EXISTS idx_purchase_logs_product_id ON purchase_logs (product_id);
-CREATE INDEX IF NOT EXISTS idx_purchase_logs_supplier_id ON purchase_logs (supplier_id);
 CREATE INDEX IF NOT EXISTS idx_purchase_logs_date ON purchase_logs (date);
 
 
 -- -----------------------------------------------------------------------------
--- SUPPLIERS (listados, filtro deleted)
+-- SUPPLIERS (listados, filtro deleted; contactos por party_type + nombre)
 -- -----------------------------------------------------------------------------
 
+DROP INDEX IF EXISTS suppliers_party_type_idx;
 CREATE INDEX IF NOT EXISTS idx_suppliers_deleted ON suppliers (deleted);
 CREATE INDEX IF NOT EXISTS idx_suppliers_payment_terms_id ON suppliers (payment_terms_id);
 CREATE INDEX IF NOT EXISTS idx_suppliers_name ON suppliers (name);
+CREATE INDEX IF NOT EXISTS idx_suppliers_party_type_name ON suppliers (party_type, name);
+
+
+-- -----------------------------------------------------------------------------
+-- INVENTORY_COUNT_SESSIONS (GET /inventory-counts: status opcional, order created_at desc)
+-- -----------------------------------------------------------------------------
+
+DROP INDEX IF EXISTS inventory_count_sessions_status_idx;
+CREATE INDEX IF NOT EXISTS idx_inventory_count_sessions_created_at ON inventory_count_sessions (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_inventory_count_sessions_status_created ON inventory_count_sessions (status, created_at DESC);
 
 
 -- -----------------------------------------------------------------------------
@@ -186,4 +217,3 @@ CREATE INDEX IF NOT EXISTS idx_users_role_id ON users (role_id);
 
 -- key es UNIQUE, suele tener índice implícito. Por si acaso:
 CREATE INDEX IF NOT EXISTS idx_system_settings_key ON system_settings (key);
-

@@ -172,10 +172,32 @@ exports.list = async (req, res, next) => {
           totalItems: 0,
           nextPage: null,
           prevPage: null,
+          customerPurchaseSummary: { totalPurchases: 0, lastSaleDate: null },
         })
       }
       const prevAnd = Array.isArray(where.AND) ? where.AND : []
       where.AND = [...prevAnd, { OR: orClauses }]
+    }
+
+    /** Solo ventas «Completada»: total neto (adjusted_total) y última fecha — para resumen en ficha de cliente */
+    let customerPurchaseSummary = null
+    if (customerContactId) {
+      const completedWhere = { ...where, status: { name: 'Completada' } }
+      const [sumRes, lastSale] = await Promise.all([
+        prisma.sale.aggregate({
+          where: completedWhere,
+          _sum: { adjusted_total: true },
+        }),
+        prisma.sale.findFirst({
+          where: completedWhere,
+          orderBy: { date: 'desc' },
+          select: { date: true },
+        }),
+      ])
+      customerPurchaseSummary = {
+        totalPurchases: Number(sumRes._sum.adjusted_total ?? 0),
+        lastSaleDate: lastSale?.date ? lastSale.date.toISOString() : null,
+      }
     }
 
     const totalItems = await prisma.sale.count({ where })
@@ -241,6 +263,7 @@ exports.list = async (req, res, next) => {
       totalItems,
       nextPage,
       prevPage,
+      ...(customerPurchaseSummary != null ? { customerPurchaseSummary } : {}),
     })
   } catch (e) { next(e) }
 }
