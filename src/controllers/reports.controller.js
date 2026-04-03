@@ -732,20 +732,63 @@ async function getSuppliersReportData() {
   }
 }
 
+/** Escapado RFC 4180 para celdas CSV (comas, comillas, saltos de línea). */
+function csvEscape(val) {
+  if (val === null || val === undefined) return ''
+  const s = String(val)
+  if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`
+  return s
+}
+
+function csvRow(cells) {
+  if (!Array.isArray(cells)) return csvEscape(cells)
+  return cells.map((c) => csvEscape(c)).join(',')
+}
+
+/** Línea de metadatos: si hay coma, primera coma separa clave y valor (el valor puede llevar más comas). */
+function csvHeaderMetadataLine(line) {
+  const s = String(line)
+  const i = s.indexOf(',')
+  if (i === -1) return csvRow([s])
+  return csvRow([s.slice(0, i).trim(), s.slice(i + 1)])
+}
+
+/**
+ * CSV con secciones legibles: BOM UTF-8 (Excel), bloque cabecera, separadores ▸ por tabla.
+ * @param {string[]} headerLines - Título(s) sin coma, o pares Concepto,Valor con primera coma como separador
+ * @param {{ title?: string, columns: string[], rows: (string|number)[][] }[]} sections
+ */
 function sendCsv(res, filename, headerLines = [], sections = []) {
   res.setHeader('Content-Type', 'text/csv; charset=utf-8')
   res.setHeader('Content-Disposition', `attachment; filename="${filename}.csv"`)
-  // simple CSV assembly
-  const parts = []
-  if (headerLines.length) parts.push(headerLines.join('\n'))
-  sections.forEach(sec => {
+  const lines = []
+  lines.push(csvRow([`Archivo: ${filename}.csv`]))
+  lines.push(csvRow(['Formato', 'CSV separado por comas, codificación UTF-8 (BOM). Cada bloque de tabla lleva título en la columna A.']))
+  lines.push('')
+  if (headerLines.length) {
+    lines.push(csvRow(['── Resumen del reporte (metadatos y totales) ──']))
+  }
+  for (const h of headerLines) {
+    lines.push(csvHeaderMetadataLine(h))
+  }
+
+  sections.forEach((sec, secIdx) => {
     if (!sec || !sec.rows || !sec.columns) return
-    parts.push('')
-    if (sec.title) parts.push(sec.title)
-    parts.push(sec.columns.join(','))
-    sec.rows.forEach(r => parts.push(r.map(v => typeof v === 'string' && v.includes(',') ? `"${v}"` : String(v)).join(',')))
+    lines.push('')
+    lines.push(csvRow([`── ${sec.title || `Sección ${secIdx + 1}`} ──`]))
+    lines.push(csvRow(sec.columns))
+    for (const r of sec.rows) {
+      const row = Array.isArray(r) ? r : [r]
+      while (row.length < sec.columns.length) row.push('')
+      lines.push(csvRow(row.slice(0, sec.columns.length)))
+    }
   })
-  res.send(parts.join('\n'))
+
+  lines.push('')
+  lines.push(csvRow(['Fin del reporte', DateTime.now().setZone('America/Guatemala').toFormat('yyyy-LL-dd HH:mm')]))
+
+  const body = lines.join('\r\n')
+  res.send(`\ufeff${body}`)
 }
 
 async function salesReport(req, res, next) {

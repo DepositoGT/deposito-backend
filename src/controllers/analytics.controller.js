@@ -17,16 +17,38 @@ const number = (v) => {
   return Number.isFinite(n) ? n : 0
 }
 
+async function analyticsContext() {
+  const now = DateTime.now().setZone('America/Guatemala')
+  const completedStatus = await prisma.saleStatus.findFirst({ where: { name: 'Completada' } })
+  const minAgg = await prisma.sale.aggregate({
+    _min: { date: true },
+    where: completedStatus ? { status_id: completedStatus.id } : {},
+  })
+  const firstSaleYear = minAgg._min.date
+    ? DateTime.fromJSDate(minAgg._min.date, { zone: 'utc' }).setZone('America/Guatemala').year
+    : now.year
+  return { now, completedStatus, firstSaleYear }
+}
+
+exports.firstSaleYear = async (req, res, next) => {
+  try {
+    const { firstSaleYear } = await analyticsContext()
+    res.json({ firstSaleYear })
+  } catch (e) {
+    next(e)
+  }
+}
+
 exports.summary = async (req, res, next) => {
   try {
     const yearParam = req.query.year
-    const now = DateTime.now().setZone('America/Guatemala')
+    const { now, completedStatus, firstSaleYear } = await analyticsContext()
     const isAll = String(yearParam || '').toLowerCase() === 'all'
     let year = Number(yearParam || now.year)
-    if (!Number.isInteger(year) || year < 2025) year = 2025
+    if (!Number.isInteger(year) || year < firstSaleYear) year = firstSaleYear
 
     const start = isAll
-      ? DateTime.fromObject({ year: 2025, month: 1, day: 1 }, { zone: 'America/Guatemala' })
+      ? DateTime.fromObject({ year: firstSaleYear, month: 1, day: 1 }, { zone: 'America/Guatemala' })
       : DateTime.fromObject({ year, month: 1, day: 1 }, { zone: 'America/Guatemala' })
     const end = isAll
       ? DateTime.fromObject({ year: now.year, month: 12, day: 31, hour: 23, minute: 59, second: 59, millisecond: 999 }, { zone: 'America/Guatemala' })
@@ -34,9 +56,6 @@ exports.summary = async (req, res, next) => {
 
     const startUtc = new Date(Date.UTC(start.year, start.month - 1, start.day, start.hour, start.minute, start.second, start.millisecond))
     const endUtc = new Date(Date.UTC(end.year, end.month - 1, end.day, end.hour, end.minute, end.second, end.millisecond))
-
-    // Restrict to completed sales only
-    const completedStatus = await prisma.saleStatus.findFirst({ where: { name: 'Completada' } })
 
     // Load sale items joined with sales and products within year range
     const saleItems = await prisma.saleItem.findMany({
@@ -148,6 +167,7 @@ exports.summary = async (req, res, next) => {
 
     res.json({
       year: isAll ? 'all' : year,
+      firstSaleYear,
       totals: {
         totalSales: Number(adjustedRevenue.toFixed(2)), // Ventas netas (sale.total - devoluciones)
         totalSalesGross: Number(totalRevenueGross.toFixed(2)), // sale.total bruto
