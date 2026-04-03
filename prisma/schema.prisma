@@ -138,7 +138,8 @@ model Supplier {
   deleted              Boolean               @default(false)
   deleted_at           DateTime?
 
-  @@index([party_type])
+  /// Listado de contactos: party_type + orden por nombre (reemplaza índice solo party_type)
+  @@index([party_type, name], map: "idx_suppliers_party_type_name")
   @@map("suppliers")
 }
 
@@ -284,6 +285,8 @@ model Sale {
   createdBy  User?   @relation("SaleCreatedBy", fields: [created_by], references: [id])
 
   @@index([created_by])
+  /// Listados por estado y fecha (p. ej. resumen de cliente, ventas «Completada»)
+  @@index([status_id, date(sort: Desc)], map: "idx_sales_status_id_date_desc")
   @@map("sales")
 }
 
@@ -331,7 +334,7 @@ model PurchaseLog {
   cost        Decimal  @db.Decimal(12, 2)
 
   @@index([product_id])
-  @@index([supplier_id])
+  @@index([supplier_id, date(sort: Desc)], map: "idx_purchase_logs_supplier_date")
   @@map("purchase_logs")
 }
 
@@ -358,9 +361,10 @@ model IncomingMerchandise {
   notes         String?                   @db.Text
   items         IncomingMerchandiseItem[]
 
-  @@index([supplier_id])
   @@index([registered_by])
   @@index([date])
+  /// Cubre también filtro por supplier_id (prefijo del compuesto)
+  @@index([supplier_id, date(sort: Desc)], map: "idx_incoming_merchandise_supplier_date")
   @@map("incoming_merchandise")
 }
 
@@ -666,8 +670,10 @@ model InventoryCountSession {
   created_at     DateTime                    @default(now())
   updated_at     DateTime                    @updatedAt
 
-  @@index([status])
   @@index([created_by_id])
+  @@index([created_at(sort: Desc)], map: "idx_inventory_count_sessions_created_at")
+  /// Cubre filtro por status (prefijo) + orden por fecha del listado
+  @@index([status, created_at(sort: Desc)], map: "idx_inventory_count_sessions_status_created")
   @@map("inventory_count_sessions")
 }
 
