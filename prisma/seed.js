@@ -18,7 +18,7 @@ async function main() {
   // 1. ROLES
   // ========================================
   console.log('Creando roles...')
-  const roles = ['admin', 'seller']
+  const roles = ['admin']
   await prisma.role.createMany({ 
     data: roles.map(name => ({ name })), 
     skipDuplicates: true 
@@ -214,9 +214,6 @@ async function main() {
 
   // Obtener roles
   const adminRole = await prisma.role.findFirst({ where: { name: { equals: 'admin', mode: 'insensitive' } } })
-  const sellerRoles = await prisma.role.findMany({
-    where: { name: { in: ['seller', 'vendedor'], mode: 'insensitive' } },
-  })
 
   if (adminRole) {
     // Admin tiene TODOS los permisos
@@ -230,58 +227,6 @@ async function main() {
       skipDuplicates: true,
     })
     console.log(`  ${adminPermissions.length} permisos asignados al rol 'admin'`)
-  }
-
-  // Seller/Vendedor tiene un subconjunto de permisos
-  const sellerPermissionCodes = [
-    'sales.view',
-    'sales.view_detail',
-    'sales.view_invoice',
-    'sales.create',
-    'returns.view',
-    'returns.manage',
-    'products.view',
-    'catalogs.view',
-    'alerts.view',
-    'cashclosure.view',
-    'cashclosure.create_own',  // Cajero: solo puede generar su propio cierre
-    'analytics.view',
-    'merchandise.view',
-    // Inventariado: contar y enviar a revisión (sin crear ni aprobar por defecto)
-    'inventory_count.view',
-    'inventory_count.count',
-    'inventory_count.submit',
-    'inventory_count.export',
-  ]
-
-  for (const sellerRole of sellerRoles) {
-    const sellerPermissions = sellerPermissionCodes
-      .map(code => {
-        const permId = permissionsMap.get(code)
-        return permId ? { role_id: sellerRole.id, permission_id: permId } : null
-      })
-      .filter(Boolean)
-
-    if (sellerPermissions.length > 0) {
-      await prisma.rolePermission.createMany({
-        data: sellerPermissions,
-        skipDuplicates: true,
-      })
-      console.log(`  ${sellerPermissions.length} permisos asignados al rol '${sellerRole.name}'`)
-    }
-
-    // Quitar permisos de registro de mercancía al vendedor (solo ver, no registrar)
-    const permRegisterIncoming = permissionsMap.get('products.register_incoming')
-    const permMerchandiseRegister = permissionsMap.get('merchandise.register')
-    const toRemove = [permRegisterIncoming, permMerchandiseRegister].filter(Boolean)
-    if (toRemove.length > 0) {
-      const deleted = await prisma.rolePermission.deleteMany({
-        where: { role_id: sellerRole.id, permission_id: { in: toRemove } },
-      })
-      if (deleted.count > 0) {
-        console.log(`  Rol '${sellerRole.name}': ${deleted.count} permiso(s) de registro de mercancía quitados`)
-      }
-    }
   }
 
   // ========================================
@@ -368,15 +313,15 @@ async function main() {
   console.log('Verificando usuario admin...')
   if (adminRole) {
     const existingAdmin = await prisma.user.findUnique({
-      where: { email: 'admin@example.com' },
+      where: { email: 'admin@ejemplo.com' },
     })
 
     if (!existingAdmin) {
       await prisma.user.create({
         data: {
           name: 'Admin',
-          email: 'admin@example.com',
-          password: '$2b$10$replace_with_real_hash', // DEBE SER REEMPLAZADO CON HASH REAL
+          email: 'admin@ejemplo.com',
+          password: '7c4a8d09ca3762af61e59520943dc26494f8941b', // DEBE SER REEMPLAZADO CON HASH REAL
           role_id: adminRole.id,
         },
       })
