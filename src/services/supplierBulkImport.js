@@ -309,15 +309,30 @@ function validateSupplierRow(
             data.payment_terms_use_default = true
         }
     } else {
-        const inDb = paymentTermsMap.has(terminosPago.toLowerCase())
-        const approved = paymentOpt.createPaymentTermSet.has(terminosPago.toLowerCase())
-        if (inDb || approved) {
-            data.payment_term_name = terminosPago
-        } else {
-            errors.push(
-                `Términos de pago "${terminosPago}" no existen. Cree este valor u omita las filas donde aparece.`,
-            )
-            hints.unknownPaymentTerms.push(terminosPago)
+        const parts = terminosPago
+            .split(/[|;,\n]/)
+            .map((s) => String(s).trim())
+            .filter(Boolean)
+        const unknown = []
+        const resolvedNames = []
+        for (const part of parts) {
+            const inDb = paymentTermsMap.has(part.toLowerCase())
+            const approved = paymentOpt.createPaymentTermSet.has(part.toLowerCase())
+            if (inDb || approved) {
+                resolvedNames.push(part)
+            } else {
+                unknown.push(part)
+            }
+        }
+        if (unknown.length > 0) {
+            for (const u of unknown) {
+                errors.push(
+                    `Término de pago "${u}" no existe. Cree este valor u omita las filas donde aparece.`,
+                )
+                hints.unknownPaymentTerms.push(u)
+            }
+        } else if (resolvedNames.length > 0) {
+            data.payment_term_names = resolvedNames
         }
     }
 
@@ -516,12 +531,31 @@ async function bulkCreateSuppliers(validRows, importOptionsRaw) {
             }
 
             if (row.data.payment_terms_use_default) {
-                createData.payment_term = { connect: { id: await resolveDefaultPaymentId() } }
-            } else if (row.data.payment_term_name) {
-                const ptId = await ensurePaymentTermId(row.data.payment_term_name, paymentCache)
-                if (ptId) createData.payment_term = { connect: { id: ptId } }
+                const defId = await resolveDefaultPaymentId()
+                createData.supplier_payment_terms = {
+                    create: [{ payment_term_id: defId, is_default: true, sort_order: 0 }],
+                }
+            } else if (Array.isArray(row.data.payment_term_names) && row.data.payment_term_names.length > 0) {
+                const ids = []
+                for (let i = 0; i < row.data.payment_term_names.length; i++) {
+                    const ptId = await ensurePaymentTermId(row.data.payment_term_names[i], paymentCache)
+                    if (ptId) ids.push(ptId)
+                }
+                if (ids.length === 0) {
+                    throw new Error('No se pudieron resolver los términos de pago')
+                }
+                createData.supplier_payment_terms = {
+                    create: ids.map((ptId, i) => ({
+                        payment_term_id: ptId,
+                        is_default: i === 0,
+                        sort_order: i,
+                    })),
+                }
             } else {
-                createData.payment_term = { connect: { id: await resolveDefaultPaymentId() } }
+                const defId = await resolveDefaultPaymentId()
+                createData.supplier_payment_terms = {
+                    create: [{ payment_term_id: defId, is_default: true, sort_order: 0 }],
+                }
             }
 
             await prisma.supplier.create({ data: createData })

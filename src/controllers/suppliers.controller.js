@@ -51,6 +51,81 @@ function resolveContactForEntityKind(p) {
   return { ok: true, name, contact }
 }
 
+/**
+ * @param {object} body
+ * @returns {{ ok: true, links: { payment_term_id: number, is_default: boolean, sort_order: number }[] } | { ok: false, message: string }}
+ */
+function parsePaymentTermsPayload(body) {
+  if (body.payment_terms != null && Array.isArray(body.payment_terms)) {
+    const raw = body.payment_terms
+    if (raw.length === 0) {
+      return { ok: false, message: 'Debe indicar al menos un término de pago' }
+    }
+    const links = []
+    let defaultCount = 0
+    for (let i = 0; i < raw.length; i++) {
+      const row = raw[i]
+      const id = row.payment_term_id != null ? row.payment_term_id : row.id
+      if (id == null || id === '') continue
+      const pid = Number(id)
+      if (!Number.isFinite(pid)) {
+        return { ok: false, message: 'payment_terms: id de término inválido' }
+      }
+      const isDef = Boolean(row.is_default)
+      if (isDef) defaultCount++
+      links.push({
+        payment_term_id: pid,
+        is_default: isDef,
+        sort_order: row.sort_order != null ? Number(row.sort_order) : i,
+      })
+    }
+    const seen = new Set()
+    for (const l of links) {
+      if (seen.has(l.payment_term_id)) {
+        return { ok: false, message: 'Términos de pago duplicados' }
+      }
+      seen.add(l.payment_term_id)
+    }
+    if (links.length === 0) {
+      return { ok: false, message: 'Debe indicar al menos un término de pago' }
+    }
+    if (defaultCount !== 1) {
+      return { ok: false, message: 'Debe marcar exactamente un término de pago como predeterminado' }
+    }
+    return { ok: true, links }
+  }
+  if (body.payment_terms_id != null && body.payment_terms_id !== '') {
+    const pid = Number(body.payment_terms_id)
+    if (!Number.isFinite(pid)) {
+      return { ok: false, message: 'payment_terms_id inválido' }
+    }
+    return { ok: true, links: [{ payment_term_id: pid, is_default: true, sort_order: 0 }] }
+  }
+  return { ok: false, message: 'payment_terms o payment_terms_id es requerido' }
+}
+
+function shapeSupplierResponse(s) {
+  const links = Array.isArray(s.supplier_payment_terms)
+    ? [...s.supplier_payment_terms].sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0))
+    : []
+  const payment_terms = links.map((l) => ({
+    payment_term_id: l.payment_term_id,
+    is_default: l.is_default,
+    sort_order: l.sort_order,
+    name: l.payment_term?.name ?? '',
+  }))
+  const def = links.find((l) => l.is_default) || links[0]
+  const payment_terms_id = def?.payment_term_id ?? null
+  const payment_term = def?.payment_term ?? null
+  const { supplier_payment_terms: _omit, ...rest } = s
+  return {
+    ...rest,
+    payment_terms,
+    payment_terms_id,
+    payment_term,
+  }
+}
+
 exports.list = async (req, res, next) => {
   try {
     const lt = listablePartyTypes(req.user, req.query.party_type)
@@ -105,7 +180,10 @@ exports.list = async (req, res, next) => {
             category: true,
           },
         },
-        payment_term: true,
+        supplier_payment_terms: {
+          include: { payment_term: true },
+          orderBy: { sort_order: 'asc' },
+        },
         productsList: true,
       },
       orderBy: { name: 'asc' },
@@ -115,6 +193,7 @@ exports.list = async (req, res, next) => {
 
     const tz = await getTimezone(prisma)
     const adapted = items.map(s => {
+      const shaped = shapeSupplierResponse(s)
       let lastOrder = ''
       if (s.last_order) {
         lastOrder = DateTime.fromJSDate(s.last_order).setZone(tz).setLocale('es').toFormat("dd LLL yyyy HH:mm")
@@ -130,7 +209,7 @@ exports.list = async (req, res, next) => {
       const categoryNames = categories.map(c => c.name)
 
       return {
-        ...s,
+        ...shaped,
         totalPurchases: Number(s.total_purchases || 0),
         lastOrder,
         categories,
@@ -209,15 +288,27 @@ exports.create = async (req, res, next) => {
       }
     }
 
-    if (data.payment_terms_id == null || data.payment_terms_id === '') {
-      return res.status(400).json({ message: 'payment_terms_id es requerido' })
+    const ptParsed = parsePaymentTermsPayload(data)
+    if (!ptParsed.ok) {
+      return res.status(400).json({ message: ptParsed.message })
     }
-    createData.payment_term = { connect: { id: Number(data.payment_terms_id) } }
+    createData.supplier_payment_terms = {
+      create: ptParsed.links.map((l) => ({
+        payment_term_id: l.payment_term_id,
+        is_default: l.is_default,
+        sort_order: l.sort_order,
+      })),
+    }
 
     createData.estado = data.estado !== undefined && data.estado !== null ? Number(data.estado) : 1
 
-    const created = await prisma.supplier.create({ data: createData })
-    res.status(201).json(created)
+    const created = await prisma.supplier.create({
+      data: createData,
+      include: {
+        supplier_payment_terms: { include: { payment_term: true }, orderBy: { sort_order: 'asc' } },
+      },
+    })
+    res.status(201).json(shapeSupplierResponse(created))
   } catch (e) { next(e) }
 }
 
@@ -231,7 +322,10 @@ exports.getOne = async (req, res, next) => {
             category: true,
           },
         },
-        payment_term: true,
+        supplier_payment_terms: {
+          include: { payment_term: true },
+          orderBy: { sort_order: 'asc' },
+        },
         productsList: true,
       },
     })
@@ -250,8 +344,9 @@ exports.getOne = async (req, res, next) => {
     const categoryNames = categories.map(c => c.name)
 
     const tz = await getTimezone(prisma)
+    const shaped = shapeSupplierResponse(item)
     const adapted = {
-      ...item,
+      ...shaped,
       totalPurchases: Number(item.total_purchases || 0),
       lastOrder: item.last_order ? DateTime.fromJSDate(item.last_order).setZone(tz).setLocale('es').toFormat('dd LLL yyyy HH:mm') : '',
       categories,
@@ -349,15 +444,32 @@ exports.update = async (req, res, next) => {
     } else if (effectiveParty === PARTY.CUSTOMER && (data.category_ids != null || data.category_id != null)) {
       updateData.categories = { deleteMany: {} }
     }
-    if (data.payment_terms_id != null) {
-      updateData.payment_term = { connect: { id: Number(data.payment_terms_id) } }
+    if (data.payment_terms != null || data.payment_terms_id != null) {
+      const ptParsed = parsePaymentTermsPayload(data)
+      if (!ptParsed.ok) {
+        return res.status(400).json({ message: ptParsed.message })
+      }
+      updateData.supplier_payment_terms = {
+        deleteMany: {},
+        create: ptParsed.links.map((l) => ({
+          payment_term_id: l.payment_term_id,
+          is_default: l.is_default,
+          sort_order: l.sort_order,
+        })),
+      }
     }
     if (data.estado !== undefined && data.estado !== null) {
       updateData.estado = Number(data.estado)
     }
 
-    const updated = await prisma.supplier.update({ where: { id: req.params.id }, data: updateData })
-    res.json(updated)
+    const updated = await prisma.supplier.update({
+      where: { id: req.params.id },
+      data: updateData,
+      include: {
+        supplier_payment_terms: { include: { payment_term: true }, orderBy: { sort_order: 'asc' } },
+      },
+    })
+    res.json(shapeSupplierResponse(updated))
   } catch (e) { next(e) }
 }
 

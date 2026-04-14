@@ -685,7 +685,12 @@ async function getFinancialData(startUtc, endUtc) {
 async function getSuppliersReportData() {
   const suppliers = await prisma.supplier.findMany({
     where: { deleted: false, party_type: 'SUPPLIER' },
-    include: { payment_term: true },
+    include: {
+      supplier_payment_terms: {
+        include: { payment_term: true },
+        orderBy: { sort_order: 'asc' },
+      },
+    },
     orderBy: { name: 'asc' }
   })
 
@@ -707,12 +712,17 @@ async function getSuppliersReportData() {
 
   const enriched = suppliers.map((s) => {
     const a = aggBySupplier.get(s.id) || { productCount: 0, stockUnits: 0, inventoryValue: 0 }
+    const links = Array.isArray(s.supplier_payment_terms) ? s.supplier_payment_terms : []
+    const names = links
+      .map((l) => l.payment_term?.name)
+      .filter(Boolean)
+    const def = links.find((l) => l.is_default) || links[0]
     return {
       ...s,
       productCount: a.productCount,
       stockUnits: a.stockUnits,
       inventoryValue: a.inventoryValue,
-      paymentTermName: s.payment_term?.name || '—'
+      paymentTermName: names.length ? names.join(', ') : (def?.payment_term?.name || '—')
     }
   })
 
