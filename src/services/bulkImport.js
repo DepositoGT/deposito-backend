@@ -389,7 +389,9 @@ async function ensureSupplierIdForProductImport(name, cache) {
             name: safeName,
             contact: safeName,
             address: '—',
-            payment_term: { connect: { id: defaultPt.id } },
+            supplier_payment_terms: {
+                create: [{ payment_term_id: defaultPt.id, is_default: true, sort_order: 0 }],
+            },
             categories: { create: [{ category: { connect: { id: catIdForSupplier } } }] },
             estado: 1,
             products: 0,

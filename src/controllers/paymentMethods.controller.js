@@ -10,9 +10,19 @@
 
 const { prisma } = require('../models/prisma')
 
+/** Mismos valores que prisma/seed.js — si la BD nunca se sembró, el listado no puede quedar vacío (ventas, cierres). */
+const DEFAULT_PAYMENT_METHOD_NAMES = ['Efectivo', 'Tarjeta', 'Transferencia']
+
 exports.list = async (req, res, next) => {
     try {
-        const paymentMethods = await prisma.paymentMethod.findMany()
+        let paymentMethods = await prisma.paymentMethod.findMany({ orderBy: { id: 'asc' } })
+        if (paymentMethods.length === 0) {
+            await prisma.paymentMethod.createMany({
+                data: DEFAULT_PAYMENT_METHOD_NAMES.map((name) => ({ name })),
+                skipDuplicates: true,
+            })
+            paymentMethods = await prisma.paymentMethod.findMany({ orderBy: { id: 'asc' } })
+        }
         res.json(paymentMethods)
     } catch (error) {
         next(error)

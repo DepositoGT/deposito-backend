@@ -43,7 +43,7 @@ exports.list = async (req, res, next) => {
     const payment_terms = await prisma.paymentTerm.findMany({ 
       where,
       orderBy: { name: 'asc' },
-      include: { _count: { select: { suppliers: true } } },
+      include: { _count: { select: { supplier_payment_terms: true } } },
       skip: (safePage - 1) * pageSize,
       take: pageSize,
     })
@@ -189,13 +189,13 @@ exports.remove = async (req, res, next) => {
     const { id } = req.params
     
     // Verificar proveedores vinculados
-    const linkedSuppliers = await prisma.supplier.count({ 
-      where: { payment_terms_id: Number(id), deleted: false }
+    const linkedSuppliers = await prisma.supplierPaymentTerm.count({
+      where: { payment_term_id: Number(id), supplier: { deleted: false } },
     })
     
     if (linkedSuppliers > 0) {
       return res.status(400).json({ 
-        message: `No se puede eliminar. Tiene ${linkedSuppliers} proveedor(es) vinculado(s)` 
+        message: `No se puede eliminar. Tiene ${linkedSuppliers} contacto(s) vinculado(s)` 
       })
     }
     

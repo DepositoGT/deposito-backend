@@ -75,7 +75,7 @@ model PaymentTerm {
   id        Int        @id @default(autoincrement())
   name      String     @unique @db.VarChar(50)
   deleted   Boolean    @default(false)
-  suppliers Supplier[]
+  supplier_payment_terms SupplierPaymentTerm[]
 
   @@map("payment_terms")
 }
@@ -129,8 +129,7 @@ model Supplier {
   total_purchases      Decimal               @default(0) @db.Decimal(12, 2)
   rating               Decimal?              @db.Decimal(3, 2)
   estado               Int                   @default(1) // 0 = inactivo, 1 = activo
-  payment_terms_id     Int
-  payment_term         PaymentTerm           @relation(fields: [payment_terms_id], references: [id])
+  supplier_payment_terms SupplierPaymentTerm[]
   categories           SupplierCategory[]
   productsList         Product[]
   purchase_logs        PurchaseLog[]
@@ -141,6 +140,20 @@ model Supplier {
   /// Listado de contactos: party_type + orden por nombre (reemplaza índice solo party_type)
   @@index([party_type, name], map: "idx_suppliers_party_type_name")
   @@map("suppliers")
+}
+
+/// Varios términos de pago por contacto; exactamente uno con is_default = true (validado en API)
+model SupplierPaymentTerm {
+  supplier_id     String      @db.Uuid
+  supplier        Supplier    @relation(fields: [supplier_id], references: [id], onDelete: Cascade)
+  payment_term_id Int
+  payment_term    PaymentTerm @relation(fields: [payment_term_id], references: [id], onDelete: Restrict)
+  is_default      Boolean     @default(false)
+  sort_order      Int         @default(0)
+
+  @@id([supplier_id, payment_term_id])
+  @@index([payment_term_id])
+  @@map("supplier_payment_terms")
 }
 
 model Product {

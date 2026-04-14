@@ -38,8 +38,10 @@ app.use(cors(corsConfig))
 // Other middleware
 app.use(cookieParser())
 app.use(express.static(path.join(__dirname, 'files')))
-app.use(express.urlencoded({ extended: false }))
-app.use(express.json())
+// Límite alto: importaciones mapeadas (JSON) y formularios grandes; alineado con multer en products.routes (10MB)
+const bodyLimit = process.env.JSON_BODY_LIMIT || '10mb'
+app.use(express.urlencoded({ extended: false, limit: bodyLimit }))
+app.use(express.json({ limit: bodyLimit }))
 
 // Swagger setup
 const swaggerDefinition = {
