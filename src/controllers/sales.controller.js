@@ -315,6 +315,38 @@ exports.create = async (req, res, next) => {
     const adminAuthorizedSet = new Set(admin_authorized_products || [])
 
     const created = await prisma.$transaction(async (tx) => {
+      let cashSessionIdForSale = null
+      const isAdmin = String(user.role?.name || user.role_name || '').toLowerCase() === 'admin'
+      if (!isAdmin) {
+        const defaultReg = await tx.cashRegister.findFirst({
+          where: { is_default: true, active: true }
+        })
+        if (!defaultReg) {
+          const err = new Error('NO_CASH_REGISTER')
+          err.status = 503
+          throw err
+        }
+        const openSess = await tx.cashRegisterSession.findFirst({
+          where: { cash_register_id: defaultReg.id, status: 'OPEN' }
+        })
+        if (!openSess) {
+          const err = new Error('CASH_SESSION_REQUIRED')
+          err.status = 403
+          throw err
+        }
+        cashSessionIdForSale = openSess.id
+      } else {
+        const defaultReg = await tx.cashRegister.findFirst({
+          where: { is_default: true, active: true }
+        })
+        if (defaultReg) {
+          const openSess = await tx.cashRegisterSession.findFirst({
+            where: { cash_register_id: defaultReg.id, status: 'OPEN' }
+          })
+          if (openSess) cashSessionIdForSale = openSess.id
+        }
+      }
+
       // 1) Validación de stock: no permitir solicitar más que el stock disponible por producto
       // EXCEPTO para productos autorizados por administrador
       const qtyByProduct = new Map()
@@ -565,6 +597,7 @@ exports.create = async (req, res, next) => {
           adjusted_total: total,  // Total ajustado = total (sin devoluciones aún)
           status_id: completadaStatus.id,
           created_by: user.sub,
+          cash_register_session_id: cashSessionIdForSale || undefined,
         },
       })
 
@@ -631,7 +664,21 @@ exports.create = async (req, res, next) => {
     })
 
     res.status(201).json(fullSale || created)
-  } catch (e) { next(e) }
+  } catch (e) {
+    if (e && e.message === 'CASH_SESSION_REQUIRED') {
+      return res.status(403).json({
+        code: 'CASH_SESSION_REQUIRED',
+        message: 'Debe abrir la caja (turno) antes de registrar ventas.'
+      })
+    }
+    if (e && e.message === 'NO_CASH_REGISTER') {
+      return res.status(503).json({
+        code: 'NO_CASH_REGISTER',
+        message: 'No hay caja configurada. Ejecute migraciones y seed.'
+      })
+    }
+    next(e)
+  }
 }
 
 // PATCH /sales/:id/status  { status_name?: string, status_id?: number }

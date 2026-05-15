@@ -151,6 +151,11 @@ async function main() {
     { code: 'merchandise.register', name: 'Registrar mercancía', description: 'Puede registrar nuevos ingresos de mercancía' },
     { code: 'merchandise.details', name: 'Ver detalles de mercancía', description: 'Puede ver detalles completos de registros de mercancía' },
     { code: 'merchandise.reports', name: 'Generar reportes de mercancía', description: 'Puede generar reportes de ingresos de mercancía' },
+    {
+      code: 'merchandise.mark_paid',
+      name: 'Marcar pago de mercancía',
+      description: 'Puede actualizar término de pago, estado y fechas de pago en registros de ingreso',
+    },
   ]
 
   // Crear todos los permisos (idempotente)
@@ -227,6 +232,20 @@ async function main() {
       skipDuplicates: true,
     })
     console.log(`  ${adminPermissions.length} permisos asignados al rol 'admin'`)
+  }
+
+  // Quién tenía merchandise.details recibe también merchandise.mark_paid (misma capacidad operativa)
+  const detailsPerm = await prisma.permission.findUnique({ where: { code: 'merchandise.details' } })
+  const markPaidPerm = await prisma.permission.findUnique({ where: { code: 'merchandise.mark_paid' } })
+  if (detailsPerm && markPaidPerm) {
+    const withDetails = await prisma.rolePermission.findMany({ where: { permission_id: detailsPerm.id } })
+    if (withDetails.length) {
+      await prisma.rolePermission.createMany({
+        data: withDetails.map((rp) => ({ role_id: rp.role_id, permission_id: markPaidPerm.id })),
+        skipDuplicates: true,
+      })
+      console.log(`  merchandise.mark_paid replicado a roles que tenían merchandise.details (${withDetails.length} filas)`)
+    }
   }
 
   // ========================================
@@ -306,6 +325,22 @@ async function main() {
     })
   }
   console.log('  Valores por defecto de configuración listos')
+
+  // ========================================
+  // 7b. Caja registradora por defecto (apertura de caja / multi-caja futuro)
+  // ========================================
+  await prisma.cashRegister.upsert({
+    where: { id: 'c0ffee00-0000-4000-8000-000000000001' },
+    update: { name: 'Caja principal', code: 'PRINCIPAL', is_default: true, active: true },
+    create: {
+      id: 'c0ffee00-0000-4000-8000-000000000001',
+      name: 'Caja principal',
+      code: 'PRINCIPAL',
+      is_default: true,
+      active: true
+    }
+  })
+  console.log('  Caja principal (cash_registers) lista')
 
   // ========================================
   // 8. USUARIO ADMIN POR DEFECTO (OPCIONAL)

@@ -92,12 +92,20 @@ exports.list = async (req, res, next) => {
  */
 exports.create = async (req, res, next) => {
   try {
-    const { name } = req.body
+    const { name, net_days } = req.body
     if (!name || !name.trim()) {
       return res.status(400).json({ message: 'El nombre es requerido' })
     }
-    const created = await prisma.paymentTerm.create({ 
-      data: { name: name.trim() }
+    let netDaysVal = null
+    if (net_days != null && net_days !== '') {
+      const n = Number(net_days)
+      if (!Number.isFinite(n) || n < 0 || n > 3650) {
+        return res.status(400).json({ message: 'net_days debe ser un número entre 0 y 3650' })
+      }
+      netDaysVal = Math.floor(n)
+    }
+    const created = await prisma.paymentTerm.create({
+      data: { name: name.trim(), net_days: netDaysVal },
     })
     res.status(201).json(created)
   } catch (e) {
@@ -143,13 +151,25 @@ exports.create = async (req, res, next) => {
 exports.update = async (req, res, next) => {
   try {
     const { id } = req.params
-    const { name } = req.body
+    const { name, net_days } = req.body
     if (!name || !name.trim()) {
       return res.status(400).json({ message: 'El nombre es requerido' })
     }
-    const updated = await prisma.paymentTerm.update({ 
-      where: { id: Number(id) }, 
-      data: { name: name.trim() }
+    const data = { name: name.trim() }
+    if (net_days !== undefined) {
+      if (net_days === null || net_days === '') {
+        data.net_days = null
+      } else {
+        const n = Number(net_days)
+        if (!Number.isFinite(n) || n < 0 || n > 3650) {
+          return res.status(400).json({ message: 'net_days debe ser un número entre 0 y 3650' })
+        }
+        data.net_days = Math.floor(n)
+      }
+    }
+    const updated = await prisma.paymentTerm.update({
+      where: { id: Number(id) },
+      data,
     })
     res.json(updated)
   } catch (e) {
