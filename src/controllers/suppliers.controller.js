@@ -113,6 +113,7 @@ function shapeSupplierResponse(s) {
     is_default: l.is_default,
     sort_order: l.sort_order,
     name: l.payment_term?.name ?? '',
+    net_days: l.payment_term?.net_days != null ? Number(l.payment_term.net_days) : null,
   }))
   const def = links.find((l) => l.is_default) || links[0]
   const payment_terms_id = def?.payment_term_id ?? null

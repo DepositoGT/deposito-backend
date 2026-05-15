@@ -630,10 +630,11 @@ exports.critical = async (req, res, next) => {
   } catch (e) { next(e) }
 }
 
-// Register incoming merchandise endpoint: body { supplier_id: string, items: [{ product_id: string, quantity: number, unit_cost: number }], notes?: string }
+// Register incoming merchandise endpoint: body { supplier_id, items, notes?, payment_term_id?, payment_status?, paid_at?, payment_reference?, due_date? }
 exports.registerIncomingMerchandise = async (req, res, next) => {
   try {
-    const { supplier_id, items, notes } = req.body || {}
+    const body = req.body || {}
+    const { supplier_id, items, notes } = body
     const user = req.user
     if (!user || !user.sub) {
       return res.status(401).json({ message: 'Usuario no autenticado' })
@@ -669,10 +670,81 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
       nowGt.millisecond
     ))
 
+    const payment_status = body.payment_status === 'PAID' ? 'PAID' : 'PENDING'
+    let payment_term_id = null
+    if (body.payment_term_id != null && body.payment_term_id !== '') {
+      const pid = Number(body.payment_term_id)
+      if (!Number.isFinite(pid)) {
+        return res.status(400).json({ message: 'payment_term_id inválido' })
+      }
+      payment_term_id = pid
+    }
+
+    let payment_reference = body.payment_reference != null ? String(body.payment_reference).trim() : ''
+    if (payment_reference.length > 255) {
+      payment_reference = payment_reference.slice(0, 255)
+    }
+
+    let due_date = null
+    if (body.due_date != null && body.due_date !== '') {
+      const d = new Date(body.due_date)
+      if (Number.isNaN(d.getTime())) {
+        return res.status(400).json({ message: 'due_date inválida' })
+      }
+      due_date = d
+    }
+
+    let paid_at = null
+    if (payment_status === 'PAID') {
+      if (body.paid_at != null && body.paid_at !== '') {
+        const p = new Date(body.paid_at)
+        if (Number.isNaN(p.getTime())) {
+          return res.status(400).json({ message: 'paid_at inválido' })
+        }
+        paid_at = p
+      } else {
+        paid_at = dateAsUtcWithGtClock
+      }
+    }
+
+    const supplierWithTerms = await prisma.supplier.findUnique({
+      where: { id: supplier_id },
+      include: { supplier_payment_terms: true },
+    })
+    if (!supplierWithTerms || supplierWithTerms.deleted) {
+      return res.status(400).json({ message: 'Proveedor no encontrado' })
+    }
+
+    const allowedTermIds = new Set(
+      (supplierWithTerms.supplier_payment_terms || []).map((l) => l.payment_term_id)
+    )
+    if (allowedTermIds.size > 0) {
+      if (payment_term_id == null) {
+        return res.status(400).json({ message: 'Debe seleccionar un término de pago para este proveedor' })
+      }
+      if (!allowedTermIds.has(payment_term_id)) {
+        return res.status(400).json({ message: 'El término de pago no corresponde a este proveedor' })
+      }
+    } else if (payment_term_id != null) {
+      return res.status(400).json({
+        message: 'Este proveedor no tiene términos de pago configurados; no envíe payment_term_id',
+      })
+    }
+
+    if (!due_date && payment_term_id != null) {
+      const ptRow = await prisma.paymentTerm.findUnique({ where: { id: payment_term_id } })
+      const nd = ptRow?.net_days != null ? Number(ptRow.net_days) : null
+      if (nd != null && Number.isFinite(nd) && nd >= 0) {
+        const d = new Date(dateAsUtcWithGtClock)
+        d.setUTCDate(d.getUTCDate() + Math.floor(nd))
+        due_date = d
+      }
+    }
+
     // Run in transaction: create audit record, update products, create purchase logs, update supplier
     // Use prismaTransaction (DIRECT_URL) for transactions as pooled connections don't support them
     const result = await prismaTransaction.$transaction(async (tx) => {
-      // Verify supplier exists
+      // Verify supplier still exists
       const supplier = await tx.supplier.findUnique({ where: { id: supplier_id } })
       if (!supplier || supplier.deleted) {
         throw new Error('Proveedor no encontrado')
@@ -705,7 +777,14 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
           registered_by,
           date: dateAsUtcWithGtClock,
           notes: notes || null,
-        }
+          payment_term_id,
+          payment_status,
+          paid_at,
+          payment_reference: payment_reference || null,
+          due_date,
+          payment_updated_by: registered_by,
+          payment_updated_at: dateAsUtcWithGtClock,
+        },
       })
 
       // Process each item
