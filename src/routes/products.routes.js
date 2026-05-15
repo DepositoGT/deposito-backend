@@ -266,6 +266,13 @@ router.post('/validate-import-mapped', Auth, hasPermission('products.import'), P
  */
 router.post('/', Auth, hasPermission('products.create'), Products.create)
 
+router.post(
+  '/pricing-preview',
+  Auth,
+  hasPermission('products.view', 'sales.create'),
+  Products.pricingPreview
+)
+
 /**
  * @openapi
  * /products/{id}:
