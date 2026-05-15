@@ -113,6 +113,7 @@ function shapeSupplierResponse(s) {
     is_default: l.is_default,
     sort_order: l.sort_order,
     name: l.payment_term?.name ?? '',
+    net_days: l.payment_term?.net_days != null ? Number(l.payment_term.net_days) : null,
   }))
   const def = links.find((l) => l.is_default) || links[0]
   const payment_terms_id = def?.payment_term_id ?? null
@@ -327,6 +328,9 @@ exports.getOne = async (req, res, next) => {
           orderBy: { sort_order: 'asc' },
         },
         productsList: true,
+        customer_price_rules: {
+          orderBy: [{ priority: 'desc' }, { created_at: 'asc' }],
+        },
       },
     })
     if (!item || item.deleted) return res.status(404).json({ message: 'No encontrado' })
@@ -461,6 +465,12 @@ exports.update = async (req, res, next) => {
     if (data.estado !== undefined && data.estado !== null) {
       updateData.estado = Number(data.estado)
     }
+    if (existing.party_type === PARTY.CUSTOMER && data.default_price_tier !== undefined) {
+      const t = String(data.default_price_tier || '').toUpperCase()
+      if (['LIST', 'WHOLESALE', 'PROMOTION'].includes(t)) {
+        updateData.default_price_tier = t
+      }
+    }
 
     const updated = await prisma.supplier.update({
       where: { id: req.params.id },
@@ -498,6 +508,98 @@ exports.remove = async (req, res, next) => {
     await prisma.supplier.update({ where: { id: req.params.id }, data: { deleted: true, deleted_at: dateAsUtcWithGtClock } })
     res.json({ ok: true })
   } catch (e) { next(e) }
+}
+
+const PRICE_TIERS = new Set(['LIST', 'WHOLESALE', 'PROMOTION'])
+const SALE_CHANNELS = new Set(['POS', 'WHOLESALE', 'ONLINE'])
+
+exports.listCustomerPriceRules = async (req, res, next) => {
+  try {
+    const row = await prisma.supplier.findUnique({
+      where: { id: req.params.id },
+      select: { id: true, deleted: true, party_type: true },
+    })
+    if (!row || row.deleted) return res.status(404).json({ message: 'No encontrado' })
+    try {
+      assertPartyAction(req.user, row.party_type, 'view')
+    } catch (err) {
+      return res.status(err.statusCode || 403).json({ message: err.message })
+    }
+    if (row.party_type !== PARTY.CUSTOMER) {
+      return res.status(400).json({ message: 'Las reglas de precio solo aplican a clientes' })
+    }
+    const rules = await prisma.customerPriceRule.findMany({
+      where: { supplier_id: row.id },
+      orderBy: [{ priority: 'desc' }, { created_at: 'asc' }],
+    })
+    res.json({ rules })
+  } catch (e) {
+    next(e)
+  }
+}
+
+exports.replaceCustomerPriceRules = async (req, res, next) => {
+  try {
+    const { randomUUID } = require('crypto')
+    const row = await prisma.supplier.findUnique({
+      where: { id: req.params.id },
+      select: { id: true, deleted: true, party_type: true },
+    })
+    if (!row || row.deleted) return res.status(404).json({ message: 'No encontrado' })
+    try {
+      assertPartyAction(req.user, row.party_type, 'edit')
+    } catch (err) {
+      return res.status(err.statusCode || 403).json({ message: err.message })
+    }
+    if (row.party_type !== PARTY.CUSTOMER) {
+      return res.status(400).json({ message: 'Las reglas de precio solo aplican a clientes' })
+    }
+
+    const { rules } = req.body || {}
+    if (!Array.isArray(rules)) {
+      return res.status(400).json({ message: 'rules debe ser un arreglo' })
+    }
+
+    const rows = []
+    for (let i = 0; i < rules.length; i++) {
+      const r = rules[i] || {}
+      const tier = String(r.price_tier ?? r.tier ?? '').toUpperCase()
+      if (!PRICE_TIERS.has(tier)) {
+        return res.status(400).json({ message: `price_tier inválido en índice ${i}` })
+      }
+      let channel = null
+      if (r.channel != null && r.channel !== '') {
+        const c = String(r.channel).toUpperCase()
+        if (!SALE_CHANNELS.has(c)) {
+          return res.status(400).json({ message: `channel inválido en índice ${i}` })
+        }
+        channel = c
+      }
+      rows.push({
+        id: randomUUID(),
+        supplier_id: row.id,
+        channel,
+        price_tier: tier,
+        priority: Number.isFinite(Number(r.priority)) ? Number(r.priority) : 0,
+        active: r.active !== false,
+      })
+    }
+
+    await prisma.$transaction(async (trx) => {
+      await trx.customerPriceRule.deleteMany({ where: { supplier_id: row.id } })
+      if (rows.length > 0) {
+        await trx.customerPriceRule.createMany({ data: rows })
+      }
+    })
+
+    const updated = await prisma.customerPriceRule.findMany({
+      where: { supplier_id: row.id },
+      orderBy: [{ priority: 'desc' }, { created_at: 'asc' }],
+    })
+    res.json({ rules: updated })
+  } catch (e) {
+    next(e)
+  }
 }
 
 // ========== BULK IMPORT METHODS ==========

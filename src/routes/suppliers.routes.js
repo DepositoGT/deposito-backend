@@ -167,6 +167,19 @@ router.get('/', Auth, hasPermission('contacts.suppliers.view', 'contacts.clients
  */
 router.post('/', Auth, hasPermission('contacts.suppliers.create', 'contacts.clients.create'), Suppliers.create)
 
+router.get(
+  '/:id/price-rules',
+  Auth,
+  hasPermission('contacts.clients.view', 'contacts.suppliers.view'),
+  Suppliers.listCustomerPriceRules
+)
+router.put(
+  '/:id/price-rules',
+  Auth,
+  hasPermission('contacts.clients.edit', 'contacts.suppliers.edit'),
+  Suppliers.replaceCustomerPriceRules
+)
+
 /**
  * @openapi
  * /suppliers/{id}:
