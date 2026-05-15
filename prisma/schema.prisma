@@ -122,6 +122,20 @@ enum ContactEntityKind {
   ORGANIZATION
 }
 
+/// Lista = precio base (`products.price`); mayoreo y promoción son columnas opcionales del producto.
+enum PriceTier {
+  LIST
+  WHOLESALE
+  PROMOTION
+}
+
+/// Canal de venta para reglas de precio y auditoría en `sales`.
+enum SalesChannel {
+  POS
+  WHOLESALE
+  ONLINE
+}
+
 model Supplier {
   id                   String                @id @default(uuid()) @db.Uuid
   /// Proveedor (compras / productos) o cliente (maestro de ventas)
@@ -147,10 +161,29 @@ model Supplier {
   incoming_merchandise IncomingMerchandise[]
   deleted              Boolean               @default(false)
   deleted_at           DateTime?
+  /// Precio por defecto si no hay regla `CustomerPriceRule` que aplique (solo clientes).
+  default_price_tier   PriceTier             @default(LIST)
+  customer_price_rules CustomerPriceRule[]
+  linked_sales           Sale[]                @relation("SaleCustomerContact")
 
   /// Listado de contactos: party_type + orden por nombre (reemplaza índice solo party_type)
   @@index([party_type, name], map: "idx_suppliers_party_type_name")
   @@map("suppliers")
+}
+
+/// Reglas de lista de precios por cliente: canal opcional (null = todos) y prioridad descendente.
+model CustomerPriceRule {
+  id          String         @id @default(uuid()) @db.Uuid
+  supplier_id String         @db.Uuid
+  supplier    Supplier       @relation(fields: [supplier_id], references: [id], onDelete: Cascade)
+  channel     SalesChannel?
+  price_tier  PriceTier
+  priority    Int            @default(0)
+  active      Boolean        @default(true)
+  created_at  DateTime       @default(now())
+
+  @@index([supplier_id, active])
+  @@map("customer_price_rules")
 }
 
 /// Varios términos de pago por contacto; exactamente uno con is_default = true (validado en API)
@@ -177,6 +210,9 @@ model Product {
   stock                      Int                       @default(0)
   min_stock                  Int                       @default(0)
   price                      Decimal                   @db.Decimal(12, 2)
+  price_wholesale            Decimal?                  @db.Decimal(12, 2)
+  price_promotion            Decimal?                  @db.Decimal(12, 2)
+  promotion_valid_until      DateTime?
   cost                       Decimal                   @db.Decimal(12, 2)
   image_url                  String?                   @db.VarChar(500)
   supplier_id                String                    @db.Uuid
@@ -317,6 +353,11 @@ model Sale {
   // Usuario que registró la venta
   created_by String? @db.Uuid
   createdBy  User?   @relation("SaleCreatedBy", fields: [created_by], references: [id])
+
+  /// Cliente del maestro (Supplier party_type CUSTOMER), si se eligió en POS.
+  customer_contact_id String?   @db.Uuid
+  customerContact       Supplier? @relation("SaleCustomerContact", fields: [customer_contact_id], references: [id], onDelete: SetNull)
+  sales_channel         SalesChannel @default(POS)
 
   @@index([created_by])
   @@index([cash_register_session_id])

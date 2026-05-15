@@ -19,6 +19,7 @@ const {
   PARTY,
   userHasPerm,
 } = require('../utils/contactsPermissions')
+const { resolvePriceTierForContext, resolveUnitPriceFromProduct, VALID_CHANNELS } = require('../services/priceResolution')
 
 /** Misma forma que GET /sales/:id — reutilizado al responder POST /sales (evita un GET extra en el cliente). */
 const SALE_DETAIL_INCLUDE = {
@@ -303,13 +304,26 @@ exports.create = async (req, res, next) => {
     if (!user || !user.sub) {
       return res.status(401).json({ message: 'Usuario no autenticado' })
     }
-    const { items, admin_authorized_products = [], promotion_codes = [], ...saleData } = req.body
+    const {
+      items,
+      admin_authorized_products = [],
+      promotion_codes = [],
+      customer_contact_id: customerContactIdRaw,
+      sales_channel: salesChannelRaw,
+      ...saleData
+    } = req.body
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ message: 'items es requerido' })
     }
 
     const totalItems = items.reduce((acc, it) => acc + Number(it.qty || 0), 0)
-    const subtotal = items.reduce((acc, it) => acc + Number(it.price || 0) * Number(it.qty || 0), 0)
+
+    const schRaw = salesChannelRaw != null ? String(salesChannelRaw).toUpperCase() : 'POS'
+    const salesChannel = VALID_CHANNELS.has(schRaw) ? schRaw : 'POS'
+    let customerContactId = null
+    if (customerContactIdRaw != null && String(customerContactIdRaw).trim() !== '') {
+      customerContactId = String(customerContactIdRaw).trim()
+    }
 
     // Convertir admin_authorized_products a Set para búsqueda rápida
     const adminAuthorizedSet = new Set(admin_authorized_products || [])
@@ -363,7 +377,16 @@ exports.create = async (req, res, next) => {
       const productIds = Array.from(qtyByProduct.keys())
       const products = await tx.product.findMany({
         where: { id: { in: productIds }, deleted: false },
-        select: { id: true, name: true, stock: true, category_id: true },
+        select: {
+          id: true,
+          name: true,
+          stock: true,
+          category_id: true,
+          price: true,
+          price_wholesale: true,
+          price_promotion: true,
+          promotion_valid_until: true,
+        },
       })
       const prodMap = new Map(products.map(p => [String(p.id), p]))
       // Verifica existencia y stock suficiente por producto (considera cantidades sumadas si hay repetidos)
@@ -389,6 +412,33 @@ exports.create = async (req, res, next) => {
           throw err
         }
       }
+
+      if (customerContactId) {
+        const cust = await tx.supplier.findFirst({
+          where: { id: customerContactId, deleted: false, party_type: 'CUSTOMER' },
+          select: { id: true },
+        })
+        if (!cust) {
+          const err = new Error('Cliente de contacto no encontrado o no es un cliente del maestro')
+          err.status = 400
+          throw err
+        }
+      }
+
+      const priceTier = await resolvePriceTierForContext(tx, {
+        customerContactId,
+        salesChannel,
+      })
+      const priceNow = new Date()
+      const resolvedItems = items.map((it) => {
+        const p = prodMap.get(String(it.product_id))
+        const unit = resolveUnitPriceFromProduct(p, priceTier, priceNow)
+        return { ...it, price: unit }
+      })
+      const subtotal = resolvedItems.reduce(
+        (acc, it) => acc + Number(it.price || 0) * Number(it.qty || 0),
+        0
+      )
 
       // 2) Procesar códigos de promoción
       let discountTotal = 0
@@ -423,7 +473,7 @@ exports.create = async (req, res, next) => {
         const { applyMultiplePromotions } = require('../services/promotionCalculator')
         const now = new Date()
 
-        const itemsWithCategory = items.map((it) => ({
+        const itemsWithCategory = resolvedItems.map((it) => ({
           ...it,
           category_id: prodMap.get(String(it.product_id))?.category_id,
         }))
@@ -585,7 +635,14 @@ exports.create = async (req, res, next) => {
 
       const sale = await tx.sale.create({
         data: {
-          ...saleData,
+          customer: saleData.customer,
+          customer_nit: saleData.customer_nit,
+          is_final_consumer: saleData.is_final_consumer,
+          payment_method_id: saleData.payment_method_id,
+          amount_received: saleData.amount_received,
+          change: saleData.change,
+          customer_contact_id: customerContactId || undefined,
+          sales_channel: salesChannel,
           reference: nextRef,
           date: saleDate,
           sold_at: saleDate,  // Establecer sold_at explícitamente en hora de Guatemala
@@ -602,7 +659,7 @@ exports.create = async (req, res, next) => {
       })
 
       await tx.saleItem.createMany({
-        data: items.map(it => ({
+        data: resolvedItems.map(it => ({
           sale_id: sale.id,
           product_id: it.product_id,
           price: it.price,
@@ -612,7 +669,7 @@ exports.create = async (req, res, next) => {
 
       // Descontar stock al registrar venta: un solo UPDATE por lote (rápido con muchos ítems)
       const productQtyMap = new Map()
-      items.forEach(it => {
+      resolvedItems.forEach(it => {
         const pid = it.product_id
         const q = Number(it.qty || 0)
         productQtyMap.set(pid, (productQtyMap.get(pid) || 0) + q)
