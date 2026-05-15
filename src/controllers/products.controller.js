@@ -227,13 +227,56 @@ exports.update = async (req, res, next) => {
     const safePayload = {}
     
     // Copiar solo los campos permitidos y necesarios
-    const allowedFields = ['name', 'brand', 'size', 'stock', 'min_stock', 'price', 'cost', 'barcode', 'description', 'image_url', 'category_id', 'supplier_id', 'status_id']
+    const allowedFields = [
+      'name',
+      'brand',
+      'size',
+      'stock',
+      'min_stock',
+      'price',
+      'cost',
+      'price_wholesale',
+      'price_promotion',
+      'promotion_valid_until',
+      'barcode',
+      'description',
+      'image_url',
+      'category_id',
+      'supplier_id',
+      'status_id',
+    ]
     for (const field of allowedFields) {
       if (payload[field] !== undefined) {
         safePayload[field] = payload[field]
       }
     }
-    
+
+    // Opcionales: mayoreo / promoción (null borra en BD)
+    for (const decField of ['price_wholesale', 'price_promotion']) {
+      if (safePayload[decField] === undefined) continue
+      if (safePayload[decField] === null || safePayload[decField] === '') {
+        safePayload[decField] = null
+        continue
+      }
+      const n = Number(safePayload[decField])
+      if (!Number.isFinite(n) || n < 0) {
+        return res.status(400).json({ message: `${decField} debe ser un número válido >= 0` })
+      }
+      safePayload[decField] = n
+    }
+
+    if (safePayload.promotion_valid_until !== undefined) {
+      if (safePayload.promotion_valid_until === null || safePayload.promotion_valid_until === '') {
+        safePayload.promotion_valid_until = null
+      } else {
+        const d = new Date(safePayload.promotion_valid_until)
+        if (Number.isNaN(d.getTime())) {
+          return res.status(400).json({ message: 'promotion_valid_until no es una fecha válida' })
+        }
+        safePayload.promotion_valid_until = d
+      }
+    }
+
     // Remover image_url si está vacío
     if (safePayload.image_url === '' || safePayload.image_url === null) {
       delete safePayload.image_url
@@ -360,7 +403,7 @@ exports.reportPdf = async (req, res, next) => {
 
     // Optional columns from query (e.g. ?fields=name,category,price,stock for cotización)
     const fieldsParam = req.query.fields
-    const allowedFields = ['name', 'category', 'brand', 'size', 'barcode', 'price', 'cost', 'stock', 'min_stock', 'supplier', 'status', 'description']
+    const allowedFields = ['name', 'category', 'brand', 'size', 'barcode', 'price', 'price_wholesale', 'price_promotion', 'cost', 'stock', 'min_stock', 'supplier', 'status', 'description']
     const fields = fieldsParam
       ? String(fieldsParam).split(',').map((f) => f.trim().toLowerCase()).filter((f) => allowedFields.includes(f))
       : null
@@ -371,6 +414,7 @@ exports.reportPdf = async (req, res, next) => {
       (String(includeSummaryParam).toLowerCase() === 'true') || (String(includeSummaryParam) === '1')
 
     const getCellValue = (p, key) => {
+      const now = new Date()
       switch (key) {
         case 'name': return p.name || '-'
         case 'category': return p.category?.name || 'Sin categoría'
@@ -378,6 +422,21 @@ exports.reportPdf = async (req, res, next) => {
         case 'size': return p.size || '-'
         case 'barcode': return p.barcode || '-'
         case 'price': return money(p.price)
+        case 'price_wholesale': {
+          const v = p.price_wholesale != null ? Number(p.price_wholesale) : NaN
+          return Number.isFinite(v) && v > 0 ? money(v) : '—'
+        }
+        case 'price_promotion': {
+          const v = p.price_promotion != null ? Number(p.price_promotion) : NaN
+          if (!Number.isFinite(v) || v <= 0) return '—'
+          const until = p.promotion_valid_until
+          if (!until) return money(v)
+          const d = new Date(until)
+          const ds = d.toLocaleDateString('es-GT', { day: '2-digit', month: 'short', year: 'numeric' })
+          if (Number.isNaN(d.getTime())) return money(v)
+          if (d < now) return `${money(v)} (vencida)`
+          return `${money(v)} (hasta ${ds})`
+        }
         case 'cost': return money(p.cost)
         case 'stock': return String(Number(p.stock || 0))
         case 'min_stock': return String(Number(p.min_stock || 0))
@@ -387,7 +446,22 @@ exports.reportPdf = async (req, res, next) => {
         default: return '-'
       }
     }
-    const headers = { name: 'Nombre', category: 'Categoría', brand: 'Marca', size: 'Tamaño', barcode: 'Código', price: 'Precio', cost: 'Costo', stock: 'Stock', min_stock: 'Mín.', supplier: 'Proveedor', status: 'Estado', description: 'Descripción' }
+    const headers = {
+      name: 'Nombre',
+      category: 'Categoría',
+      brand: 'Marca',
+      size: 'Tamaño',
+      barcode: 'Código',
+      price: 'Precio lista',
+      price_wholesale: 'Mayoreo',
+      price_promotion: 'Promoción',
+      cost: 'Costo',
+      stock: 'Stock',
+      min_stock: 'Mín.',
+      supplier: 'Proveedor',
+      status: 'Estado',
+      description: 'Descripción',
+    }
 
     // Header block
     doc.fillColor('#0b1220').fontSize(22).font('Helvetica-Bold').text(`${companyName} - Informe de Productos`, { align: 'left' })
@@ -486,7 +560,7 @@ exports.reportPdf = async (req, res, next) => {
         doc.rect(doc.page.margins.left, tableY, pageWidth, rowHeight).fill(rowBg).stroke(borderColor)
         doc.fillColor('#374151').font('Helvetica')
         let cellX = doc.page.margins.left
-        const rightAlignKeys = ['price', 'cost', 'stock', 'min_stock']
+        const rightAlignKeys = ['price', 'cost', 'price_wholesale', 'stock', 'min_stock']
         for (let c = 0; c < values.length; c++) {
           const cellW = colWidth - cellPadding * 2
           const val = String(values[c] ?? '-')
@@ -504,7 +578,7 @@ exports.reportPdf = async (req, res, next) => {
     const cols = 2
     const gap = 12
     const cardWidth = (pageWidth - gap) / cols
-    const cardHeight = 120
+    const cardHeight = 148
 
     // start x at left page margin
     let x = doc.page.margins.left
@@ -564,6 +638,25 @@ exports.reportPdf = async (req, res, next) => {
 
       // Cost small under price box
       doc.fillColor('#94a3b8').font('Helvetica').fontSize(9).text(`Costo: ${money(p.cost)}`, priceX + 8, priceY + 34, { width: priceBoxW - 16 })
+
+      let lineY = priceY + 50
+      const wholesale = p.price_wholesale != null ? Number(p.price_wholesale) : NaN
+      if (Number.isFinite(wholesale) && wholesale > 0) {
+        doc.fillColor('#64748b').font('Helvetica').fontSize(8).text(`Mayoreo: ${money(wholesale)}`, priceX + 6, lineY, { width: priceBoxW - 12 })
+        lineY += 11
+      }
+      const promo = p.price_promotion != null ? Number(p.price_promotion) : NaN
+      if (Number.isFinite(promo) && promo > 0) {
+        let promoText = `Promo: ${money(promo)}`
+        if (p.promotion_valid_until) {
+          const d = new Date(p.promotion_valid_until)
+          if (!Number.isNaN(d.getTime())) {
+            const ds = d.toLocaleDateString('es-GT', { day: '2-digit', month: 'short', year: 'numeric' })
+            promoText += d < new Date() ? ` · vencida (${ds})` : ` · hasta ${ds}`
+          }
+        }
+        doc.fillColor('#64748b').font('Helvetica').fontSize(8).text(promoText, priceX + 6, lineY, { width: priceBoxW - 12, lineGap: 1 })
+      }
 
       // Stock
       const stockText = `Stock: ${Number(p.stock || 0)}`
@@ -630,10 +723,11 @@ exports.critical = async (req, res, next) => {
   } catch (e) { next(e) }
 }
 
-// Register incoming merchandise endpoint: body { supplier_id: string, items: [{ product_id: string, quantity: number, unit_cost: number }], notes?: string }
+// Register incoming merchandise endpoint: body { supplier_id, items, notes?, payment_term_id?, payment_status?, paid_at?, payment_reference?, due_date? }
 exports.registerIncomingMerchandise = async (req, res, next) => {
   try {
-    const { supplier_id, items, notes } = req.body || {}
+    const body = req.body || {}
+    const { supplier_id, items, notes } = body
     const user = req.user
     if (!user || !user.sub) {
       return res.status(401).json({ message: 'Usuario no autenticado' })
@@ -669,10 +763,81 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
       nowGt.millisecond
     ))
 
+    const payment_status = body.payment_status === 'PAID' ? 'PAID' : 'PENDING'
+    let payment_term_id = null
+    if (body.payment_term_id != null && body.payment_term_id !== '') {
+      const pid = Number(body.payment_term_id)
+      if (!Number.isFinite(pid)) {
+        return res.status(400).json({ message: 'payment_term_id inválido' })
+      }
+      payment_term_id = pid
+    }
+
+    let payment_reference = body.payment_reference != null ? String(body.payment_reference).trim() : ''
+    if (payment_reference.length > 255) {
+      payment_reference = payment_reference.slice(0, 255)
+    }
+
+    let due_date = null
+    if (body.due_date != null && body.due_date !== '') {
+      const d = new Date(body.due_date)
+      if (Number.isNaN(d.getTime())) {
+        return res.status(400).json({ message: 'due_date inválida' })
+      }
+      due_date = d
+    }
+
+    let paid_at = null
+    if (payment_status === 'PAID') {
+      if (body.paid_at != null && body.paid_at !== '') {
+        const p = new Date(body.paid_at)
+        if (Number.isNaN(p.getTime())) {
+          return res.status(400).json({ message: 'paid_at inválido' })
+        }
+        paid_at = p
+      } else {
+        paid_at = dateAsUtcWithGtClock
+      }
+    }
+
+    const supplierWithTerms = await prisma.supplier.findUnique({
+      where: { id: supplier_id },
+      include: { supplier_payment_terms: true },
+    })
+    if (!supplierWithTerms || supplierWithTerms.deleted) {
+      return res.status(400).json({ message: 'Proveedor no encontrado' })
+    }
+
+    const allowedTermIds = new Set(
+      (supplierWithTerms.supplier_payment_terms || []).map((l) => l.payment_term_id)
+    )
+    if (allowedTermIds.size > 0) {
+      if (payment_term_id == null) {
+        return res.status(400).json({ message: 'Debe seleccionar un término de pago para este proveedor' })
+      }
+      if (!allowedTermIds.has(payment_term_id)) {
+        return res.status(400).json({ message: 'El término de pago no corresponde a este proveedor' })
+      }
+    } else if (payment_term_id != null) {
+      return res.status(400).json({
+        message: 'Este proveedor no tiene términos de pago configurados; no envíe payment_term_id',
+      })
+    }
+
+    if (!due_date && payment_term_id != null) {
+      const ptRow = await prisma.paymentTerm.findUnique({ where: { id: payment_term_id } })
+      const nd = ptRow?.net_days != null ? Number(ptRow.net_days) : null
+      if (nd != null && Number.isFinite(nd) && nd >= 0) {
+        const d = new Date(dateAsUtcWithGtClock)
+        d.setUTCDate(d.getUTCDate() + Math.floor(nd))
+        due_date = d
+      }
+    }
+
     // Run in transaction: create audit record, update products, create purchase logs, update supplier
     // Use prismaTransaction (DIRECT_URL) for transactions as pooled connections don't support them
     const result = await prismaTransaction.$transaction(async (tx) => {
-      // Verify supplier exists
+      // Verify supplier still exists
       const supplier = await tx.supplier.findUnique({ where: { id: supplier_id } })
       if (!supplier || supplier.deleted) {
         throw new Error('Proveedor no encontrado')
@@ -705,7 +870,14 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
           registered_by,
           date: dateAsUtcWithGtClock,
           notes: notes || null,
-        }
+          payment_term_id,
+          payment_status,
+          paid_at,
+          payment_reference: payment_reference || null,
+          due_date,
+          payment_updated_by: registered_by,
+          payment_updated_at: dateAsUtcWithGtClock,
+        },
       })
 
       // Process each item
@@ -1051,6 +1223,56 @@ exports.validateImportMapped = async (req, res, next) => {
       skippedRows: validation.skippedRows,
       catalogs: validation.catalogs,
     })
+  } catch (e) {
+    next(e)
+  }
+}
+
+/**
+ * POST /api/products/pricing-preview
+ * Precio unitario por producto según cliente/canal (misma lógica que al registrar la venta).
+ */
+exports.pricingPreview = async (req, res, next) => {
+  try {
+    const { customer_contact_id: customerContactIdRaw, sales_channel: salesChannelRaw, product_ids: productIdsRaw } =
+      req.body || {}
+    const { resolvePriceTierForContext, resolveUnitPriceFromProduct, VALID_CHANNELS } = require('../services/priceResolution')
+
+    const schRaw = salesChannelRaw != null ? String(salesChannelRaw).toUpperCase() : 'POS'
+    const salesChannel = VALID_CHANNELS.has(schRaw) ? schRaw : 'POS'
+    let customerContactId = null
+    if (customerContactIdRaw != null && String(customerContactIdRaw).trim() !== '') {
+      customerContactId = String(customerContactIdRaw).trim()
+    }
+
+    const ids = Array.isArray(productIdsRaw)
+      ? [...new Set(productIdsRaw.map((x) => String(x)).filter(Boolean))]
+      : []
+
+    const tier = await resolvePriceTierForContext(prisma, {
+      customerContactId,
+      salesChannel,
+    })
+
+    if (ids.length === 0) {
+      return res.json({ price_tier_used: tier, sales_channel: salesChannel, unit_prices: {} })
+    }
+
+    const products = await prisma.product.findMany({
+      where: { id: { in: ids }, deleted: false },
+      select: {
+        id: true,
+        price: true,
+        price_wholesale: true,
+        price_promotion: true,
+        promotion_valid_until: true,
+      },
+    })
+    const now = new Date()
+    const unit_prices = Object.fromEntries(
+      products.map((p) => [String(p.id), resolveUnitPriceFromProduct(p, tier, now)])
+    )
+    res.json({ price_tier_used: tier, sales_channel: salesChannel, unit_prices })
   } catch (e) {
     next(e)
   }

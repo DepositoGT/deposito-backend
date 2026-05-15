@@ -86,10 +86,11 @@ exports.calculateTheoretical = async (req, res, next) => {
     const startDate = req.query.startDate || req.query.start_date
     const endDate = req.query.endDate || req.query.end_date
     const cashierId = req.query.cashier_id || req.query.cashierId || null
-
-    if (!startDate || !endDate) {
-      return res.status(400).json({ message: 'startDate y endDate son requeridos' })
-    }
+    const cashRegisterSessionIdRaw =
+      req.query.cash_register_session_id || req.query.cashRegisterSessionId || null
+    const cashRegisterSessionId = cashRegisterSessionIdRaw
+      ? String(cashRegisterSessionIdRaw).trim()
+      : null
 
     // Permiso según tipo de cierre: día (sin cashier_id) vs propio (con cashier_id)
     const isOwn = !!cashierId
@@ -101,30 +102,68 @@ exports.calculateTheoretical = async (req, res, next) => {
       return res.status(403).json({ message: 'Solo puede generar el cierre de su propia caja' })
     }
 
+    const isAdminRole = String(req.user?.role?.name || req.user?.role_name || '').toLowerCase() === 'admin'
+
     const tz = await getTimezone(prisma)
-    // Parsear fechas en zona horaria configurada
-    // Si las fechas vienen sin Z, las tratamos como hora local
-    let start, end;
-    
-    if (startDate.includes('Z')) {
-      start = DateTime.fromISO(startDate, { zone: 'utc' }).setZone(tz).toJSDate();
-      end = DateTime.fromISO(endDate, { zone: 'utc' }).setZone(tz).toJSDate();
+    let start
+    let end
+
+    if (isOwn) {
+      if (!cashRegisterSessionId) {
+        return res.status(400).json({
+          message:
+            'Para «mi cierre» debe enviar cash_register_session_id (turno ya cerrado en «Nueva venta», pendiente de arqueo).'
+        })
+      }
+      const sess = await prisma.cashRegisterSession.findFirst({
+        where: { id: cashRegisterSessionId }
+      })
+      if (!sess) {
+        return res.status(400).json({ message: 'Sesión de caja no encontrada' })
+      }
+      if (!isAdminRole && String(sess.opened_by_id) !== String(cashierId)) {
+        return res.status(403).json({ message: 'La sesión no corresponde a su turno de caja' })
+      }
+      if (sess.status !== 'CLOSED') {
+        return res.status(400).json({
+          message:
+            'El turno debe estar cerrado en «Nueva venta» (fin de turno) antes de calcular el cierre. Mientras la caja siga abierta no se puede arquear.'
+        })
+      }
+      if (sess.cash_closure_id) {
+        return res.status(400).json({ message: 'Este turno de caja ya tiene un cierre de caja registrado.' })
+      }
+      if (!sess.closed_at) {
+        return res.status(400).json({ message: 'La sesión no tiene fecha de cierre; no se puede calcular.' })
+      }
+      // Fuente de verdad: horas del turno en BD (evita desajuste con sold_at vs strings del formulario)
+      start = sess.opened_at
+      end = sess.closed_at
     } else {
-      start = DateTime.fromISO(startDate, { zone: tz }).toJSDate();
-      end = DateTime.fromISO(endDate, { zone: tz }).toJSDate();
+      if (!startDate || !endDate) {
+        return res.status(400).json({ message: 'startDate y endDate son requeridos' })
+      }
+      if (startDate.includes('Z')) {
+        start = DateTime.fromISO(startDate, { zone: 'utc' }).setZone(tz).toJSDate()
+        end = DateTime.fromISO(endDate, { zone: 'utc' }).setZone(tz).toJSDate()
+      } else {
+        start = DateTime.fromISO(startDate, { zone: tz }).toJSDate()
+        end = DateTime.fromISO(endDate, { zone: tz }).toJSDate()
+      }
     }
-    
-    // Validar que las fechas sean válidas
+
     if (!start || !end || isNaN(start.getTime()) || isNaN(end.getTime())) {
       return res.status(400).json({ message: 'Fechas inválidas' })
     }
-    
+
     console.log('Calculando cierre para período:', {
-      startDate,
-      endDate,
+      startDate: startDate || '(sesión)',
+      endDate: endDate || '(sesión)',
       cashier_id: cashierId || '(todos)',
+      cash_register_session_id: cashRegisterSessionId || '(n/a)',
       start: start.toISOString(),
-      end: end.toISOString()
+      end: end.toISOString(),
+      own_closure: isOwn
     })
 
     // Obtener estado "Completada"
@@ -132,12 +171,42 @@ exports.calculateTheoretical = async (req, res, next) => {
       where: { name: 'Completada' }
     })
 
-    const salesWhere = {
-      sold_at: { gte: start, lte: end },
-      status_id: completedStatus?.id
+    const periodOr = {
+      OR: [
+        { sold_at: { gte: start, lte: end } },
+        { date: { gte: start, lte: end } }
+      ]
     }
-    if (cashierId) {
-      salesWhere.created_by = cashierId
+
+    /**
+     * Mi cierre con sesión: NO filtrar por sold_at/date entre opened_at y closed_at.
+     * Las ventas guardan sold_at con convención «hora local como UTC» (sales.controller);
+     * la sesión usa timestamps UTC reales → el rango excluye todas las ventas del turno.
+     * Basta cash_register_session_id = turno. Legado: sin sesión, sí período + created_by.
+     */
+    let salesWhere
+    if (isOwn && cashRegisterSessionId) {
+      salesWhere = {
+        status_id: completedStatus?.id,
+        OR: [
+          { cash_register_session_id: cashRegisterSessionId },
+          {
+            AND: [
+              { cash_register_session_id: null },
+              ...(cashierId ? [{ created_by: String(cashierId) }] : []),
+              periodOr
+            ]
+          }
+        ]
+      }
+    } else {
+      salesWhere = {
+        status_id: completedStatus?.id,
+        ...periodOr
+      }
+      if (cashierId) {
+        salesWhere.created_by = String(cashierId)
+      }
     }
 
     // Obtener ventas completadas en el período (opcionalmente filtradas por cajero)
@@ -252,7 +321,8 @@ exports.create = async (req, res, next) => {
       averageTicket,
       paymentBreakdowns,  // Array de { payment_method_id, theoretical_amount, theoretical_count, actual_amount, actual_count, notes }
       denominations,      // Array de { denomination, type, quantity }
-      notes
+      notes,
+      cash_register_session_id: cashRegisterSessionIdBody
     } = req.body
     const authUser = req.user
 
@@ -313,94 +383,170 @@ exports.create = async (req, res, next) => {
       dateLocal: nowLocal.toFormat('yyyy-MM-dd HH:mm:ss')
     });
 
-    const cashierUuid = cashierId || authUser?.sub || null
+    const cashierUuidStored = isOwnClosure ? (cashierId ? String(cashierId) : authUser?.sub || null) : null
     const supervisorUuid = supervisorId || null
+    const rawSession = cashRegisterSessionIdBody ?? req.body.cashRegisterSessionId ?? null
+    const cashRegisterSessionId = rawSession ? String(rawSession).trim() : null
 
-    // Crear cierre de caja
-    const cashClosure = await prisma.cashClosure.create({
-      data: {
-        date: dateUTC,
-        start_date: startDateUTC,
-        end_date: endDateUTC,
-        cashier_name: cashierName,
-        cashier_signature: cashierSignature || null,
-        cashier_id: cashierUuid || undefined,
-        supervisor_name: supervisorName || null,
-        supervisor_signature: supervisorSignature || null,
-        supervisor_validated_at: supervisorSignature ? dateUTC : null,
-        supervisor_id: supervisorUuid || undefined,
-        theoretical_total: theoreticalTotal,
-        theoretical_sales: theoreticalSales,
-        theoretical_returns: theoreticalReturns,
-        actual_total: actualTotal,
-        difference: difference,
-        difference_percentage: Number(differencePercentage.toFixed(2)),
-        total_transactions: totalTransactions,
-        total_customers: totalCustomers,
-        average_ticket: averageTicket,
-        notes: notes || null,
-        status: 'Pendiente'
-      }
-    })
-
-    // Crear desglose por método de pago
-    if (paymentBreakdowns && paymentBreakdowns.length > 0) {
-      for (const breakdown of paymentBreakdowns) {
-        const methodDiff = number(breakdown.actual_amount) - number(breakdown.theoretical_amount)
-        
-        await prisma.cashClosurePayment.create({
-          data: {
-            cash_closure_id: cashClosure.id,
-            payment_method_id: breakdown.payment_method_id,
-            theoretical_amount: breakdown.theoretical_amount,
-            theoretical_count: breakdown.theoretical_count,
-            actual_amount: breakdown.actual_amount,
-            actual_count: breakdown.actual_count || null,
-            difference: methodDiff,
-            notes: breakdown.notes || null
-          }
-        })
-      }
+    if (isOwnClosure && !cashRegisterSessionId) {
+      return res.status(400).json({
+        message: 'El cierre por cajero debe incluir cash_register_session_id (turno cerrado en «Nueva venta», pendiente de arqueo).'
+      })
     }
 
-    // Crear conteo de denominaciones
-    if (denominations && denominations.length > 0) {
-      for (const denom of denominations) {
-        if (denom.quantity > 0) {
-          const subtotal = number(denom.denomination) * denom.quantity
-          
-          await prisma.cashClosureDenomination.create({
+    const createdClosure = await prisma.$transaction(async (tx) => {
+      let sessionToCloseOnSave = null
+      if (cashRegisterSessionId) {
+        const sess = await tx.cashRegisterSession.findFirst({
+          where: { id: cashRegisterSessionId }
+        })
+        if (!sess) {
+          throw new Error('INVALID_SESSION')
+        }
+
+        if (isOwnClosure) {
+          if (cashierId && String(sess.opened_by_id) !== String(cashierId)) {
+            const adminCloser = String(authUser?.role?.name || authUser?.role_name || '').toLowerCase() === 'admin'
+            if (!adminCloser) throw new Error('SESSION_NOT_YOURS')
+          }
+          if (sess.status !== 'CLOSED') {
+            throw new Error('SESSION_NOT_CLOSED')
+          }
+          if (sess.cash_closure_id) {
+            throw new Error('SESSION_ALREADY_LINKED')
+          }
+        } else if (sess.status === 'OPEN') {
+          sessionToCloseOnSave = sess
+        }
+      }
+
+      const cashClosure = await tx.cashClosure.create({
+        data: {
+          date: dateUTC,
+          start_date: startDateUTC,
+          end_date: endDateUTC,
+          cashier_name: cashierName,
+          cashier_signature: cashierSignature || null,
+          cashier_id: cashierUuidStored || undefined,
+          supervisor_name: supervisorName || null,
+          supervisor_signature: supervisorSignature || null,
+          supervisor_validated_at: supervisorSignature ? dateUTC : null,
+          supervisor_id: supervisorUuid || undefined,
+          theoretical_total: theoreticalTotal,
+          theoretical_sales: theoreticalSales,
+          theoretical_returns: theoreticalReturns,
+          actual_total: actualTotal,
+          difference: difference,
+          difference_percentage: Number(differencePercentage.toFixed(2)),
+          total_transactions: totalTransactions,
+          total_customers: totalCustomers,
+          average_ticket: averageTicket,
+          notes: notes || null,
+          status: 'Pendiente'
+        }
+      })
+
+      if (paymentBreakdowns && paymentBreakdowns.length > 0) {
+        for (const breakdown of paymentBreakdowns) {
+          const methodDiff = number(breakdown.actual_amount) - number(breakdown.theoretical_amount)
+
+          await tx.cashClosurePayment.create({
             data: {
               cash_closure_id: cashClosure.id,
-              denomination: denom.denomination,
-              type: denom.type,
-              quantity: denom.quantity,
-              subtotal: subtotal
+              payment_method_id: breakdown.payment_method_id,
+              theoretical_amount: breakdown.theoretical_amount,
+              theoretical_count: breakdown.theoretical_count,
+              actual_amount: breakdown.actual_amount,
+              actual_count: breakdown.actual_count || null,
+              difference: methodDiff,
+              notes: breakdown.notes || null
             }
           })
         }
       }
-    }
 
-    // Devolver cierre creado con relaciones
-    const createdClosure = await prisma.cashClosure.findUnique({
-      where: { id: cashClosure.id },
-      include: {
-        payment_breakdowns: {
-          include: {
-            payment_method: true
-          }
-        },
-        denominations: {
-          orderBy: {
-            denomination: 'desc'
+      if (denominations && denominations.length > 0) {
+        for (const denom of denominations) {
+          if (denom.quantity > 0) {
+            const subtotal = number(denom.denomination) * denom.quantity
+
+            await tx.cashClosureDenomination.create({
+              data: {
+                cash_closure_id: cashClosure.id,
+                denomination: denom.denomination,
+                type: denom.type,
+                quantity: denom.quantity,
+                subtotal: subtotal
+              }
+            })
           }
         }
       }
+
+      if (cashRegisterSessionId) {
+        if (isOwnClosure) {
+          const linked = await tx.cashRegisterSession.updateMany({
+            where: { id: cashRegisterSessionId, status: 'CLOSED', cash_closure_id: null },
+            data: { cash_closure_id: cashClosure.id }
+          })
+          if (linked.count !== 1) {
+            throw new Error('SESSION_RACE')
+          }
+        } else if (sessionToCloseOnSave) {
+          const upd = await tx.cashRegisterSession.updateMany({
+            where: { id: cashRegisterSessionId, status: 'OPEN' },
+            data: {
+              status: 'CLOSED',
+              closed_at: dateUTC,
+              closed_by_id: authUser.sub,
+              cash_closure_id: cashClosure.id
+            }
+          })
+          if (upd.count !== 1) {
+            throw new Error('SESSION_RACE')
+          }
+        }
+      }
+
+      return tx.cashClosure.findUnique({
+        where: { id: cashClosure.id },
+        include: {
+          payment_breakdowns: {
+            include: {
+              payment_method: true
+            }
+          },
+          denominations: {
+            orderBy: {
+              denomination: 'desc'
+            }
+          }
+        }
+      })
     })
 
     res.status(201).json(createdClosure)
   } catch (e) {
+    if (e.message === 'SESSION_NOT_YOURS') {
+      return res.status(403).json({ message: 'La sesión de caja no corresponde a este cajero.' })
+    }
+    if (e.message === 'INVALID_SESSION') {
+      return res.status(400).json({
+        message: 'Sesión de caja inválida. Actualice la página y vuelva a intentar.'
+      })
+    }
+    if (e.message === 'SESSION_NOT_CLOSED') {
+      return res.status(400).json({
+        message:
+          'El turno debe estar cerrado en «Nueva venta» antes de guardar el cierre. Mientras la caja siga abierta no se registra el arqueo.'
+      })
+    }
+    if (e.message === 'SESSION_ALREADY_LINKED') {
+      return res.status(400).json({ message: 'Este turno de caja ya tiene un cierre registrado.' })
+    }
+    if (e.message === 'SESSION_RACE') {
+      return res.status(409).json({ message: 'La sesión de caja ya fue cerrada por otro proceso.' })
+    }
     next(e)
   }
 }
