@@ -12,6 +12,154 @@ function userId(req) {
   return req.user?.sub || req.user?.id
 }
 
+const MIN_REASON_LEN = 5
+
+/** Transacciones interactivas: el default de Prisma (~5s) puede fallar con P2028 al aplicar muchas líneas. */
+const INVENTORY_APPROVE_TX_OPTIONS = { maxWait: 15_000, timeout: 120_000 }
+
+function sanitizeScope(raw) {
+  if (!raw || typeof raw !== 'object') return {}
+  const out = {}
+  if (Array.isArray(raw.categoryIds) && raw.categoryIds.length) {
+    out.categoryIds = raw.categoryIds.map((x) => Number(x)).filter((x) => Number.isFinite(x))
+  }
+  if (Array.isArray(raw.supplierIds) && raw.supplierIds.length) {
+    out.supplierIds = raw.supplierIds.map(String).filter(Boolean)
+  }
+  if (Array.isArray(raw.abcClasses) && raw.abcClasses.length) {
+    const allowed = new Set(['A', 'B', 'C'])
+    out.abcClasses = [
+      ...new Set(
+        raw.abcClasses.map((x) => String(x).toUpperCase()).filter((x) => allowed.has(x))
+      ),
+    ]
+    if (out.abcClasses.length === 0) delete out.abcClasses
+  }
+  const sp = Number(raw.samplePercent)
+  if (Number.isFinite(sp) && sp > 0 && sp < 100) {
+    out.samplePercent = Math.round(sp)
+  }
+  if (raw.doubleCount === true) out.doubleCount = true
+  return out
+}
+
+function scopeDoubleCount(scope) {
+  return Boolean(scope && typeof scope === 'object' && scope.doubleCount === true)
+}
+
+function scopeSamplePercent(scope) {
+  if (!scope || typeof scope !== 'object') return null
+  const n = Number(scope.samplePercent)
+  if (!Number.isFinite(n) || n <= 0 || n >= 100) return null
+  return Math.round(n)
+}
+
+function scopeAbcClasses(scope) {
+  if (!scope || typeof scope !== 'object' || !Array.isArray(scope.abcClasses)) return null
+  const allowed = new Set(['A', 'B', 'C'])
+  const out = [...new Set(scope.abcClasses.map((x) => String(x).toUpperCase()).filter((x) => allowed.has(x)))]
+  return out.length ? out : null
+}
+
+function assignAbcByInventoryValue(rows) {
+  const enriched = rows.map((r) => ({
+    id: r.id,
+    stock: r.stock,
+    cost: r.cost,
+    category_id: r.category_id,
+    value: Math.max(0, Number(r.stock) || 0) * Number(r.cost || 0),
+  }))
+  const sorted = [...enriched].sort((a, b) => b.value - a.value)
+  const totalVal = sorted.reduce((s, r) => s + r.value, 0)
+  if (totalVal <= 0) {
+    const n = sorted.length
+    if (!n) return []
+    const iA = Math.max(1, Math.ceil(n / 3))
+    const iB = Math.max(iA + 1, Math.ceil((2 * n) / 3))
+    return sorted.map((r, i) => ({
+      id: r.id,
+      stock: r.stock,
+      cost: r.cost,
+      category_id: r.category_id,
+      abc: i < iA ? 'A' : i < iB ? 'B' : 'C',
+    }))
+  }
+  let cum = 0
+  return sorted.map((r) => {
+    cum += r.value
+    const pct = (100 * cum) / totalVal
+    const abc = pct <= 80 ? 'A' : pct <= 95 ? 'B' : 'C'
+    return {
+      id: r.id,
+      stock: r.stock,
+      cost: r.cost,
+      category_id: r.category_id,
+      abc,
+    }
+  })
+}
+
+function mulberry32(a) {
+  return function mul() {
+    let t = (a += 0x6d2b79f5)
+    t = Math.imul(t ^ (t >>> 15), t | 1)
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+
+function hashSeed(str) {
+  let h = 2166136261
+  for (let i = 0; i < str.length; i += 1) {
+    h = Math.imul(h ^ str.charCodeAt(i), 16777619)
+  }
+  return h >>> 0
+}
+
+function seededShuffleIds(ids, seedStr) {
+  const rnd = mulberry32(hashSeed(seedStr))
+  const a = [...ids]
+  for (let i = a.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(rnd() * (i + 1))
+    const t = a[i]
+    a[i] = a[j]
+    a[j] = t
+  }
+  return a
+}
+
+async function resolveProductsForCountStart(session) {
+  const scope = session.scope_json || {}
+  const where = buildProductWhereFromScope(scope)
+  const rows = await prisma.product.findMany({
+    where,
+    select: { id: true, stock: true, cost: true, category_id: true },
+  })
+  let list = rows
+  const abc = scopeAbcClasses(scope)
+  if (abc) {
+    const tagged = assignAbcByInventoryValue(list)
+    const allow = new Set(abc)
+    list = tagged.filter((t) => allow.has(t.abc)).map((t) => ({
+      id: t.id,
+      stock: t.stock,
+      cost: t.cost,
+      category_id: t.category_id,
+    }))
+  }
+  const pct = scopeSamplePercent(scope)
+  if (pct != null && list.length > 0) {
+    const shuffled = seededShuffleIds(
+      list.map((p) => p.id),
+      session.id
+    )
+    const k = Math.max(1, Math.ceil((list.length * pct) / 100))
+    const pick = new Set(shuffled.slice(0, k))
+    list = list.filter((p) => pick.has(p.id))
+  }
+  return list.map((p) => ({ id: p.id, stock: p.stock }))
+}
+
 function buildProductWhereFromScope(scope) {
   const s = scope && typeof scope === 'object' ? scope : {}
   const where = { deleted: false }
@@ -29,7 +177,7 @@ function buildProductWhereFromScope(scope) {
 async function assertNoBlockingSession(exceptId) {
   const blocking = await prisma.inventoryCountSession.findFirst({
     where: {
-      status: { in: ['IN_PROGRESS', 'IN_REVIEW'] },
+      status: { in: ['IN_PROGRESS', 'IN_REVIEW', 'PENDING_SECOND_APPROVAL'] },
       ...(exceptId ? { id: { not: exceptId } } : {}),
     },
     select: { id: true, name: true, status: true },
@@ -43,9 +191,45 @@ async function assertNoBlockingSession(exceptId) {
   }
 }
 
+/**
+ * Aplica qty_counted al stock de productos dentro de una transacción.
+ * @returns {Promise<string[]>} IDs de productos afectados
+ */
+async function applyStockTransaction(tx, sessionId) {
+  const lines = await tx.inventoryCountLine.findMany({
+    where: { session_id: sessionId, qty_counted: { not: null } },
+    include: { product: { select: { min_stock: true } } },
+  })
+  const statuses = await tx.stockStatus.findMany()
+  const byName = Object.fromEntries(statuses.map((s) => [s.name, s.id]))
+  const idDisponible = byName.Disponible
+  const idBajo = byName.Bajo
+  const idAgotado = byName.Agotado
+  if (!idDisponible) {
+    const err = new Error('Catálogo stock_statuses incompleto (falta Disponible)')
+    err.statusCode = 500
+    throw err
+  }
+  await Promise.all(
+    lines.map((L) => {
+      const stock = L.qty_counted
+      const minStock = Number(L.product.min_stock) || 0
+      let status_id = idDisponible
+      if (stock === 0 && idAgotado) status_id = idAgotado
+      else if (stock < minStock && idBajo) status_id = idBajo
+      return tx.product.update({
+        where: { id: L.product_id },
+        data: { stock, status_id },
+      })
+    })
+  )
+  return lines.map((l) => l.product_id)
+}
+
 const sessionIncludeSummary = {
   createdBy: { select: { id: true, name: true, email: true } },
   approvedBy: { select: { id: true, name: true, email: true } },
+  firstApprovedBy: { select: { id: true, name: true, email: true } },
   _count: { select: { lines: true } },
 }
 
@@ -74,8 +258,13 @@ exports.list = async (req, res, next) => {
 
     const withProgress = await Promise.all(
       rows.map(async (s) => {
+        const dc = scopeDoubleCount(s.scope_json)
         const counted = await prisma.inventoryCountLine.count({
-          where: { session_id: s.id, qty_counted: { not: null } },
+          where: {
+            session_id: s.id,
+            qty_counted: { not: null },
+            ...(dc ? { qty_counted_secondary: { not: null } } : {}),
+          },
         })
         return {
           ...s,
@@ -110,7 +299,11 @@ exports.getById = async (req, res, next) => {
 
     const [countedLines, sumSnap] = await Promise.all([
       prisma.inventoryCountLine.count({
-        where: { session_id: id, qty_counted: { not: null } },
+        where: {
+          session_id: id,
+          qty_counted: { not: null },
+          ...(scopeDoubleCount(session.scope_json) ? { qty_counted_secondary: { not: null } } : {}),
+        },
       }),
       prisma.inventoryCountLine.aggregate({
         where: { session_id: id },
@@ -119,7 +312,11 @@ exports.getById = async (req, res, next) => {
     ])
 
     const linesWithDiff = await prisma.inventoryCountLine.findMany({
-      where: { session_id: id, qty_counted: { not: null } },
+      where: {
+        session_id: id,
+        qty_counted: { not: null },
+        ...(scopeDoubleCount(session.scope_json) ? { qty_counted_secondary: { not: null } } : {}),
+      },
       select: { stock_snapshot: true, qty_counted: true, product: { select: { cost: true } } },
     })
     let valueDelta = 0
@@ -153,21 +350,37 @@ exports.listLines = async (req, res, next) => {
     const { id } = req.params
     const session = await prisma.inventoryCountSession.findUnique({
       where: { id },
-      select: { id: true },
+      select: { id: true, scope_json: true },
     })
     if (!session) return res.status(404).json({ message: 'Sesión no encontrada' })
+
+    const dc = scopeDoubleCount(session.scope_json)
 
     const take = Math.min(Number(req.query.limit) || 40, 200)
     const skip = Number(req.query.offset) || 0
     const q = (req.query.q && String(req.query.q).trim()) || ''
+    const pendingOnly = ['1', 'true', 'yes'].includes(String(req.query.pending || '').toLowerCase())
 
     const where = { session_id: id }
+    const andFilters = []
     if (q) {
-      where.OR = [
-        { product: { name: { contains: q, mode: 'insensitive' } } },
-        { product: { barcode: { contains: q, mode: 'insensitive' } } },
-      ]
+      andFilters.push({
+        OR: [
+          { product: { name: { contains: q, mode: 'insensitive' } } },
+          { product: { barcode: { contains: q, mode: 'insensitive' } } },
+        ],
+      })
     }
+    if (pendingOnly) {
+      if (dc) {
+        andFilters.push({
+          OR: [{ qty_counted: null }, { qty_counted_secondary: null }],
+        })
+      } else {
+        andFilters.push({ qty_counted: null })
+      }
+    }
+    if (andFilters.length) where.AND = andFilters
 
     const [lines, total] = await Promise.all([
       prisma.inventoryCountLine.findMany({
@@ -187,6 +400,7 @@ exports.listLines = async (req, res, next) => {
             },
           },
           countedBy: { select: { id: true, name: true } },
+          countedSecondaryBy: { select: { id: true, name: true } },
         },
       }),
       prisma.inventoryCountLine.count({ where }),
@@ -200,6 +414,11 @@ exports.listLines = async (req, res, next) => {
         L.qty_counted != null
           ? (L.qty_counted - L.stock_snapshot) * Number(L.product.cost)
           : null,
+      countMismatch:
+        dc &&
+        L.qty_counted != null &&
+        L.qty_counted_secondary != null &&
+        L.qty_counted !== L.qty_counted_secondary,
     }))
 
     res.json({ data, total, take, skip })
@@ -210,20 +429,38 @@ exports.listLines = async (req, res, next) => {
 
 /**
  * POST /inventory-counts
- * body: { name?, scope?: { categoryIds?, supplierIds? }, notes? }
+ * body: { name?, scope?: { categoryIds?, supplierIds?, abcClasses?, samplePercent?, doubleCount? }, notes?, dual_approval? }
  */
 exports.create = async (req, res, next) => {
   try {
     const uid = userId(req)
     if (!uid) return res.status(401).json({ message: 'Usuario no identificado' })
 
-    const { name, scope, notes } = req.body || {}
+    const { name, scope, notes, dual_approval } = req.body || {}
+    if (scope && typeof scope === 'object' && Array.isArray(scope.abcClasses) && scope.abcClasses.length) {
+      const allowed = new Set(['A', 'B', 'C'])
+      const ok = scope.abcClasses.some((x) => allowed.has(String(x).toUpperCase()))
+      if (!ok) {
+        return res.status(400).json({ message: 'Clases ABC inválidas. Use A, B y/o C.' })
+      }
+    }
+    const scopeClean = sanitizeScope(scope)
+    if (
+      scope &&
+      typeof scope === 'object' &&
+      Array.isArray(scope.abcClasses) &&
+      scope.abcClasses.length > 0 &&
+      !scopeClean.abcClasses
+    ) {
+      return res.status(400).json({ message: 'Clases ABC inválidas. Use A, B y/o C.' })
+    }
     const session = await prisma.inventoryCountSession.create({
       data: {
         name: name ? String(name).slice(0, 200) : null,
-        scope_json: scope && typeof scope === 'object' ? scope : {},
+        scope_json: scopeClean,
         notes: notes ? String(notes).slice(0, 2000) : null,
         created_by_id: uid,
+        dual_approval: Boolean(dual_approval),
       },
       include: sessionIncludeSummary,
     })
@@ -253,13 +490,12 @@ exports.start = async (req, res, next) => {
 
     await assertNoBlockingSession(id)
 
-    const where = buildProductWhereFromScope(session.scope_json)
-    const products = await prisma.product.findMany({
-      where,
-      select: { id: true, stock: true },
-    })
+    const products = await resolveProductsForCountStart(session)
     if (!products.length) {
-      return res.status(400).json({ message: 'No hay productos que coincidan con el alcance del inventariado' })
+      return res.status(400).json({
+        message:
+          'No hay productos que coincidan con el alcance del inventariado (revisar categorías, proveedores, ABC o muestreo).',
+      })
     }
 
     await prisma.$transaction([
@@ -289,7 +525,7 @@ exports.start = async (req, res, next) => {
 
 /**
  * PATCH /inventory-counts/:id/lines/:lineId
- * body: { qty_counted: number, note? }
+ * body: { qty_counted?: number, qty_counted_secondary?: number, note? } — al menos un conteo numérico
  */
 exports.updateLine = async (req, res, next) => {
   try {
@@ -299,19 +535,85 @@ exports.updateLine = async (req, res, next) => {
 
     const session = await prisma.inventoryCountSession.findUnique({
       where: { id },
-      select: { status: true },
+      select: { status: true, scope_json: true },
     })
     if (!session) return res.status(404).json({ message: 'Sesión no encontrada' })
     if (session.status !== 'IN_PROGRESS') {
       return res.status(400).json({ message: 'Solo se puede contar mientras la sesión está en progreso' })
     }
 
-    const qty = req.body?.qty_counted
-    if (qty === undefined || qty === null || Number.isNaN(Number(qty))) {
-      return res.status(400).json({ message: 'qty_counted numérico requerido' })
-    }
-    const qtyInt = Math.max(0, Math.floor(Number(qty)))
+    const qtyRaw = req.body?.qty_counted
+    const qty2Raw = req.body?.qty_counted_secondary
+    const hasPrimary = qtyRaw !== undefined && qtyRaw !== null && !Number.isNaN(Number(qtyRaw))
+    const hasSecondary = qty2Raw !== undefined && qty2Raw !== null && !Number.isNaN(Number(qty2Raw))
     const note = req.body?.note != null ? String(req.body.note).slice(0, 500) : undefined
+    const doubleCount = scopeDoubleCount(session.scope_json)
+
+    if (!hasPrimary && !hasSecondary) {
+      if (req.body?.note !== undefined) {
+        const lineOnly = await prisma.inventoryCountLine.findFirst({
+          where: { id: lineId, session_id: id },
+          include: {
+            product: {
+              select: {
+                id: true,
+                name: true,
+                barcode: true,
+                stock: true,
+                cost: true,
+                category: { select: { id: true, name: true } },
+              },
+            },
+            countedBy: { select: { id: true, name: true } },
+            countedSecondaryBy: { select: { id: true, name: true } },
+          },
+        })
+        if (!lineOnly) return res.status(404).json({ message: 'Línea no encontrada' })
+        const updatedNote = await prisma.inventoryCountLine.update({
+          where: { id: lineId },
+          data: { note: note || null },
+          include: {
+            product: {
+              select: {
+                id: true,
+                name: true,
+                barcode: true,
+                stock: true,
+                cost: true,
+                category: { select: { id: true, name: true } },
+              },
+            },
+            countedBy: { select: { id: true, name: true } },
+            countedSecondaryBy: { select: { id: true, name: true } },
+          },
+        })
+        const mismatch =
+          doubleCount &&
+          updatedNote.qty_counted != null &&
+          updatedNote.qty_counted_secondary != null &&
+          updatedNote.qty_counted !== updatedNote.qty_counted_secondary
+        return res.json({
+          ...updatedNote,
+          difference:
+            updatedNote.qty_counted != null
+              ? updatedNote.qty_counted - updatedNote.stock_snapshot
+              : null,
+          valueDifference:
+            updatedNote.qty_counted != null
+              ? (updatedNote.qty_counted - updatedNote.stock_snapshot) * Number(updatedNote.product.cost)
+              : null,
+          countMismatch: mismatch,
+        })
+      }
+      return res.status(400).json({ message: 'Indique qty_counted y/o qty_counted_secondary' })
+    }
+
+    if (hasSecondary && !doubleCount) {
+      return res.status(400).json({ message: 'Esta sesión no tiene doble conteo activado' })
+    }
+
+    const qtyInt = hasPrimary ? Math.max(0, Math.floor(Number(qtyRaw))) : undefined
+    const qty2Int = hasSecondary ? Math.max(0, Math.floor(Number(qty2Raw))) : undefined
 
     const line = await prisma.inventoryCountLine.findFirst({
       where: { id: lineId, session_id: id },
@@ -327,18 +629,27 @@ exports.updateLine = async (req, res, next) => {
           },
         },
         countedBy: { select: { id: true, name: true } },
+        countedSecondaryBy: { select: { id: true, name: true } },
       },
     })
     if (!line) return res.status(404).json({ message: 'Línea no encontrada' })
 
+    const data = {}
+    if (qtyInt !== undefined) {
+      data.qty_counted = qtyInt
+      data.counted_at = new Date()
+      data.counted_by_id = uid
+    }
+    if (qty2Int !== undefined) {
+      data.qty_counted_secondary = qty2Int
+      data.counted_secondary_at = new Date()
+      data.counted_secondary_by_id = uid
+    }
+    if (note !== undefined) data.note = note || null
+
     const updated = await prisma.inventoryCountLine.update({
       where: { id: lineId },
-      data: {
-        qty_counted: qtyInt,
-        counted_at: new Date(),
-        counted_by_id: uid,
-        ...(note !== undefined ? { note: note || null } : {}),
-      },
+      data,
       include: {
         product: {
           select: {
@@ -351,14 +662,25 @@ exports.updateLine = async (req, res, next) => {
           },
         },
         countedBy: { select: { id: true, name: true } },
+        countedSecondaryBy: { select: { id: true, name: true } },
       },
     })
 
+    const mismatch =
+      doubleCount &&
+      updated.qty_counted != null &&
+      updated.qty_counted_secondary != null &&
+      updated.qty_counted !== updated.qty_counted_secondary
+
     res.json({
       ...updated,
-      difference: updated.qty_counted - updated.stock_snapshot,
+      difference:
+        updated.qty_counted != null ? updated.qty_counted - updated.stock_snapshot : null,
       valueDifference:
-        (updated.qty_counted - updated.stock_snapshot) * Number(updated.product.cost),
+        updated.qty_counted != null
+          ? (updated.qty_counted - updated.stock_snapshot) * Number(updated.product.cost)
+          : null,
+      countMismatch: mismatch,
     })
   } catch (e) {
     next(e)
@@ -367,10 +689,19 @@ exports.updateLine = async (req, res, next) => {
 
 /**
  * POST /inventory-counts/:id/submit
+ * body: { reason: string } obligatorio
  */
 exports.submit = async (req, res, next) => {
   try {
     const { id } = req.params
+    const reason = req.body?.reason
+    if (!reason || String(reason).trim().length < MIN_REASON_LEN) {
+      return res.status(400).json({
+        message: `Motivo obligatorio al enviar a revisión (mín. ${MIN_REASON_LEN} caracteres)`,
+      })
+    }
+    const reasonStr = String(reason).trim().slice(0, 2000)
+
     const session = await prisma.inventoryCountSession.findUnique({
       where: { id },
       include: { _count: { select: { lines: true } } },
@@ -380,18 +711,48 @@ exports.submit = async (req, res, next) => {
       return res.status(400).json({ message: 'Solo se puede enviar una sesión en progreso' })
     }
 
-    const counted = await prisma.inventoryCountLine.count({
-      where: { session_id: id, qty_counted: { not: null } },
-    })
+    const dc = scopeDoubleCount(session.scope_json)
+    const countedWhere = {
+      session_id: id,
+      qty_counted: { not: null },
+      ...(dc ? { qty_counted_secondary: { not: null } } : {}),
+    }
+    const counted = await prisma.inventoryCountLine.count({ where: countedWhere })
     if (counted < session._count.lines) {
       return res.status(400).json({
         message: `Faltan líneas sin contar (${counted} de ${session._count.lines}). Complete el conteo antes de enviar a revisión.`,
       })
     }
 
+    if (dc) {
+      const both = await prisma.inventoryCountLine.findMany({
+        where: { session_id: id, qty_counted: { not: null }, qty_counted_secondary: { not: null } },
+        select: {
+          id: true,
+          qty_counted: true,
+          qty_counted_secondary: true,
+          product: { select: { name: true } },
+        },
+      })
+      const bad = both.filter((L) => L.qty_counted !== L.qty_counted_secondary)
+      if (bad.length) {
+        const names = bad
+          .slice(0, 5)
+          .map((L) => L.product?.name || L.id)
+          .join(', ')
+        return res.status(400).json({
+          message: `Doble conteo: ${bad.length} línea(s) con 1.ª y 2.ª lectura distintas. Ej.: ${names}`,
+        })
+      }
+    }
+
     const updated = await prisma.inventoryCountSession.update({
       where: { id },
-      data: { status: 'IN_REVIEW', submitted_at: new Date() },
+      data: {
+        status: 'IN_REVIEW',
+        submitted_at: new Date(),
+        submit_reason: reasonStr,
+      },
       include: sessionIncludeSummary,
     })
     res.json(updated)
@@ -402,6 +763,7 @@ exports.submit = async (req, res, next) => {
 
 /**
  * POST /inventory-counts/:id/approve
+ * body: { reason: string } obligatorio. Con dual_approval: 1.ª pasada → PENDING_SECOND_APPROVAL; 2.ª aplica stock.
  */
 exports.approve = async (req, res, next) => {
   try {
@@ -409,69 +771,104 @@ exports.approve = async (req, res, next) => {
     const uid = userId(req)
     if (!uid) return res.status(401).json({ message: 'Usuario no identificado' })
 
+    const reason = req.body?.reason
+    if (!reason || String(reason).trim().length < MIN_REASON_LEN) {
+      return res.status(400).json({
+        message: `Motivo de aprobación obligatorio (mín. ${MIN_REASON_LEN} caracteres)`,
+      })
+    }
+    const reasonStr = String(reason).trim().slice(0, 2000)
+
     const session = await prisma.inventoryCountSession.findUnique({
       where: { id },
-      select: { status: true },
+      select: {
+        status: true,
+        dual_approval: true,
+        first_approved_by_id: true,
+        scope_json: true,
+      },
     })
     if (!session) return res.status(404).json({ message: 'Sesión no encontrada' })
-    if (session.status !== 'IN_REVIEW') {
-      return res.status(400).json({ message: 'Solo se pueden aprobar sesiones en revisión' })
+
+    if (!['IN_REVIEW', 'PENDING_SECOND_APPROVAL'].includes(session.status)) {
+      return res.status(400).json({ message: 'Estado no válido para aprobar' })
     }
 
-    const countedLines = await prisma.inventoryCountLine.count({
-      where: { session_id: id, qty_counted: { not: null } },
-    })
+    const dc = scopeDoubleCount(session.scope_json)
+    const countedWhere = {
+      session_id: id,
+      qty_counted: { not: null },
+      ...(dc ? { qty_counted_secondary: { not: null } } : {}),
+    }
+    const countedLines = await prisma.inventoryCountLine.count({ where: countedWhere })
     if (!countedLines) {
       return res.status(400).json({ message: 'No hay líneas contadas para aplicar' })
     }
 
+    /** @type {string[]} */
     let affectedProductIds = []
-    await prismaTransaction.$transaction(async (tx) => {
-      const lines = await tx.inventoryCountLine.findMany({
-        where: { session_id: id, qty_counted: { not: null } },
-        include: { product: { select: { min_stock: true } } },
-      })
-      const statuses = await tx.stockStatus.findMany()
-      const byName = Object.fromEntries(statuses.map((s) => [s.name, s.id]))
-      const idDisponible = byName['Disponible']
-      const idBajo = byName['Bajo']
-      const idAgotado = byName['Agotado']
-      if (!idDisponible) {
-        throw new Error('Catálogo stock_statuses incompleto (falta Disponible)')
+
+    if (session.status === 'IN_REVIEW') {
+      if (session.dual_approval) {
+        await prisma.inventoryCountSession.update({
+          where: { id },
+          data: {
+            status: 'PENDING_SECOND_APPROVAL',
+            first_approved_at: new Date(),
+            first_approved_by_id: uid,
+            first_approval_reason: reasonStr,
+          },
+        })
+      } else {
+        await prismaTransaction.$transaction(
+          async (tx) => {
+            affectedProductIds = await applyStockTransaction(tx, id)
+            await tx.inventoryCountSession.update({
+              where: { id },
+              data: {
+                status: 'APPROVED',
+                approved_at: new Date(),
+                approved_by_id: uid,
+                final_approval_reason: reasonStr,
+              },
+            })
+          },
+          INVENTORY_APPROVE_TX_OPTIONS
+        )
       }
-
-      for (const L of lines) {
-        const stock = L.qty_counted
-        const minStock = Number(L.product.min_stock) || 0
-        let status_id = idDisponible
-        if (stock === 0 && idAgotado) status_id = idAgotado
-        else if (stock < minStock && idBajo) status_id = idBajo
-
-        await tx.product.update({
-          where: { id: L.product_id },
-          data: { stock, status_id },
+    } else if (session.status === 'PENDING_SECOND_APPROVAL') {
+      if (session.first_approved_by_id === uid) {
+        return res.status(400).json({
+          message: 'La segunda aprobación debe ser realizada por un usuario distinto al de la primera',
         })
       }
-      affectedProductIds = lines.map((l) => l.product_id)
-
-      await tx.inventoryCountSession.update({
-        where: { id },
-        data: {
-          status: 'APPROVED',
-          approved_at: new Date(),
-          approved_by_id: uid,
+      await prismaTransaction.$transaction(
+        async (tx) => {
+          affectedProductIds = await applyStockTransaction(tx, id)
+          await tx.inventoryCountSession.update({
+            where: { id },
+            data: {
+              status: 'APPROVED',
+              approved_at: new Date(),
+              approved_by_id: uid,
+              final_approval_reason: reasonStr,
+            },
+          })
         },
-      })
-    })
+        INVENTORY_APPROVE_TX_OPTIONS
+      )
+    }
 
-    try {
-      const refreshed = await prisma.product.findMany({
-        where: { id: { in: affectedProductIds } },
-        select: { id: true, stock: true, min_stock: true },
-      })
-      await ensureStockAlertsBatch(prisma, refreshed)
-    } catch (alertErr) {
-      console.error('[inventoryCounts.approve] alertas stock:', alertErr.message)
+    if (affectedProductIds.length) {
+      try {
+        const refreshed = await prisma.product.findMany({
+          where: { id: { in: affectedProductIds } },
+          select: { id: true, stock: true, min_stock: true },
+        })
+        await ensureStockAlertsBatch(prisma, refreshed)
+      } catch (alertErr) {
+        console.error('[inventoryCounts.approve] alertas stock:', alertErr.message)
+      }
     }
 
     const updated = await prisma.inventoryCountSession.findUnique({
@@ -501,7 +898,7 @@ exports.cancel = async (req, res, next) => {
       select: { status: true },
     })
     if (!session) return res.status(404).json({ message: 'Sesión no encontrada' })
-    if (!['DRAFT', 'IN_PROGRESS', 'IN_REVIEW'].includes(session.status)) {
+    if (!['DRAFT', 'IN_PROGRESS', 'IN_REVIEW', 'PENDING_SECOND_APPROVAL'].includes(session.status)) {
       return res.status(400).json({ message: 'No se puede cancelar esta sesión' })
     }
 
