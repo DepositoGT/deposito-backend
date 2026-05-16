@@ -386,6 +386,7 @@ exports.create = async (req, res, next) => {
           price_wholesale: true,
           price_promotion: true,
           promotion_valid_until: true,
+          available_for_sale: true,
         },
       })
       const prodMap = new Map(products.map(p => [String(p.id), p]))
@@ -394,6 +395,12 @@ exports.create = async (req, res, next) => {
         const p = prodMap.get(pid)
         if (!p) {
           const err = new Error(`Producto no encontrado o eliminado: ${pid}`)
+          err.status = 400
+          throw err
+        }
+
+        if (!p.available_for_sale) {
+          const err = new Error(`Producto no disponible para la venta: ${p.name}`)
           err.status = 400
           throw err
         }

@@ -32,9 +32,16 @@ exports.list = async (req, res, next) => {
   try {
     const page = Math.max(1, Number(req.query.page ?? 1))
     const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 20)))
-    const { includeDeleted, search, category, supplier } = req.query || {}
-    
+    const { includeDeleted, search, category, supplier, forSale } = req.query || {}
+    const forSaleOnly =
+      forSale === 'true' ||
+      forSale === '1' ||
+      String(forSale || '').toLowerCase() === 'yes'
+
     const where = includeDeleted === 'true' ? {} : { deleted: false }
+    if (forSaleOnly) {
+      where.available_for_sale = true
+    }
     
     // Filtro de búsqueda
     if (search) {
@@ -244,6 +251,7 @@ exports.update = async (req, res, next) => {
       'category_id',
       'supplier_id',
       'status_id',
+      'available_for_sale',
     ]
     for (const field of allowedFields) {
       if (payload[field] !== undefined) {
@@ -296,6 +304,10 @@ exports.update = async (req, res, next) => {
       if (Number.isNaN(safePayload.status_id)) {
         return res.status(400).json({ message: 'status_id debe ser un número válido' })
       }
+    }
+
+    if (safePayload.available_for_sale !== undefined) {
+      safePayload.available_for_sale = Boolean(safePayload.available_for_sale)
     }
 
     // Validar y normalizar supplier_id: debe ser un UUID válido
@@ -1259,7 +1271,7 @@ exports.pricingPreview = async (req, res, next) => {
     }
 
     const products = await prisma.product.findMany({
-      where: { id: { in: ids }, deleted: false },
+      where: { id: { in: ids }, deleted: false, available_for_sale: true },
       select: {
         id: true,
         price: true,
