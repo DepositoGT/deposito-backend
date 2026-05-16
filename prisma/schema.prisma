@@ -218,6 +218,8 @@ model Product {
   supplier_id                String                    @db.Uuid
   supplier                   Supplier                  @relation(fields: [supplier_id], references: [id])
   barcode                    String?                   @unique @db.VarChar(100)
+  /// Si es false, el producto no aparece en el punto de venta ni puede venderse por la API.
+  available_for_sale         Boolean                   @default(true)
   description                String?                   @db.Text
   deleted                    Boolean                   @default(false)
   deleted_at                 DateTime?
