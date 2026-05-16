@@ -1960,6 +1960,7 @@ async function inventoryCountSessionReport(req, res, next) {
       include: {
         createdBy: { select: { name: true, email: true } },
         approvedBy: { select: { name: true, email: true } },
+        firstApprovedBy: { select: { name: true, email: true } },
       },
     })
     if (!session) {
@@ -1998,6 +1999,7 @@ async function inventoryCountSessionReport(req, res, next) {
           L.product.category?.name || '—',
           L.stock_snapshot,
           L.qty_counted ?? '—',
+          L.qty_counted_secondary ?? '—',
           diff === '' ? '—' : diff,
           vd === '' ? '—' : money(vd),
           (L.note || '').replace(/\n/g, ' '),
@@ -2009,14 +2011,24 @@ async function inventoryCountSessionReport(req, res, next) {
         [
           'REPORTE DE INVENTARIADO',
           `Sesión,${session.name || id}`,
-          `Estado,${session.status}`,
+          `Estado,${inventoryCountStatusLabel(session.status)}`,
+          session.submit_reason ? `Motivo envío revisión,${String(session.submit_reason).replace(/,/g, ';')}` : null,
+          session.first_approved_at
+            ? `1.ª aprobación,${session.firstApprovedBy?.name || '—'} · ${DateTime.fromJSDate(session.first_approved_at).setZone(config.timezone || 'America/Guatemala').toFormat('dd/LL/yyyy HH:mm')}`
+            : null,
+          session.first_approval_reason
+            ? `Motivo 1.ª aprobación,${String(session.first_approval_reason).replace(/,/g, ';')}`
+            : null,
+          session.approved_at && session.final_approval_reason
+            ? `Motivo aprobación final,${String(session.final_approval_reason).replace(/,/g, ';')}`
+            : null,
           `Creado por,${session.createdBy?.name || '—'}`,
           `Generado,${DateTime.now().setZone(config.timezone || 'America/Guatemala').toFormat('yyyy-LL-dd HH:mm')}`,
-        ],
+        ].filter(Boolean),
         [
           {
             title: 'Líneas',
-            columns: ['Producto', 'Código', 'Categoría', 'Teórico', 'Contado', 'Diferencia', 'Valor diff.', 'Nota'],
+            columns: ['Producto', 'Código', 'Categoría', 'Teórico', 'Contado', '2.ª lectura', 'Diferencia', 'Valor diff.', 'Nota'],
             rows,
           },
         ]
@@ -2029,14 +2041,28 @@ async function inventoryCountSessionReport(req, res, next) {
     doc
       .fontSize(9)
       .fillColor(BRAND.muted)
-      .text(`${companyName} · ${session.status}`, { continued: false })
+      .text(`${companyName} · ${inventoryCountStatusLabel(session.status)}`, { continued: false })
     doc.text(
       `Sesión: ${session.name || id} · Creado: ${session.createdBy?.name || '—'} · ${DateTime.fromJSDate(session.created_at).setZone(config.timezone || 'America/Guatemala').toFormat('dd/LL/yyyy HH:mm')}`
     )
+    if (session.submit_reason) {
+      doc.text(`Motivo envío a revisión: ${String(session.submit_reason).slice(0, 500)}`)
+    }
+    if (session.first_approved_at) {
+      doc.text(
+        `1.ª aprobación: ${DateTime.fromJSDate(session.first_approved_at).setZone(config.timezone || 'America/Guatemala').toFormat('dd/LL/yyyy HH:mm')} · ${session.firstApprovedBy?.name || '—'}`
+      )
+    }
+    if (session.first_approval_reason) {
+      doc.text(`Motivo 1.ª aprobación: ${String(session.first_approval_reason).slice(0, 400)}`)
+    }
     if (session.approved_at) {
       doc.text(
-        `Aprobado: ${DateTime.fromJSDate(session.approved_at).setZone(config.timezone || 'America/Guatemala').toFormat('dd/LL/yyyy HH:mm')} · ${session.approvedBy?.name || '—'}`
+        `Aprobación final: ${DateTime.fromJSDate(session.approved_at).setZone(config.timezone || 'America/Guatemala').toFormat('dd/LL/yyyy HH:mm')} · ${session.approvedBy?.name || '—'}`
       )
+    }
+    if (session.final_approval_reason) {
+      doc.text(`Motivo aprobación final: ${String(session.final_approval_reason).slice(0, 400)}`)
     }
     doc.moveDown(0.8)
 
@@ -2044,11 +2070,12 @@ async function inventoryCountSessionReport(req, res, next) {
       const diff = L.qty_counted != null ? L.qty_counted - L.stock_snapshot : null
       const vd = diff != null ? diff * number(L.product.cost) : null
       return [
-        String(L.product.name).slice(0, 28),
+        String(L.product.name).slice(0, 22),
         L.product.barcode || '—',
-        String(L.product.category?.name || '—').slice(0, 12),
+        String(L.product.category?.name || '—').slice(0, 10),
         L.stock_snapshot,
         L.qty_counted ?? '—',
+        L.qty_counted_secondary ?? '—',
         diff != null ? diff : '—',
         vd != null ? money(vd) : '—',
       ]
@@ -2057,12 +2084,12 @@ async function inventoryCountSessionReport(req, res, next) {
     sectionTitle(doc, 'Detalle de líneas')
     drawTable(
       doc,
-      ['Producto', 'Cód.', 'Cat.', 'Teór.', 'Cont.', 'Diff.', 'Valor'],
+      ['Producto', 'Cód.', 'Cat.', 'Teór.', 'C1', 'C2', 'Diff.', 'Valor'],
       tableRows.slice(0, 100),
-      [130, 62, 54, 36, 36, 36, 52],
+      [102, 54, 48, 30, 28, 28, 28, 48],
       {
-        align: ['left', 'left', 'left', 'right', 'right', 'right', 'right'],
-        headerAlign: ['left', 'left', 'left', 'right', 'right', 'right', 'right'],
+        align: ['left', 'left', 'left', 'right', 'right', 'right', 'right', 'right'],
+        headerAlign: ['left', 'left', 'left', 'right', 'right', 'right', 'right', 'right'],
       }
     )
     if (lines.length > 100) {
@@ -2079,10 +2106,11 @@ async function inventoryCountSessionReport(req, res, next) {
 
 function inventoryCountStatusLabel(status) {
   const m = {
-    DRAFT: 'Borrador',
-    IN_PROGRESS: 'En curso',
+    DRAFT: 'Pendiente de empezar',
+    IN_PROGRESS: 'Contando',
     IN_REVIEW: 'En revisión',
-    APPROVED: 'Aprobado',
+    PENDING_SECOND_APPROVAL: 'Falta segunda firma',
+    APPROVED: 'Cerrado y guardado',
     CANCELLED: 'Cancelado',
   }
   return m[status] || String(status)
@@ -2225,7 +2253,7 @@ async function inventoryCountsHistoryReport(req, res, next) {
     drawSummaryCards(doc, [
       { label: 'Sesiones', value: String(sessions.length) },
       { label: 'Aprobadas', value: String(byStatus.APPROVED || 0) },
-      { label: 'En curso / revisión', value: String((byStatus.IN_PROGRESS || 0) + (byStatus.IN_REVIEW || 0)) },
+      { label: 'En curso / revisión', value: String((byStatus.IN_PROGRESS || 0) + (byStatus.IN_REVIEW || 0) + (byStatus.PENDING_SECOND_APPROVAL || 0)) },
       { label: 'Valor dif. (contado)', value: money(sumValueDiff) },
       { label: 'Mermas (valor)', value: money(sumMerma) },
     ])

@@ -284,9 +284,11 @@ model User {
   /// Sesiones de caja (apertura)
   cash_sessions_opened        CashRegisterSession[] @relation("CashSessionOpenedBy")
   cash_sessions_closed        CashRegisterSession[] @relation("CashSessionClosedBy")
-  inventory_counts_created    InventoryCountSession[] @relation("InventoryCountCreatedBy")
-  inventory_counts_approved   InventoryCountSession[] @relation("InventoryCountApprovedBy")
-  inventory_count_lines_counted InventoryCountLine[] @relation("InventoryCountLineCountedBy")
+  inventory_counts_created              InventoryCountSession[] @relation("InventoryCountCreatedBy")
+  inventory_counts_approved             InventoryCountSession[] @relation("InventoryCountApprovedBy")
+  inventory_counts_first_approved       InventoryCountSession[] @relation("InventoryCountFirstApprovedBy")
+  inventory_count_lines_counted         InventoryCountLine[]    @relation("InventoryCountLineCountedBy")
+  inventory_count_lines_secondary_count InventoryCountLine[]    @relation("InventoryCountLineSecondaryCountedBy")
 
   // Campos de empleado
   is_employee Boolean   @default(false)
@@ -808,6 +810,7 @@ enum InventoryCountSessionStatus {
   DRAFT
   IN_PROGRESS
   IN_REVIEW
+  PENDING_SECOND_APPROVAL
   APPROVED
   CANCELLED
 }
@@ -816,12 +819,22 @@ model InventoryCountSession {
   id             String                      @id @default(uuid()) @db.Uuid
   name           String?                     @db.VarChar(200)
   status         InventoryCountSessionStatus @default(DRAFT)
-  /// { categoryIds?: number[], supplierIds?: string[] } — vacío = todos los productos activos (no eliminados)
+  /// Alcance y opciones: categoryIds?, supplierIds?, abcClasses? (A|B|C por valor en bodega),
+  /// samplePercent? (1–99 muestreo aleatorio reproducible), doubleCount? (segunda lectura obligatoria)
   scope_json     Json?
+  /// Si true: primera aprobación → PENDING_SECOND_APPROVAL; segunda aplica stock (otro usuario).
+  dual_approval  Boolean                     @default(false)
+  /// Motivo obligatorio al enviar a revisión
+  submit_reason  String?                     @db.Text
   created_by_id  String                      @db.Uuid
   createdBy      User                        @relation("InventoryCountCreatedBy", fields: [created_by_id], references: [id])
   started_at     DateTime?
   submitted_at   DateTime?
+  first_approved_at     DateTime?
+  first_approved_by_id  String?                     @db.Uuid
+  firstApprovedBy       User?                       @relation("InventoryCountFirstApprovedBy", fields: [first_approved_by_id], references: [id])
+  first_approval_reason String?                     @db.Text
+  final_approval_reason String?                     @db.Text
   approved_at    DateTime?
   approved_by_id String?                     @db.Uuid
   approvedBy     User?                       @relation("InventoryCountApprovedBy", fields: [approved_by_id], references: [id])
@@ -850,6 +863,10 @@ model InventoryCountLine {
   counted_at     DateTime?
   counted_by_id  String?               @db.Uuid
   countedBy      User?                 @relation("InventoryCountLineCountedBy", fields: [counted_by_id], references: [id])
+  qty_counted_secondary    Int?
+  counted_secondary_at     DateTime?
+  counted_secondary_by_id  String?               @db.Uuid
+  countedSecondaryBy       User?                 @relation("InventoryCountLineSecondaryCountedBy", fields: [counted_secondary_by_id], references: [id])
   note           String?               @db.VarChar(500)
 
   @@unique([session_id, product_id])
