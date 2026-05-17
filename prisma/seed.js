@@ -129,8 +129,8 @@ async function main() {
     { code: 'cashclosure.validate', name: 'Validar cierres de caja', description: 'Puede validar y cerrar cierres de caja' },
 
     // Catálogos, condiciones de pago, categorías
-    { code: 'catalogs.view', name: 'Ver catálogos', description: 'Puede ver catálogos (categorías, estados, etc.)' },
-    { code: 'catalogs.manage', name: 'Gestionar catálogos', description: 'Puede crear/editar catálogos' },
+    { code: 'catalogs.view', name: 'Ver datos maestros', description: 'Puede ver datos maestros (categorías, términos de pago, etc.)' },
+    { code: 'catalogs.manage', name: 'Gestionar datos maestros', description: 'Puede crear y editar datos maestros (categorías, términos de pago, etc.)' },
 
     // Configuración del sistema
     { code: 'settings.view', name: 'Ver configuración', description: 'Puede ver la configuración del sistema' },
