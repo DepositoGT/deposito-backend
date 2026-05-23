@@ -608,6 +608,9 @@ model CashClosure {
   supervisor_signature    String?   @db.Text // Base64 de firma digital
   supervisor_validated_at DateTime?
 
+  /// Fondo inicial en caja al abrir el turno (solo arqueo por sesión)
+  opening_float Decimal? @db.Decimal(12, 2)
+
   // Totales teóricos (según BD)
   theoretical_total   Decimal @db.Decimal(12, 2)
   theoretical_sales   Decimal @db.Decimal(12, 2)
