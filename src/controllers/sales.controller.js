@@ -20,6 +20,16 @@ const {
   userHasPerm,
 } = require('../utils/contactsPermissions')
 const { resolvePriceTierForContext, resolveUnitPriceFromProduct, VALID_CHANNELS } = require('../services/priceResolution')
+const {
+  appendSaleSearchFilter,
+  MIN_TEXT_SEARCH_LEN,
+} = require('../services/saleSearch')
+
+/** Include ligero para listados (tabla / búsqueda). Detalle completo en GET /sales/:id */
+const SALE_LIST_INCLUDE = {
+  payment_method: { select: { id: true, name: true } },
+  status: { select: { id: true, name: true } },
+}
 
 /** Misma forma que GET /sales/:id — reutilizado al responder POST /sales (evita un GET extra en el cliente). */
 const SALE_DETAIL_INCLUDE = {
@@ -67,14 +77,15 @@ const SALE_DETAIL_INCLUDE = {
 
 exports.list = async (req, res, next) => {
   try {
-    // Query params: period (today|week|month|year), status, page, pageSize, customer_contact_id
-    const { period, status, customer_contact_id: customerContactId } = req.query || {}
+    // Query params: period (today|week|month|year), status, page, pageSize, customer_contact_id, search
+    const { period, status, customer_contact_id: customerContactId, search } = req.query || {}
     const page = Math.max(1, Number(req.query.page ?? 1))
     const pageSize = Math.min(1000, Math.max(1, Number(req.query.pageSize ?? 100)))
+    const searchTerm = String(search || '').trim()
 
     let startDate
     let endDate
-    if (period) {
+    if (period && !searchTerm) {
       const tz = await getTimezone(prisma)
       const nowGt = DateTime.now().setZone(tz)
       let startGt
@@ -130,6 +141,30 @@ exports.list = async (req, res, next) => {
     if (status) {
       // filter by related status name (e.g., ?status=pendiente)
       where.status = { name: String(status) }
+    }
+
+    let searchMeta = null
+    if (searchTerm) {
+      const searchResult = appendSaleSearchFilter(where, searchTerm)
+      if (searchResult.kind === 'tooShort') {
+        return res.json({
+          items: [],
+          page: 1,
+          pageSize,
+          totalPages: 1,
+          totalItems: 0,
+          nextPage: null,
+          prevPage: null,
+          hasMore: false,
+          searchMeta: {
+            tooShort: true,
+            minLength: searchResult.minLength ?? MIN_TEXT_SEARCH_LEN,
+          },
+        })
+      }
+      if (searchResult.kind === 'ok') {
+        searchMeta = { mode: searchResult.parsedKind }
+      }
     }
 
     if (customerContactId) {
@@ -201,59 +236,45 @@ exports.list = async (req, res, next) => {
       }
     }
 
-    const totalItems = await prisma.sale.count({ where })
-    const totalPages = Math.max(1, Math.ceil(totalItems / pageSize))
-    const safePage = Math.min(page, totalPages)
+    const isGlobalSearch = Boolean(searchTerm)
 
-    const items = await prisma.sale.findMany({
-      where,
-      include: {
-        payment_method: true,
-        status: true,
-        sale_items: { include: { product: true } },
-        sale_promotions: {
-          include: {
-            promotion: {
-              include: { type: true }
-            }
-          }
-        },
-        returns: {
-          where: {
-            status: { name: 'Completada' }
-          },
-          include: {
-            status: true,
-            return_items: {
-              include: {
-                product: {
-                  select: {
-                    id: true,
-                    name: true,
-                    barcode: true
-                  }
-                }
-              }
-            }
-          },
-          orderBy: {
-            return_date: 'desc'
-          }
-        },
-        createdBy: {
-          select: {
-            id: true,
-            name: true,
-            email: true,
-          }
-        },
-      },
-      orderBy: { date: 'desc' },
-      skip: (safePage - 1) * pageSize,
-      take: pageSize,
-    })
+    let totalItems
+    let totalPages
+    let safePage = page
+    let hasMore = false
+    let items
 
-    const nextPage = safePage < totalPages ? safePage + 1 : null
+    if (isGlobalSearch) {
+      // Sin COUNT(*) en búsqueda global: pedimos una fila extra para saber si hay más páginas
+      const rows = await prisma.sale.findMany({
+        where,
+        include: SALE_LIST_INCLUDE,
+        orderBy: { date: 'desc' },
+        skip: (page - 1) * pageSize,
+        take: pageSize + 1,
+      })
+      hasMore = rows.length > pageSize
+      items = rows.slice(0, pageSize)
+      totalItems = null
+      totalPages = null
+      safePage = page
+    } else {
+      totalItems = await prisma.sale.count({ where })
+      totalPages = Math.max(1, Math.ceil(totalItems / pageSize))
+      safePage = Math.min(page, totalPages)
+
+      items = await prisma.sale.findMany({
+        where,
+        include: SALE_LIST_INCLUDE,
+        orderBy: { date: 'desc' },
+        skip: (safePage - 1) * pageSize,
+        take: pageSize,
+      })
+    }
+
+    const nextPage = isGlobalSearch
+      ? (hasMore ? safePage + 1 : null)
+      : (safePage < totalPages ? safePage + 1 : null)
     const prevPage = safePage > 1 ? safePage - 1 : null
 
     res.json({
@@ -264,6 +285,8 @@ exports.list = async (req, res, next) => {
       totalItems,
       nextPage,
       prevPage,
+      hasMore: isGlobalSearch ? hasMore : safePage < totalPages,
+      ...(searchMeta ? { searchMeta } : {}),
       ...(customerPurchaseSummary != null ? { customerPurchaseSummary } : {}),
     })
   } catch (e) { next(e) }
