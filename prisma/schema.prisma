@@ -22,6 +22,7 @@ datasource db {
 model ProductCategory {
   id                   Int                 @id @default(autoincrement())
   name                 String              @unique @db.VarChar(100)
+  image_url            String?             @db.VarChar(500)
   deleted              Boolean             @default(false)
   products             Product[]
   suppliers            SupplierCategory[]
