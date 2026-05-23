@@ -155,6 +155,14 @@ exports.update = async (req, res, next) => {
       const v = String(payload.timezone).trim()
       if (!v) return res.status(400).json({ message: 'La zona horaria no puede estar vacía' })
     }
+    for (const daysKey of ['quote_validity_days', 'order_validity_days', 'quote_soft_hold_hours']) {
+      if (payload[daysKey] !== undefined) {
+        const n = parseInt(String(payload[daysKey]), 10)
+        if (!Number.isFinite(n) || n < 1) {
+          return res.status(400).json({ message: `${daysKey} debe ser un entero ≥ 1` })
+        }
+      }
+    }
 
     const allowedKeys = new Set([
       'currency_code',
@@ -172,7 +180,10 @@ exports.update = async (req, res, next) => {
       'vat_affiliation',
       'date_format',
       'locale',
-      'cash_closure_max_diff_pct'
+      'cash_closure_max_diff_pct',
+      'quote_validity_days',
+      'order_validity_days',
+      'quote_soft_hold_hours',
     ])
 
     for (const [key, value] of Object.entries(payload)) {

@@ -24,6 +24,7 @@ const {
   appendSaleSearchFilter,
   MIN_TEXT_SEARCH_LEN,
 } = require('../services/saleSearch')
+const { getAvailabilityBatch } = require('../services/stockAvailability')
 
 /** Include ligero para listados (tabla / búsqueda). Detalle completo en GET /sales/:id */
 const SALE_LIST_INCLUDE = {
@@ -413,6 +414,7 @@ exports.create = async (req, res, next) => {
         },
       })
       const prodMap = new Map(products.map(p => [String(p.id), p]))
+      const availabilityMap = await getAvailabilityBatch(productIds, tx)
       // Verifica existencia y stock suficiente por producto (considera cantidades sumadas si hay repetidos)
       for (const pid of productIds) {
         const p = prodMap.get(pid)
@@ -435,9 +437,13 @@ exports.create = async (req, res, next) => {
         }
 
         const requested = Number(qtyByProduct.get(pid) || 0)
-        const available = Number(p.stock || 0)
+        const availability = availabilityMap[pid]
+        const available = Number(availability?.available ?? p.stock ?? 0)
         if (requested > available) {
-          const err = new Error(`Stock insuficiente para ${p.name}. Disponible: ${available}, solicitado: ${requested}`)
+          const reserved = Number(availability?.reserved ?? 0)
+          const err = new Error(
+            `Stock insuficiente para ${p.name}. Disponible: ${available}${reserved > 0 ? ` (${Number(p.stock || 0)} físico − ${reserved} reservado)` : ''}, solicitado: ${requested}`
+          )
           err.status = 400
           throw err
         }

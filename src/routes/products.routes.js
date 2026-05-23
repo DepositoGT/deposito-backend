@@ -127,6 +127,8 @@ router.get('/critical', Auth, hasPermission('products.view', 'alerts.view'), Pro
  */
 router.get('/report.pdf', Products.reportPdf)
 
+router.get('/availability', Auth, hasPermission('products.view', 'sales.create', 'orders.view', 'quotes.view'), Products.availability)
+
 /**
  * @openapi
  * /products/import-template:

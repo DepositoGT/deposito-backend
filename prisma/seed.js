@@ -117,6 +117,17 @@ async function main() {
     { code: 'sales.view_invoice', name: 'Ver factura', description: 'Puede consultar la factura de una venta' },
     { code: 'sales.create', name: 'Crear ventas', description: 'Puede registrar nuevas ventas' },
     { code: 'sales.cancel', name: 'Anular / actualizar ventas', description: 'Puede anular o actualizar ventas' },
+
+    // Cotizaciones
+    { code: 'quotes.view', name: 'Ver cotizaciones', description: 'Puede ver cotizaciones comerciales' },
+    { code: 'quotes.create', name: 'Crear cotizaciones', description: 'Puede crear y editar cotizaciones en borrador' },
+    { code: 'quotes.manage', name: 'Gestionar cotizaciones', description: 'Puede enviar, aceptar, rechazar y convertir cotizaciones' },
+
+    // Pedidos
+    { code: 'orders.view', name: 'Ver pedidos', description: 'Puede ver pedidos comerciales' },
+    { code: 'orders.create', name: 'Crear pedidos', description: 'Puede crear pedidos en borrador' },
+    { code: 'orders.manage', name: 'Gestionar pedidos', description: 'Puede confirmar, cancelar y convertir pedidos a venta' },
+
     { code: 'returns.view', name: 'Ver devoluciones', description: 'Puede ver devoluciones' },
     { code: 'returns.manage', name: 'Gestionar devoluciones', description: 'Puede crear y cambiar estado de devoluciones' },
 
@@ -315,7 +326,10 @@ async function main() {
     { key: 'vat_affiliation', value: '', type: 'string', description: 'Afiliación IVA (régimen general, pequeño contribuyente, etc.)' },
     { key: 'date_format', value: 'dd/MM/yyyy', type: 'string', description: 'Formato de fecha por defecto (dd/MM/yyyy o MM/dd/yyyy)' },
     { key: 'locale', value: 'es-GT', type: 'string', description: 'Locale para números y fechas (ej. es-GT)' },
-    { key: 'cash_closure_max_diff_pct', value: '5', type: 'string', description: 'Diferencia máxima permitida en cierre de caja (%) antes de advertencia' }
+    { key: 'cash_closure_max_diff_pct', value: '5', type: 'string', description: 'Diferencia máxima permitida en cierre de caja (%) antes de advertencia' },
+    { key: 'quote_validity_days', value: '30', type: 'string', description: 'Días de vigencia por defecto para cotizaciones (Q-)' },
+    { key: 'order_validity_days', value: '7', type: 'string', description: 'Días de vigencia / reserva por defecto para pedidos (P-)' },
+    { key: 'quote_soft_hold_hours', value: '48', type: 'string', description: 'Horas de apartado blando al enviar cotización (Q-)' },
   ]
   for (const s of defaultSettings) {
     await prisma.systemSetting.upsert({
