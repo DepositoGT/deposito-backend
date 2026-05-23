@@ -1,6 +1,3 @@
--- =============================================================================
--- ÍNDICES PARA RENDIMIENTO - Depósito (Ventas, InFile, listados pesados)
--- =============================================================================
 
 
 -- Limpieza
@@ -11,18 +8,25 @@ DROP INDEX IF EXISTS idx_incoming_merchandise_date_desc;
 -- VENTAS 
 -- -----------------------------------------------------------------------------
 
--- Filtro por estado (status_id) + fecha para listado y resumen de cliente (Completada + última fecha)
+-- Filtro por estado 
 CREATE INDEX IF NOT EXISTS idx_sales_status_id_date_desc ON sales (status_id, date DESC);
 
--- Filtro por estado (status_id) — útil si solo se filtra por estado sin orden explícito por fecha
+-- Filtro por estado 
 CREATE INDEX IF NOT EXISTS idx_sales_status_id ON sales (status_id);
 
--- Compuesto: listado por período y estado, ordenado por fecha (date es prefijo útil con rango de fechas)
+-- Compuesto: listado por período y estado, ordenado por fecha 
 CREATE INDEX IF NOT EXISTS idx_sales_date_status ON sales (date DESC, status_id);
 
--- Histórico de compras en ficha de cliente: GET /sales?customer_contact_id=…
+-- Histórico de compras en ficha de cliente
 CREATE INDEX IF NOT EXISTS idx_sales_customer_lower ON sales (LOWER(customer)) WHERE customer IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_sales_customer_nit_lower ON sales (LOWER(customer_nit)) WHERE customer_nit IS NOT NULL;
+
+-- Búsqueda global en listado de ventas: GET /sales?search=… (referencia V-, cliente, NIT, UUID)
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE INDEX IF NOT EXISTS idx_sales_reference_lower ON sales (LOWER(reference)) WHERE reference IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_sales_reference_trgm ON sales USING gin (reference gin_trgm_ops) WHERE reference IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_sales_customer_trgm ON sales USING gin (customer gin_trgm_ops) WHERE customer IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_sales_customer_nit_trgm ON sales USING gin (customer_nit gin_trgm_ops) WHERE customer_nit IS NOT NULL;
 
 -- JOIN con createdBy (getById, list)
 CREATE INDEX IF NOT EXISTS idx_sales_created_by ON sales (created_by);

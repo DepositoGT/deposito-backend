@@ -22,6 +22,7 @@ datasource db {
 model ProductCategory {
   id                   Int                 @id @default(autoincrement())
   name                 String              @unique @db.VarChar(100)
+  image_url            String?             @db.VarChar(500)
   deleted              Boolean             @default(false)
   products             Product[]
   suppliers            SupplierCategory[]
@@ -607,6 +608,9 @@ model CashClosure {
   supervisor              User?     @relation("CashClosureSupervisor", fields: [supervisor_id], references: [id], onDelete: SetNull)
   supervisor_signature    String?   @db.Text // Base64 de firma digital
   supervisor_validated_at DateTime?
+
+  /// Fondo inicial en caja al abrir el turno (solo arqueo por sesión)
+  opening_float Decimal? @db.Decimal(12, 2)
 
   // Totales teóricos (según BD)
   theoretical_total   Decimal @db.Decimal(12, 2)

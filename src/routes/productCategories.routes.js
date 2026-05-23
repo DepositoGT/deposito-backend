@@ -9,9 +9,22 @@
  */
 
 const { Router } = require('express')
+const multer = require('multer')
 const { Auth, hasAnyRole, hasPermission } = require('../middlewares/autenticacion')
 const ctrl = require('../controllers/productCategories.controller')
 const router = Router()
+
+const uploadImage = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true)
+    } else {
+      cb(new Error('Solo se permiten archivos de imagen'))
+    }
+  },
+})
 
 /**
  * @openapi
@@ -99,6 +112,36 @@ router.post('/validate-import-mapped', Auth, hasPermission('catalogs.manage'), c
  *         description: Error de validación
  */
 router.post('/bulk-import-mapped', Auth, hasPermission('catalogs.manage'), ctrl.bulkImportMapped)
+
+/**
+ * @openapi
+ * /catalogs/product-categories/upload-image:
+ *   post:
+ *     tags: [ProductCategories]
+ *     summary: Subir imagen representativa de categoría
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               image:
+ *                 type: string
+ *                 format: binary
+ *     responses:
+ *       200:
+ *         description: URL pública de la imagen
+ */
+router.post(
+  '/upload-image',
+  Auth,
+  hasPermission('catalogs.manage'),
+  uploadImage.single('image'),
+  ctrl.uploadImage
+)
 
 /**
  * @openapi
