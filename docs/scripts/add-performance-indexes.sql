@@ -214,3 +214,21 @@ CREATE INDEX IF NOT EXISTS idx_users_role_id ON users (role_id);
 -- -----------------------------------------------------------------------------
 
 CREATE INDEX IF NOT EXISTS idx_system_settings_key ON system_settings (key);
+
+
+-- -----------------------------------------------------------------------------
+-- COMMERCIAL DOCUMENTS & STOCK RESERVATIONS (cotizaciones / pedidos)
+-- -----------------------------------------------------------------------------
+
+CREATE INDEX IF NOT EXISTS idx_commercial_docs_type_status_created
+  ON commercial_documents (doc_type, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_commercial_docs_customer_contact
+  ON commercial_documents (customer_contact_id);
+CREATE INDEX IF NOT EXISTS idx_commercial_doc_lines_document
+  ON commercial_document_lines (document_id);
+CREATE INDEX IF NOT EXISTS idx_commercial_doc_lines_product
+  ON commercial_document_lines (product_id);
+CREATE INDEX IF NOT EXISTS idx_stock_reservations_product_status
+  ON stock_reservations (product_id, status);
+CREATE INDEX IF NOT EXISTS idx_stock_reservations_document_status
+  ON stock_reservations (document_id, status);

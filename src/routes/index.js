@@ -49,6 +49,12 @@ router.use('/promotions', require('./promotions.routes'))
 router.use('/incoming-merchandise', require('./incomingMerchandise.routes'))
 // Inventariado (conteo físico)
 router.use('/inventory-counts', require('./inventoryCounts.routes'))
+// Cotizaciones comerciales
+router.use('/quotes', require('./quotes.routes'))
+// Pedidos comerciales
+router.use('/orders', require('./orders.routes'))
+// Cotiz/pedidos: vencimientos y reportes operativos
+router.use('/commercial-documents', require('./commercialDocuments.routes'))
 
 
 module.exports = router

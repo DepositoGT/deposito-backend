@@ -20,6 +20,7 @@ const { getTimezone, getSystemConfig } = require('../utils/getTimezone')
 
 // Bulk import service
 const { parseExcel, validateBulkData, bulkCreateProducts, generateTemplateWithCatalogs } = require('../services/bulkImport')
+const { getAvailabilityBatch } = require('../services/stockAvailability')
 
 // Inicializar cliente de Supabase con service role key (solo para backend)
 const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL
@@ -217,6 +218,30 @@ exports.getOne = async (req, res, next) => {
     if (!item || item.deleted) return res.status(404).json({ message: 'No encontrado' })
     res.json(item)
   } catch (e) { next(e) }
+}
+
+/**
+ * GET /api/products/availability?ids=uuid1,uuid2
+ * Stock físico, reservado y disponible (stock − reservas ACTIVE).
+ */
+exports.availability = async (req, res, next) => {
+  try {
+    const raw = req.query.ids
+    const ids = String(raw || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+    if (ids.length === 0) {
+      return res.status(400).json({ message: 'Parámetro ids requerido (UUIDs separados por coma)' })
+    }
+    if (ids.length > 200) {
+      return res.status(400).json({ message: 'Máximo 200 productos por consulta' })
+    }
+    const availability = await getAvailabilityBatch(ids)
+    res.json({ availability })
+  } catch (e) {
+    next(e)
+  }
 }
 
 exports.update = async (req, res, next) => {
