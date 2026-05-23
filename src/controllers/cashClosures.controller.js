@@ -18,6 +18,57 @@ const number = (v) => {
   return Number.isFinite(n) ? n : 0
 }
 
+function isCashPaymentMethodName(name) {
+  const n = String(name || '').toLowerCase()
+  return n.includes('efectivo') || n.includes('cash')
+}
+
+/** Suma el fondo inicial al teórico de efectivo (arqueo por turno). */
+async function applyOpeningFloatToCashBreakdown(paymentMethodsMap, openingFloat) {
+  const float = number(openingFloat)
+  if (float <= 0) {
+    return { openingFloat: 0, cashSalesAmount: 0 }
+  }
+
+  let cashEntry = null
+  for (const method of paymentMethodsMap.values()) {
+    if (isCashPaymentMethodName(method.name)) {
+      cashEntry = method
+      break
+    }
+  }
+
+  if (!cashEntry) {
+    const cashPm = await prisma.paymentMethod.findFirst({
+      where: {
+        OR: [
+          { name: { equals: 'Efectivo', mode: 'insensitive' } },
+          { name: { contains: 'efectivo', mode: 'insensitive' } },
+          { name: { contains: 'cash', mode: 'insensitive' } }
+        ]
+      }
+    })
+    if (cashPm) {
+      cashEntry = {
+        id: cashPm.id,
+        name: cashPm.name,
+        theoretical_amount: 0,
+        theoretical_count: 0,
+        sales: []
+      }
+      paymentMethodsMap.set(cashPm.id, cashEntry)
+    }
+  }
+
+  if (!cashEntry) {
+    return { openingFloat: float, cashSalesAmount: 0 }
+  }
+
+  const cashSalesAmount = number(cashEntry.theoretical_amount)
+  cashEntry.theoretical_amount = cashSalesAmount + float
+  return { openingFloat: float, cashSalesAmount }
+}
+
 /** Verifica permiso según tipo de cierre (día = todos, own = solo mi cierre). Devuelve { allowed } o { allowed: false, status, message }. */
 function checkClosureScopePermission(req, isOwnClosure) {
   const user = req.user
@@ -107,6 +158,7 @@ exports.calculateTheoretical = async (req, res, next) => {
     const tz = await getTimezone(prisma)
     let start
     let end
+    let sessionOpeningFloat = 0
 
     if (isOwn) {
       if (!cashRegisterSessionId) {
@@ -136,6 +188,7 @@ exports.calculateTheoretical = async (req, res, next) => {
       if (!sess.closed_at) {
         return res.status(400).json({ message: 'La sesión no tiene fecha de cierre; no se puede calcular.' })
       }
+      sessionOpeningFloat = number(sess.opening_float)
       // Fuente de verdad: horas del turno en BD (evita desajuste con sold_at vs strings del formulario)
       start = sess.opened_at
       end = sess.closed_at
@@ -259,7 +312,12 @@ exports.calculateTheoretical = async (req, res, next) => {
       })
     }
 
-    const theoreticalTotal = theoreticalSales - theoreticalReturns
+    let theoreticalTotal = theoreticalSales - theoreticalReturns
+
+    const cashDetail = await applyOpeningFloatToCashBreakdown(paymentMethodsMap, sessionOpeningFloat)
+    if (cashDetail.openingFloat > 0) {
+      theoreticalTotal += cashDetail.openingFloat
+    }
 
     // Calcular métricas adicionales
     const totalTransactions = sales.length
@@ -285,6 +343,15 @@ exports.calculateTheoretical = async (req, res, next) => {
         total_returns: Number(theoreticalReturns.toFixed(2)),
         net_total: Number(theoreticalTotal.toFixed(2))
       },
+      cash_session: cashDetail.openingFloat > 0
+        ? {
+            opening_float: Number(cashDetail.openingFloat.toFixed(2)),
+            cash_sales_amount: Number(cashDetail.cashSalesAmount.toFixed(2)),
+            expected_cash_in_drawer: Number(
+              (cashDetail.cashSalesAmount + cashDetail.openingFloat).toFixed(2)
+            )
+          }
+        : null,
       metrics: {
         total_transactions: totalTransactions,
         total_customers: totalCustomers,
@@ -396,33 +463,35 @@ exports.create = async (req, res, next) => {
 
     const createdClosure = await prisma.$transaction(async (tx) => {
       let sessionToCloseOnSave = null
+      let linkedSession = null
       if (cashRegisterSessionId) {
-        const sess = await tx.cashRegisterSession.findFirst({
+        linkedSession = await tx.cashRegisterSession.findFirst({
           where: { id: cashRegisterSessionId }
         })
-        if (!sess) {
+        if (!linkedSession) {
           throw new Error('INVALID_SESSION')
         }
 
         if (isOwnClosure) {
-          if (cashierId && String(sess.opened_by_id) !== String(cashierId)) {
+          if (cashierId && String(linkedSession.opened_by_id) !== String(cashierId)) {
             const adminCloser = String(authUser?.role?.name || authUser?.role_name || '').toLowerCase() === 'admin'
             if (!adminCloser) throw new Error('SESSION_NOT_YOURS')
           }
-          if (sess.status !== 'CLOSED') {
+          if (linkedSession.status !== 'CLOSED') {
             throw new Error('SESSION_NOT_CLOSED')
           }
-          if (sess.cash_closure_id) {
+          if (linkedSession.cash_closure_id) {
             throw new Error('SESSION_ALREADY_LINKED')
           }
-        } else if (sess.status === 'OPEN') {
-          sessionToCloseOnSave = sess
+        } else if (linkedSession.status === 'OPEN') {
+          sessionToCloseOnSave = linkedSession
         }
       }
 
       const cashClosure = await tx.cashClosure.create({
         data: {
           date: dateUTC,
+          opening_float: isOwnClosure && linkedSession ? linkedSession.opening_float : null,
           start_date: startDateUTC,
           end_date: endDateUTC,
           cashier_name: cashierName,
@@ -631,6 +700,14 @@ exports.getById = async (req, res, next) => {
           orderBy: {
             denomination: 'desc'
           }
+        },
+        cash_register_session: {
+          select: {
+            id: true,
+            opening_float: true,
+            opened_at: true,
+            closed_at: true
+          }
         }
       }
     })
@@ -639,7 +716,17 @@ exports.getById = async (req, res, next) => {
       return res.status(404).json({ message: 'Cierre de caja no encontrado' })
     }
 
-    res.json(closure)
+    const openingFloat =
+      closure.opening_float != null
+        ? number(closure.opening_float)
+        : closure.cash_register_session?.opening_float != null
+          ? number(closure.cash_register_session.opening_float)
+          : null
+
+    res.json({
+      ...closure,
+      opening_float: openingFloat
+    })
   } catch (e) {
     next(e)
   }
