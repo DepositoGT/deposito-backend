@@ -1280,9 +1280,15 @@ exports.validateImportMapped = async (req, res, next) => {
  */
 exports.pricingPreview = async (req, res, next) => {
   try {
-    const { customer_contact_id: customerContactIdRaw, sales_channel: salesChannelRaw, product_ids: productIdsRaw } =
+    const { customer_contact_id: customerContactIdRaw, sales_channel: salesChannelRaw, product_ids: productIdsRaw, price_tier: priceTierRaw } =
       req.body || {}
-    const { resolvePriceTierForContext, resolveUnitPriceFromProduct, VALID_CHANNELS } = require('../services/priceResolution')
+    const {
+      resolvePriceTierForContext,
+      resolveUnitPriceFromProduct,
+      productSupportsPriceTier,
+      parsePriceTier,
+      VALID_CHANNELS,
+    } = require('../services/priceResolution')
 
     const schRaw = salesChannelRaw != null ? String(salesChannelRaw).toUpperCase() : 'POS'
     const salesChannel = VALID_CHANNELS.has(schRaw) ? schRaw : 'POS'
@@ -1295,19 +1301,28 @@ exports.pricingPreview = async (req, res, next) => {
       ? [...new Set(productIdsRaw.map((x) => String(x)).filter(Boolean))]
       : []
 
-    const tier = await resolvePriceTierForContext(prisma, {
-      customerContactId,
-      salesChannel,
-    })
+    const explicitTier = parsePriceTier(priceTierRaw)
+    const tier = explicitTier
+      ? explicitTier
+      : await resolvePriceTierForContext(prisma, {
+          customerContactId,
+          salesChannel,
+        })
 
     if (ids.length === 0) {
-      return res.json({ price_tier_used: tier, sales_channel: salesChannel, unit_prices: {} })
+      return res.json({
+        price_tier_used: tier,
+        sales_channel: salesChannel,
+        unit_prices: {},
+        tier_unavailable: [],
+      })
     }
 
     const products = await prisma.product.findMany({
       where: { id: { in: ids }, deleted: false, available_for_sale: true },
       select: {
         id: true,
+        name: true,
         price: true,
         price_wholesale: true,
         price_promotion: true,
@@ -1315,10 +1330,24 @@ exports.pricingPreview = async (req, res, next) => {
       },
     })
     const now = new Date()
-    const unit_prices = Object.fromEntries(
-      products.map((p) => [String(p.id), resolveUnitPriceFromProduct(p, tier, now)])
-    )
-    res.json({ price_tier_used: tier, sales_channel: salesChannel, unit_prices })
+    const unit_prices = {}
+    const tier_unavailable = []
+
+    for (const p of products) {
+      if (explicitTier) {
+        const check = productSupportsPriceTier(p, tier, now)
+        if (!check.ok) {
+          tier_unavailable.push({
+            product_id: String(p.id),
+            name: p.name,
+            reason: check.reason,
+          })
+          continue
+        }
+      }
+      unit_prices[String(p.id)] = resolveUnitPriceFromProduct(p, tier, now)
+    }
+    res.json({ price_tier_used: tier, sales_channel: salesChannel, unit_prices, tier_unavailable })
   } catch (e) {
     next(e)
   }
