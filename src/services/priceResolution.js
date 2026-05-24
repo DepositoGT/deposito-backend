@@ -5,6 +5,12 @@
  */
 
 const VALID_CHANNELS = new Set(['POS', 'WHOLESALE', 'ONLINE'])
+const VALID_PRICE_TIERS = new Set(['LIST', 'WHOLESALE', 'PROMOTION'])
+
+function parsePriceTier(raw) {
+  const t = raw != null ? String(raw).toUpperCase() : ''
+  return VALID_PRICE_TIERS.has(t) ? t : null
+}
 
 function numberOrZero(v) {
   const n = Number(v)
@@ -38,6 +44,41 @@ function resolveUnitPriceFromProduct(product, tier, now = new Date()) {
     }
   }
   return list
+}
+
+function isPromotionActive(product, now = new Date()) {
+  const promoRaw =
+    product.price_promotion != null && product.price_promotion !== ''
+      ? numberOrZero(product.price_promotion)
+      : null
+  if (promoRaw == null || promoRaw <= 0) return false
+  const promoUntil = product.promotion_valid_until
+  if (!promoUntil) return true
+  return new Date(promoUntil) >= now
+}
+
+function productSupportsPriceTier(product, tier, now = new Date()) {
+  if (tier === 'LIST') return { ok: true }
+  if (tier === 'WHOLESALE') {
+    const wholesale =
+      product.price_wholesale != null && product.price_wholesale !== ''
+        ? numberOrZero(product.price_wholesale)
+        : null
+    if (wholesale != null && wholesale > 0) return { ok: true }
+    return { ok: false, reason: 'sin precio de mayoreo' }
+  }
+  if (tier === 'PROMOTION') {
+    if (isPromotionActive(product, now)) return { ok: true }
+    const promoRaw =
+      product.price_promotion != null && product.price_promotion !== ''
+        ? numberOrZero(product.price_promotion)
+        : null
+    if (promoRaw == null || promoRaw <= 0) {
+      return { ok: false, reason: 'sin precio promocional' }
+    }
+    return { ok: false, reason: 'promoción vencida o no vigente' }
+  }
+  return { ok: false, reason: 'tarifa no válida' }
 }
 
 /**
@@ -81,5 +122,9 @@ async function resolvePriceTierForContext(tx, ctx) {
 module.exports = {
   resolveUnitPriceFromProduct,
   resolvePriceTierForContext,
+  isPromotionActive,
+  productSupportsPriceTier,
+  parsePriceTier,
   VALID_CHANNELS,
+  VALID_PRICE_TIERS,
 }

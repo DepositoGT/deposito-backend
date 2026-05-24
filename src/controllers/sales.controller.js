@@ -192,7 +192,7 @@ exports.list = async (req, res, next) => {
         return res.status(404).json({ message: 'Cliente no encontrado' })
       }
       const nameTrim = String(contact.name || '').trim()
-      const orClauses = []
+      const orClauses = [{ customer_contact_id: contact.id }]
       if (nameTrim) {
         orClauses.push({ customer: { equals: nameTrim, mode: 'insensitive' } })
       }
@@ -200,18 +200,7 @@ exports.list = async (req, res, next) => {
       if (tid) {
         orClauses.push({ customer_nit: { equals: tid, mode: 'insensitive' } })
       }
-      if (orClauses.length === 0) {
-        return res.json({
-          items: [],
-          page: 1,
-          pageSize,
-          totalPages: 1,
-          totalItems: 0,
-          nextPage: null,
-          prevPage: null,
-          customerPurchaseSummary: { totalPurchases: 0, lastSaleDate: null },
-        })
-      }
+      // Siempre hay al menos customer_contact_id en orClauses
       const prevAnd = Array.isArray(where.AND) ? where.AND : []
       where.AND = [...prevAnd, { OR: orClauses }]
     }
