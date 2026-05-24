@@ -11,7 +11,7 @@
 const { prisma } = require('../models/prisma')
 const { DateTime } = require('luxon')
 const PDFDocument = require('pdfkit')
-const { getCompanyName } = require('../utils/getTimezone')
+const { getBrandingForPdf } = require('../utils/pdfBranding')
 
 const ROUND_EPS = 0.005
 
@@ -685,7 +685,17 @@ exports.generateReport = async (req, res, next) => {
     res.setHeader('Content-Disposition', 'attachment; filename="reporte-mercancia.pdf"')
     doc.pipe(res)
 
-    const companyName = await getCompanyName(prisma)
+    const branding = await getBrandingForPdf(prisma)
+    const companyName = branding.company_name
+    if (branding.logoBuffer) {
+      try {
+        const pageWidth = doc.page.width
+        doc.image(branding.logoBuffer, pageWidth / 2 - 22, doc.y, { fit: [44, 26] })
+        doc.moveDown(2)
+      } catch {
+        /* sin logo */
+      }
+    }
     doc.fontSize(12).text(companyName, { align: 'center' })
     doc.moveDown(0.3)
     doc.fontSize(20).text('Reporte de Ingresos de Mercancía', { align: 'center' })

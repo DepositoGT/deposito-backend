@@ -39,6 +39,21 @@ async function removePublicObject(publicUrl, bucket) {
   }
 }
 
+/** Descarga el objeto del bucket como Buffer (evita fetch HTTP y problemas de CORS). */
+async function downloadPublicObject(publicUrl, bucket) {
+  if (!publicUrl || !supabase) return null
+  const path = storagePathFromPublicUrl(publicUrl, bucket)
+  if (!path) return null
+  try {
+    const { data, error } = await supabase.storage.from(bucket).download(path)
+    if (error || !data) return null
+    const buffer = Buffer.from(await data.arrayBuffer())
+    return buffer.length ? buffer : null
+  } catch {
+    return null
+  }
+}
+
 /**
  * Sube un buffer de imagen al bucket indicado.
  * @returns URL pública
@@ -99,6 +114,8 @@ module.exports = {
   assertSupabase,
   storagePathFromPublicUrl,
   removePublicObject,
+  downloadPublicObject,
   uploadImageBuffer,
   CATEGORY_IMAGES_BUCKET: 'categorias',
+  COMPANY_LOGO_BUCKET: 'logo',
 }

@@ -9,7 +9,14 @@
  */
 
 const { prisma } = require('../models/prisma')
+const sharp = require('sharp')
 const { invalidateSystemConfigCache } = require('../utils/getTimezone')
+const { fetchLogoForHttp } = require('../utils/pdfBranding')
+const {
+  uploadImageBuffer,
+  removePublicObject,
+  COMPANY_LOGO_BUCKET,
+} = require('../services/supabaseStorage')
 
 /**
  * GET /api/settings
@@ -44,7 +51,7 @@ exports.getAll = async (req, res, next) => {
  */
 exports.getPublic = async (req, res, next) => {
   try {
-    const keys = ['timezone', 'currency_code', 'currency_name', 'company_name', 'date_format', 'locale', 'cash_closure_max_diff_pct']
+    const keys = ['timezone', 'currency_code', 'currency_name', 'company_name', 'company_logo_url', 'date_format', 'locale', 'cash_closure_max_diff_pct']
     const rows = await prisma.systemSetting.findMany({
       where: { key: { in: keys } }
     })
@@ -53,6 +60,7 @@ exports.getPublic = async (req, res, next) => {
       currency_code: 'GTQ',
       currency_name: 'Quetzal',
       company_name: 'Deposito',
+      company_logo_url: '',
       date_format: 'dd/MM/yyyy',
       locale: 'es-GT',
       cash_closure_max_diff_pct: '5'
@@ -68,15 +76,128 @@ exports.getPublic = async (req, res, next) => {
 
 /**
  * GET /api/settings/company-name
- * Solo company_name, sin autenticación (para pantalla de login / branding).
+ * Nombre y logo públicos (login / cotización pública / branding sin auth).
  */
 exports.getCompanyName = async (req, res, next) => {
   try {
-    const row = await prisma.systemSetting.findUnique({
-      where: { key: 'company_name' }
+    const rows = await prisma.systemSetting.findMany({
+      where: { key: { in: ['company_name', 'company_logo_url'] } },
     })
-    const company_name = (row?.value && String(row.value).trim()) || 'Deposito'
-    res.json({ company_name })
+    const map = Object.fromEntries(rows.map((r) => [r.key, r.value]))
+    const company_name = (map.company_name && String(map.company_name).trim()) || 'Deposito'
+    const company_logo_url = (map.company_logo_url && String(map.company_logo_url).trim()) || ''
+    res.json({ company_name, company_logo_url })
+  } catch (e) {
+    next(e)
+  }
+}
+
+/**
+ * GET /api/settings/company-logo
+ * Sirve el logo rasterizado (PNG/JPEG) para PDFs y favicon sin depender de CORS de Supabase.
+ */
+exports.getCompanyLogo = async (req, res, next) => {
+  try {
+    const row = await prisma.systemSetting.findUnique({ where: { key: 'company_logo_url' } })
+    const logoUrl = row?.value?.trim()
+    if (!logoUrl) return res.status(404).end()
+
+    const logo = await fetchLogoForHttp(logoUrl)
+    if (!logo?.buffer?.length) return res.status(404).end()
+
+    res.setHeader('Content-Type', logo.contentType)
+    res.setHeader('Cache-Control', 'public, max-age=300')
+    res.send(logo.buffer)
+  } catch (e) {
+    next(e)
+  }
+}
+
+/**
+ * POST /api/settings/upload-logo
+ * Sube logo al bucket Supabase "logo" y guarda company_logo_url.
+ */
+exports.uploadLogo = async (req, res, next) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: 'No se proporcionó ningún archivo' })
+    }
+
+    let file = req.file
+    const isSvg = file.mimetype === 'image/svg+xml' || file.mimetype === 'image/svg'
+    const needsRaster =
+      isSvg || file.mimetype === 'image/webp' || file.mimetype === 'image/avif'
+    if (needsRaster) {
+      const pngBuffer = await sharp(file.buffer, isSvg ? { density: 150 } : undefined)
+        .png()
+        .toBuffer()
+      file = {
+        ...file,
+        buffer: pngBuffer,
+        mimetype: 'image/png',
+        size: pngBuffer.length,
+        originalname: `${(file.originalname || 'logo').replace(/\.[^.]+$/, '')}.png`,
+      }
+    }
+
+    const prev = await prisma.systemSetting.findUnique({ where: { key: 'company_logo_url' } })
+    const prevUrl = prev?.value?.trim()
+
+    const imageUrl = await uploadImageBuffer({
+      bucket: COMPANY_LOGO_BUCKET,
+      file: req.file,
+      pathPrefix: 'company',
+    })
+
+    await prisma.systemSetting.upsert({
+      where: { key: 'company_logo_url' },
+      update: { value: imageUrl, type: 'string' },
+      create: {
+        key: 'company_logo_url',
+        value: imageUrl,
+        type: 'string',
+        description: 'URL pública del logo del negocio (bucket logo)',
+      },
+    })
+
+    if (prevUrl && prevUrl !== imageUrl) {
+      await removePublicObject(prevUrl, COMPANY_LOGO_BUCKET)
+    }
+
+    invalidateSystemConfigCache()
+    res.json({ imageUrl, company_logo_url: imageUrl })
+  } catch (e) {
+    if (e.status) return res.status(e.status).json({ message: e.message })
+    next(e)
+  }
+}
+
+/**
+ * DELETE /api/settings/logo
+ * Quita el logo configurado (opcionalmente borra el archivo en Storage).
+ */
+exports.removeLogo = async (req, res, next) => {
+  try {
+    const prev = await prisma.systemSetting.findUnique({ where: { key: 'company_logo_url' } })
+    const prevUrl = prev?.value?.trim()
+
+    await prisma.systemSetting.upsert({
+      where: { key: 'company_logo_url' },
+      update: { value: '', type: 'string' },
+      create: {
+        key: 'company_logo_url',
+        value: '',
+        type: 'string',
+        description: 'URL pública del logo del negocio (bucket logo)',
+      },
+    })
+
+    if (prevUrl) {
+      await removePublicObject(prevUrl, COMPANY_LOGO_BUCKET)
+    }
+
+    invalidateSystemConfigCache()
+    res.json({ company_logo_url: '' })
   } catch (e) {
     next(e)
   }
@@ -169,6 +290,7 @@ exports.update = async (req, res, next) => {
       'currency_name',
       'timezone',
       'company_name',
+      'company_logo_url',
       'cash_closure_denominations',
       // Datos fiscales (Fase 3 / FEL)
       'company_nit',
