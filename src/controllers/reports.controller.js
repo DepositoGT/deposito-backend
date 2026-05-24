@@ -11,7 +11,7 @@
 const { prisma } = require('../models/prisma')
 const { DateTime } = require('luxon')
 const PDFDocument = require('pdfkit')
-const { getSystemConfig } = require('../utils/getTimezone')
+const { getBrandingForPdf } = require('../utils/pdfBranding')
 
 // Brand & styles inspired by Products PDF
 const BRAND = {
@@ -127,11 +127,24 @@ function ensureSpace(doc, needed) {
   if (doc.y + needed > bottom) addPageWithBand(doc)
 }
 
-function header(doc, title, periodLabel, companyName = 'Depósito') {
+function header(doc, title, periodLabel, companyName = 'Depósito', logoBuffer = null) {
   const left = doc.page.margins.left
   const right = doc.page.width - doc.page.margins.right
-  doc.fillColor(BRAND.primary).fontSize(20).text(title, left, 32, { align: 'left' })
-  doc.fontSize(9).fillColor(BRAND.muted).text(`Generado: ${DateTime.now().setZone('America/Guatemala').toFormat('yyyy-LL-dd HH:mm')}  |  Período: ${periodLabel}`, { align: 'left' })
+  let titleX = left
+  let titleY = 32
+
+  if (logoBuffer) {
+    try {
+      doc.image(logoBuffer, left, 16, { fit: [44, 26] })
+      titleX = left + 50
+      titleY = 26
+    } catch {
+      /* sin logo */
+    }
+  }
+
+  doc.fillColor(BRAND.primary).fontSize(20).text(title, titleX, titleY, { align: 'left', width: Math.max(80, right - titleX) })
+  doc.fontSize(9).fillColor(BRAND.muted).text(`Generado: ${DateTime.now().setZone('America/Guatemala').toFormat('yyyy-LL-dd HH:mm')}  |  Período: ${periodLabel}`, titleX, doc.y + 2, { align: 'left', width: Math.max(80, right - titleX) })
   doc.moveTo(left, doc.y + 4).lineTo(right, doc.y + 4).lineWidth(1).strokeColor(BRAND.border).stroke()
   doc.moveDown(0.6)
 }
@@ -803,9 +816,10 @@ function sendCsv(res, filename, headerLines = [], sections = []) {
 
 async function salesReport(req, res, next) {
   try {
-  const config = await getSystemConfig(prisma)
-  const companyName = config.company_name
-  const money = makeMoney(config.currency_code)
+  const branding = await getBrandingForPdf(prisma)
+  const companyName = branding.company_name
+  const logoBuffer = branding.logoBuffer
+  const money = makeMoney(branding.currency_code)
   const { period='month', year, format='pdf', month, quarter, semester } = req.query
   const { startUtc, endUtc, label } = periodRange(period, year, { month, quarter, semester })
     const data = await getSalesData(startUtc, endUtc)
@@ -845,7 +859,7 @@ async function salesReport(req, res, next) {
       return
     }
     const doc = newDoc(res, 'Reporte de Ventas')
-    header(doc, 'Reporte de Ventas', label, companyName)
+    header(doc, 'Reporte de Ventas', label, companyName, logoBuffer)
     sectionTitle(doc, 'Resumen')
     drawSummaryCards(doc, [
       { label: 'Ventas Brutas', value: money(data.totalRevenueGross) },
@@ -911,9 +925,10 @@ async function salesReport(req, res, next) {
 
 async function inventoryReport(req,res,next){
   try {
-    const config = await getSystemConfig(prisma)
-    const companyName = config.company_name
-    const money = makeMoney(config.currency_code)
+    const branding = await getBrandingForPdf(prisma)
+    const companyName = branding.company_name
+    const logoBuffer = branding.logoBuffer
+    const money = makeMoney(branding.currency_code)
     const { format='pdf' } = req.query
     const products = await prisma.product.findMany({ where:{ deleted_at: null }, include:{ category:true } })
     if (String(format).toLowerCase() === 'csv' || String(format).toLowerCase() === 'excel') {
@@ -931,7 +946,7 @@ async function inventoryReport(req,res,next){
       return
     }
     const doc = newDoc(res, 'Reporte de Inventario')
-    header(doc, 'Reporte de Inventario', 'Actual', companyName)
+    header(doc, 'Reporte de Inventario', 'Actual', companyName, logoBuffer)
     sectionTitle(doc, 'Resumen')
     const totalProducts = products.length
     const totalValue = products.reduce((acc,p)=>acc+ number(p.stock)* number(p.cost),0)
@@ -950,9 +965,10 @@ async function inventoryReport(req,res,next){
 
 async function suppliersReport(req, res, next) {
   try {
-    const config = await getSystemConfig(prisma)
-    const companyName = config.company_name
-    const money = makeMoney(config.currency_code)
+    const branding = await getBrandingForPdf(prisma)
+    const companyName = branding.company_name
+    const logoBuffer = branding.logoBuffer
+    const money = makeMoney(branding.currency_code)
     const { format = 'pdf' } = req.query
     const data = await getSuppliersReportData()
     const { suppliers, summary } = data
@@ -1027,7 +1043,7 @@ async function suppliersReport(req, res, next) {
     }
 
     const doc = newDoc(res, 'Reporte de Proveedores')
-    header(doc, 'Reporte de Proveedores', 'Actual', companyName)
+    header(doc, 'Reporte de Proveedores', 'Actual', companyName, logoBuffer)
     sectionTitle(doc, 'Resumen')
     drawSummaryCards(doc, [
       { label: 'Total proveedores', value: String(summary.totalSuppliers) },
@@ -1099,9 +1115,10 @@ async function suppliersReport(req, res, next) {
 
 async function financialReport(req, res, next) {
   try {
-    const config = await getSystemConfig(prisma)
-    const companyName = config.company_name
-    const money = makeMoney(config.currency_code)
+    const branding = await getBrandingForPdf(prisma)
+    const companyName = branding.company_name
+    const logoBuffer = branding.logoBuffer
+    const money = makeMoney(branding.currency_code)
     const { period = 'month', year, format = 'pdf', month, quarter, semester } = req.query
     const { startUtc, endUtc, label } = periodRange(period, year, { month, quarter, semester })
     const data = await getFinancialData(startUtc, endUtc)
@@ -1161,7 +1178,7 @@ async function financialReport(req, res, next) {
     }
 
     const doc = newDoc(res, 'Reporte Financiero')
-    header(doc, 'Reporte Financiero', label, companyName)
+    header(doc, 'Reporte Financiero', label, companyName, logoBuffer)
 
     sectionTitle(doc, 'Resumen - inventario, compras y margen')
     drawSummaryCards(doc, [
@@ -1328,9 +1345,10 @@ async function getAlertsReportData() {
 
 async function alertsReport(req, res, next) {
   try {
-    const config = await getSystemConfig(prisma)
-    const companyName = config.company_name
-    const money = makeMoney(config.currency_code)
+    const branding = await getBrandingForPdf(prisma)
+    const companyName = branding.company_name
+    const logoBuffer = branding.logoBuffer
+    const money = makeMoney(branding.currency_code)
     const { format = 'pdf' } = req.query
     const zone = 'America/Guatemala'
     const data = await getAlertsReportData()
@@ -1423,7 +1441,7 @@ async function alertsReport(req, res, next) {
     }
 
     const doc = newDoc(res, 'Reporte de Alertas')
-    header(doc, 'Reporte de Alertas', 'Actual', companyName)
+    header(doc, 'Reporte de Alertas', 'Actual', companyName, logoBuffer)
 
     sectionTitle(doc, 'Resumen - riesgo de stock y seguimiento')
     drawSummaryCards(doc, [
@@ -1673,9 +1691,10 @@ async function getProductsAnalysisData() {
 
 async function productsReport(req, res, next) {
   try {
-    const config = await getSystemConfig(prisma)
-    const companyName = config.company_name
-    const money = makeMoney(config.currency_code)
+    const branding = await getBrandingForPdf(prisma)
+    const companyName = branding.company_name
+    const logoBuffer = branding.logoBuffer
+    const money = makeMoney(branding.currency_code)
     const zone = 'America/Guatemala'
     const { format = 'pdf' } = req.query
     const data = await getProductsAnalysisData()
@@ -1796,7 +1815,7 @@ async function productsReport(req, res, next) {
     }
 
     const doc = newDoc(res, 'Análisis de Productos')
-    header(doc, 'Análisis de Productos', 'Actual', companyName)
+    header(doc, 'Análisis de Productos', 'Actual', companyName, logoBuffer)
 
     sectionTitle(doc, 'Resumen - catálogo y rentabilidad de existencias')
     drawSummaryCards(doc, [
@@ -1982,9 +2001,10 @@ async function inventoryCountSessionReport(req, res, next) {
       },
     })
 
-    const config = await getSystemConfig(prisma)
-    const companyName = config.company_name
-    const money = makeMoney(config.currency_code)
+    const branding = await getBrandingForPdf(prisma)
+    const companyName = branding.company_name
+    const logoBuffer = branding.logoBuffer
+    const money = makeMoney(branding.currency_code)
 
     if (format === 'csv' || format === 'excel') {
       const rows = lines.map((L) => {
@@ -2014,7 +2034,7 @@ async function inventoryCountSessionReport(req, res, next) {
           `Estado,${inventoryCountStatusLabel(session.status)}`,
           session.submit_reason ? `Motivo envío revisión,${String(session.submit_reason).replace(/,/g, ';')}` : null,
           session.first_approved_at
-            ? `1.ª aprobación,${session.firstApprovedBy?.name || '—'} · ${DateTime.fromJSDate(session.first_approved_at).setZone(config.timezone || 'America/Guatemala').toFormat('dd/LL/yyyy HH:mm')}`
+            ? `1.ª aprobación,${session.firstApprovedBy?.name || '—'} · ${DateTime.fromJSDate(session.first_approved_at).setZone(branding.timezone || 'America/Guatemala').toFormat('dd/LL/yyyy HH:mm')}`
             : null,
           session.first_approval_reason
             ? `Motivo 1.ª aprobación,${String(session.first_approval_reason).replace(/,/g, ';')}`
@@ -2023,7 +2043,7 @@ async function inventoryCountSessionReport(req, res, next) {
             ? `Motivo aprobación final,${String(session.final_approval_reason).replace(/,/g, ';')}`
             : null,
           `Creado por,${session.createdBy?.name || '—'}`,
-          `Generado,${DateTime.now().setZone(config.timezone || 'America/Guatemala').toFormat('yyyy-LL-dd HH:mm')}`,
+          `Generado,${DateTime.now().setZone(branding.timezone || 'America/Guatemala').toFormat('yyyy-LL-dd HH:mm')}`,
         ].filter(Boolean),
         [
           {
@@ -2036,6 +2056,14 @@ async function inventoryCountSessionReport(req, res, next) {
     }
 
     const doc = newDoc(res, `Inventariado ${session.name || id.slice(0, 8)}`)
+    if (logoBuffer) {
+      try {
+        doc.image(logoBuffer, doc.page.margins.left, doc.y, { fit: [44, 26] })
+        doc.moveDown(1.8)
+      } catch {
+        /* sin logo */
+      }
+    }
     doc.fontSize(16).fillColor(BRAND.primary).text('Inventariado (conteo físico)', { align: 'left' })
     doc.moveDown(0.3)
     doc
@@ -2043,14 +2071,14 @@ async function inventoryCountSessionReport(req, res, next) {
       .fillColor(BRAND.muted)
       .text(`${companyName} · ${inventoryCountStatusLabel(session.status)}`, { continued: false })
     doc.text(
-      `Sesión: ${session.name || id} · Creado: ${session.createdBy?.name || '—'} · ${DateTime.fromJSDate(session.created_at).setZone(config.timezone || 'America/Guatemala').toFormat('dd/LL/yyyy HH:mm')}`
+      `Sesión: ${session.name || id} · Creado: ${session.createdBy?.name || '—'} · ${DateTime.fromJSDate(session.created_at).setZone(branding.timezone || 'America/Guatemala').toFormat('dd/LL/yyyy HH:mm')}`
     )
     if (session.submit_reason) {
       doc.text(`Motivo envío a revisión: ${String(session.submit_reason).slice(0, 500)}`)
     }
     if (session.first_approved_at) {
       doc.text(
-        `1.ª aprobación: ${DateTime.fromJSDate(session.first_approved_at).setZone(config.timezone || 'America/Guatemala').toFormat('dd/LL/yyyy HH:mm')} · ${session.firstApprovedBy?.name || '—'}`
+        `1.ª aprobación: ${DateTime.fromJSDate(session.first_approved_at).setZone(branding.timezone || 'America/Guatemala').toFormat('dd/LL/yyyy HH:mm')} · ${session.firstApprovedBy?.name || '—'}`
       )
     }
     if (session.first_approval_reason) {
@@ -2058,7 +2086,7 @@ async function inventoryCountSessionReport(req, res, next) {
     }
     if (session.approved_at) {
       doc.text(
-        `Aprobación final: ${DateTime.fromJSDate(session.approved_at).setZone(config.timezone || 'America/Guatemala').toFormat('dd/LL/yyyy HH:mm')} · ${session.approvedBy?.name || '—'}`
+        `Aprobación final: ${DateTime.fromJSDate(session.approved_at).setZone(branding.timezone || 'America/Guatemala').toFormat('dd/LL/yyyy HH:mm')} · ${session.approvedBy?.name || '—'}`
       )
     }
     if (session.final_approval_reason) {
@@ -2122,10 +2150,11 @@ function inventoryCountStatusLabel(status) {
  */
 async function inventoryCountsHistoryReport(req, res, next) {
   try {
-    const config = await getSystemConfig(prisma)
-    const companyName = config.company_name
-    const money = makeMoney(config.currency_code)
-    const zone = config.timezone || 'America/Guatemala'
+    const branding = await getBrandingForPdf(prisma)
+    const companyName = branding.company_name
+    const logoBuffer = branding.logoBuffer
+    const money = makeMoney(branding.currency_code)
+    const zone = branding.timezone || 'America/Guatemala'
     const { period = 'month', year, format = 'pdf', month, quarter, semester } = req.query
     const { startUtc, endUtc, label } = periodRange(period, year, { month, quarter, semester }, zone)
 

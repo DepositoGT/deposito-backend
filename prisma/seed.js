@@ -315,6 +315,7 @@ async function main() {
     { key: 'currency_name', value: 'Quetzal', type: 'string', description: 'Nombre de la moneda' },
     { key: 'timezone', value: 'America/Guatemala', type: 'string', description: 'Zona horaria del sistema' },
     { key: 'company_name', value: 'Mi Empresa', type: 'string', description: 'Nombre o razón social de la empresa' },
+    { key: 'company_logo_url', value: '', type: 'string', description: 'URL pública del logo del negocio (Supabase bucket logo)' },
     { key: 'cash_closure_denominations', value: defaultDenominations, type: 'json', description: 'Denominaciones para conteo de cierre de caja' },
     // Datos fiscales (preparación FEL)
     { key: 'company_nit', value: '', type: 'string', description: 'NIT del emisor' },

@@ -16,7 +16,8 @@ const { createClient } = require('@supabase/supabase-js')
 
 // Reuse shared stock alert service
 const { ensureStockAlert } = require('../services/stockAlerts')
-const { getTimezone, getSystemConfig } = require('../utils/getTimezone')
+const { getTimezone } = require('../utils/getTimezone')
+const { getBrandingForPdf } = require('../utils/pdfBranding')
 
 // Bulk import service
 const { parseExcel, validateBulkData, bulkCreateProducts, generateTemplateWithCatalogs } = require('../services/bulkImport')
@@ -416,9 +417,9 @@ exports.remove = async (req, res, next) => {
 
 exports.reportPdf = async (req, res, next) => {
   try {
-    const config = await getSystemConfig(prisma)
-    const companyName = config.company_name
-    const currencyCode = (config.currency_code && config.currency_code.trim()) || 'GTQ'
+    const branding = await getBrandingForPdf(prisma)
+    const companyName = branding.company_name
+    const currencyCode = (branding.currency_code && branding.currency_code.trim()) || 'GTQ'
     const money = (v) => new Intl.NumberFormat('es-GT', { style: 'currency', currency: currencyCode }).format(Number(v || 0))
     const where = { deleted: false }
     const idsParam = req.query.ids
@@ -501,6 +502,14 @@ exports.reportPdf = async (req, res, next) => {
     }
 
     // Header block
+    if (branding.logoBuffer) {
+      try {
+        doc.image(branding.logoBuffer, doc.page.margins.left, doc.y, { fit: [48, 28] })
+        doc.moveDown(2)
+      } catch {
+        /* sin logo */
+      }
+    }
     doc.fillColor('#0b1220').fontSize(22).font('Helvetica-Bold').text(`${companyName} - Informe de Productos`, { align: 'left' })
     doc.moveDown(0.25)
     doc.fontSize(10).font('Helvetica').fillColor('#475569').text(`Generado: ${new Date().toLocaleString('es-GT')}`)
