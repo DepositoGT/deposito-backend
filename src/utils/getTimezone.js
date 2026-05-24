@@ -10,7 +10,7 @@ const DEFAULT_COMPANY_NAME = 'Depósito'
 const DEFAULT_CURRENCY_CODE = 'GTQ'
 const DEFAULT_CURRENCY_NAME = 'Quetzal'
 
-const RUNTIME_KEYS = ['timezone', 'company_name', 'currency_code', 'currency_name']
+const RUNTIME_KEYS = ['timezone', 'company_name', 'company_logo_url', 'currency_code', 'currency_name']
 
 /** Caché en memoria: { data, expiresAt } */
 let systemConfigCache = null
@@ -39,6 +39,7 @@ async function getSystemConfig(prisma) {
   const data = {
     timezone: DEFAULT_TZ,
     company_name: DEFAULT_COMPANY_NAME,
+    company_logo_url: '',
     currency_code: DEFAULT_CURRENCY_CODE,
     currency_name: DEFAULT_CURRENCY_NAME
   }

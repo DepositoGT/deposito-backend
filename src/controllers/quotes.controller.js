@@ -150,7 +150,10 @@ exports.getPublicByToken = async (req, res, next) => {
       return res.status(410).json({ message: 'Esta cotización ya no está disponible' })
     }
 
-    const companyRow = await prisma.systemSetting.findUnique({ where: { key: 'company_name' } })
+    const companyRows = await prisma.systemSetting.findMany({
+      where: { key: { in: ['company_name', 'company_logo_url'] } },
+    })
+    const companyMap = Object.fromEntries(companyRows.map((r) => [r.key, r.value]))
 
     res.json({
       reference: quote.reference,
@@ -162,7 +165,8 @@ exports.getPublicByToken = async (req, res, next) => {
       subtotal: quote.subtotal,
       total: quote.total,
       notes: quote.notes,
-      company_name: companyRow?.value || 'Depósito',
+      company_name: companyMap.company_name || 'Depósito',
+      company_logo_url: (companyMap.company_logo_url && String(companyMap.company_logo_url).trim()) || '',
       lines: quote.lines.map((l) => ({
         product_name: l.product?.name,
         barcode: l.product?.barcode,
