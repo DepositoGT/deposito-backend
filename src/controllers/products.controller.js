@@ -21,7 +21,6 @@ const { getBrandingForPdf } = require('../utils/pdfBranding')
 
 // Bulk import service
 const { parseExcel, validateBulkData, bulkCreateProducts, generateTemplateWithCatalogs } = require('../services/bulkImport')
-const { getAvailabilityBatch } = require('../services/stockAvailability')
 const {
   parseKind,
   replaceProductBom,
@@ -369,6 +368,12 @@ exports.update = async (req, res, next) => {
       safePayload.kind = parseKind(safePayload.kind)
       if (safePayload.kind === 'KIT') {
         safePayload.stock = 0
+        const bomCount = await prisma.productBomLine.count({ where: { kit_product_id: id } })
+        if (bomCount === 0) {
+          return res.status(400).json({
+            message: 'Un kit debe tener al menos un componente. Configúralos con PUT /api/products/:id/bom antes de marcar kind=KIT.',
+          })
+        }
       }
     }
 
