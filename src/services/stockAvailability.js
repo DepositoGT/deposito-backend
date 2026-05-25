@@ -58,7 +58,7 @@ async function getAvailability(productId, tx) {
   return { stock, reserved, available: Math.max(0, stock - reserved) }
 }
 
-async function getAvailabilityBatch(productIds, tx) {
+async function getAvailabilityBatch(productIds, tx, { excludeDocumentId } = {}) {
   const client = tx || prisma
   const ids = [...new Set(productIds.filter(Boolean))]
   if (ids.length === 0) return {}
@@ -68,12 +68,22 @@ async function getAvailabilityBatch(productIds, tx) {
     select: { id: true, stock: true },
   })
 
-  const reservedRows = await client.stockReservation.groupBy({
-    by: ['product_id'],
-    where: { product_id: { in: ids }, status: ACTIVE },
-    _sum: { qty: true },
+  const reservationWhere = {
+    product_id: { in: ids },
+    status: ACTIVE,
+  }
+  if (excludeDocumentId) {
+    reservationWhere.document_id = { not: excludeDocumentId }
+  }
+
+  const reservedRows = await client.stockReservation.findMany({
+    where: reservationWhere,
+    select: { product_id: true, qty: true },
   })
-  const reservedMap = new Map(reservedRows.map((r) => [r.product_id, Number(r._sum.qty || 0)]))
+  const reservedMap = new Map()
+  for (const row of reservedRows) {
+    reservedMap.set(row.product_id, (reservedMap.get(row.product_id) || 0) + Number(row.qty || 0))
+  }
 
   const out = {}
   for (const p of products) {
@@ -88,7 +98,7 @@ async function getAvailabilityBatch(productIds, tx) {
  * Valida disponibilidad agregada por producto (líneas duplicadas).
  * @param {Array<{ product_id: string, qty: number }>} lines
  */
-async function assertLinesAvailable(tx, lines, { skipProductIds = [] } = {}) {
+async function assertLinesAvailable(tx, lines, { skipProductIds = [], excludeDocumentId } = {}) {
   const { expandLinesToStockMap, stockMapToLines } = require('./bomStock')
   const skip = new Set(skipProductIds.map(String))
   const stockMap = await expandLinesToStockMap(tx, lines)
@@ -105,7 +115,7 @@ async function assertLinesAvailable(tx, lines, { skipProductIds = [] } = {}) {
   if (productIds.length === 0) return
 
   const locked = await lockProductsForUpdate(tx, productIds)
-  const availabilityMap = await getAvailabilityBatch(productIds, tx)
+  const availabilityMap = await getAvailabilityBatch(productIds, tx, { excludeDocumentId })
 
   for (const [productId, requested] of byProduct.entries()) {
     const row = locked.get(productId)

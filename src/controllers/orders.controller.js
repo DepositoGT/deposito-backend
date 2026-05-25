@@ -555,7 +555,8 @@ exports.convertToSale = async (req, res, next) => {
 
       await assertLinesAvailable(
         tx,
-        fulfillments.map(({ line, qty }) => ({ product_id: line.product_id, qty }))
+        fulfillments.map(({ line, qty }) => ({ product_id: line.product_id, qty })),
+        { excludeDocumentId: order.id }
       )
 
       const completadaStatus = await tx.saleStatus.findFirst({ where: { name: 'Completada' } })
