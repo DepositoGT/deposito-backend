@@ -22,6 +22,12 @@ const { getBrandingForPdf } = require('../utils/pdfBranding')
 // Bulk import service
 const { parseExcel, validateBulkData, bulkCreateProducts, generateTemplateWithCatalogs } = require('../services/bulkImport')
 const { getAvailabilityBatch } = require('../services/stockAvailability')
+const {
+  parseKind,
+  replaceProductBom,
+  BOM_INCLUDE,
+  getAvailabilityBatchWithKits,
+} = require('../services/bomStock')
 
 // Inicializar cliente de Supabase con service role key (solo para backend)
 const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL
@@ -130,6 +136,17 @@ exports.create = async (req, res, next) => {
       }
     }
 
+    const kind = parseKind(payload.kind)
+    const bomComponents = payload.bom_components
+    delete safePayload.bom_components
+    delete safePayload.kind
+    if (kind === 'KIT') {
+      safePayload.kind = 'KIT'
+      safePayload.stock = 0
+    } else {
+      safePayload.kind = 'STANDARD'
+    }
+
     // create product and, if initial stock > 0, create a purchase log in the same transaction
     // Use prismaTransaction (DIRECT_URL) for transactions as pooled connections don't support them
     const result = await prismaTransaction.$transaction(async (tx) => {
@@ -153,9 +170,18 @@ exports.create = async (req, res, next) => {
         }
       }
 
+      if (kind === 'KIT') {
+        if (!bomComponents?.length) {
+          const err = new Error('Un kit debe incluir al menos un componente (bom_components)')
+          err.status = 400
+          throw err
+        }
+        await replaceProductBom(tx, product.id, bomComponents)
+      }
+
       let purchaseLog = null
 
-      if (stock > 0) {
+      if (stock > 0 && kind !== 'KIT') {
         // supplier_id is required on Product model, but validate to ensure purchase log can be created
         const supplierId = product.supplier_id || payload.supplier_id
         if (!supplierId) {
@@ -215,10 +241,63 @@ exports.create = async (req, res, next) => {
 
 exports.getOne = async (req, res, next) => {
   try {
-    const item = await prisma.product.findUnique({ where: { id: req.params.id } })
+    const item = await prisma.product.findUnique({
+      where: { id: req.params.id },
+      include: BOM_INCLUDE,
+    })
     if (!item || item.deleted) return res.status(404).json({ message: 'No encontrado' })
     res.json(item)
   } catch (e) { next(e) }
+}
+
+exports.getBom = async (req, res, next) => {
+  try {
+    const product = await prisma.product.findFirst({
+      where: { id: req.params.id, deleted: false },
+      select: { id: true, name: true, kind: true },
+    })
+    if (!product) return res.status(404).json({ message: 'Producto no encontrado' })
+    if (product.kind !== 'KIT') {
+      return res.json({ kind: product.kind, components: [] })
+    }
+    const components = await prisma.productBomLine.findMany({
+      where: { kit_product_id: product.id },
+      orderBy: { sort_order: 'asc' },
+      include: {
+        component_product: {
+          select: { id: true, name: true, barcode: true, price: true, stock: true, kind: true },
+        },
+      },
+    })
+    res.json({ kind: product.kind, components })
+  } catch (e) {
+    next(e)
+  }
+}
+
+exports.updateBom = async (req, res, next) => {
+  try {
+    const id = req.params.id
+    const { components } = req.body || {}
+    const updated = await prismaTransaction.$transaction(async (tx) => {
+      const product = await tx.product.findFirst({
+        where: { id, deleted: false },
+        select: { id: true, kind: true },
+      })
+      if (!product) {
+        const err = new Error('Producto no encontrado')
+        err.status = 404
+        throw err
+      }
+      if (product.kind !== 'KIT') {
+        await tx.product.update({ where: { id }, data: { kind: 'KIT', stock: 0 } })
+      }
+      return replaceProductBom(tx, id, components)
+    })
+    res.json({ components: updated })
+  } catch (e) {
+    next(e)
+  }
 }
 
 /**
@@ -238,7 +317,7 @@ exports.availability = async (req, res, next) => {
     if (ids.length > 200) {
       return res.status(400).json({ message: 'Máximo 200 productos por consulta' })
     }
-    const availability = await getAvailabilityBatch(ids)
+    const availability = await getAvailabilityBatchWithKits(ids)
     res.json({ availability })
   } catch (e) {
     next(e)
@@ -278,10 +357,18 @@ exports.update = async (req, res, next) => {
       'supplier_id',
       'status_id',
       'available_for_sale',
+      'kind',
     ]
     for (const field of allowedFields) {
       if (payload[field] !== undefined) {
         safePayload[field] = payload[field]
+      }
+    }
+
+    if (safePayload.kind !== undefined) {
+      safePayload.kind = parseKind(safePayload.kind)
+      if (safePayload.kind === 'KIT') {
+        safePayload.stock = 0
       }
     }
 

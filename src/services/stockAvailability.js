@@ -89,9 +89,13 @@ async function getAvailabilityBatch(productIds, tx) {
  * @param {Array<{ product_id: string, qty: number }>} lines
  */
 async function assertLinesAvailable(tx, lines, { skipProductIds = [] } = {}) {
+  const { expandLinesToStockMap, stockMapToLines } = require('./bomStock')
   const skip = new Set(skipProductIds.map(String))
+  const stockMap = await expandLinesToStockMap(tx, lines)
+  const flatLines = await stockMapToLines(stockMap)
+
   const byProduct = new Map()
-  for (const line of lines) {
+  for (const line of flatLines) {
     const pid = String(line.product_id)
     if (skip.has(pid)) continue
     byProduct.set(pid, (byProduct.get(pid) || 0) + Number(line.qty || 0))
