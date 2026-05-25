@@ -24,7 +24,8 @@ const {
   appendSaleSearchFilter,
   MIN_TEXT_SEARCH_LEN,
 } = require('../services/saleSearch')
-const { getAvailabilityBatch } = require('../services/stockAvailability')
+const { expandLinesToStockMap, deductStockMap, restoreStockMap, getAvailabilityBatchWithKits } = require('../services/bomStock')
+const { nextDocumentReference } = require('../services/referenceGenerator')
 
 /** Include ligero para listados (tabla / búsqueda). Detalle completo en GET /sales/:id */
 const SALE_LIST_INCLUDE = {
@@ -403,7 +404,7 @@ exports.create = async (req, res, next) => {
         },
       })
       const prodMap = new Map(products.map(p => [String(p.id), p]))
-      const availabilityMap = await getAvailabilityBatch(productIds, tx)
+      const availabilityMap = await getAvailabilityBatchWithKits(productIds, tx)
       // Verifica existencia y stock suficiente por producto (considera cantidades sumadas si hay repetidos)
       for (const pid of productIds) {
         const p = prodMap.get(pid)
@@ -621,42 +622,7 @@ exports.create = async (req, res, next) => {
       console.log('[SALE DATE] Guatemala local time:', nowGt.toFormat('yyyy-MM-dd HH:mm:ss'));
       console.log('[SALE DATE] Will be stored in DB as:', DateTime.fromJSDate(saleDate).toUTC().toFormat('yyyy-MM-dd HH:mm:ss'));
 
-      // Referencia en base62 (0-9, A-Z, a-z) = 62 símbolos → muchas más combinaciones sin repetir
-      const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
-      const toBase62 = (n) => {
-        if (n <= 0) return '0'
-        let s = ''
-        while (n > 0) {
-          s = BASE62[n % 62] + s
-          n = Math.floor(n / 62)
-        }
-        return s
-      }
-      const fromBase62 = (s) => {
-        let n = 0
-        for (let i = 0; i < s.length; i++) {
-          const idx = BASE62.indexOf(s[i])
-          if (idx === -1) return NaN
-          n = n * 62 + idx
-        }
-        return n
-      }
-
-      const lastSale = await tx.sale.findFirst({
-        where: { reference: { not: null } },
-        orderBy: { reference: 'desc' },
-        select: { reference: true },
-      })
-      let nextRef = 'V-000001'
-      if (lastSale?.reference) {
-        const match = String(lastSale.reference).match(/^V-([0-9A-Za-z]+)$/)
-        if (match) {
-          const num = fromBase62(match[1])
-          if (Number.isFinite(num) && num >= 0) {
-            nextRef = 'V-' + toBase62(num + 1).padStart(6, '0')
-          }
-        }
-      }
+      const nextRef = await nextDocumentReference(tx, 'V')
 
       const sale = await tx.sale.create({
         data: {
@@ -692,25 +658,12 @@ exports.create = async (req, res, next) => {
         })),
       })
 
-      // Descontar stock al registrar venta: un solo UPDATE por lote (rápido con muchos ítems)
-      const productQtyMap = new Map()
-      resolvedItems.forEach(it => {
-        const pid = it.product_id
-        const q = Number(it.qty || 0)
-        productQtyMap.set(pid, (productQtyMap.get(pid) || 0) + q)
-      })
-      let updatedProducts = []
-      const entries = Array.from(productQtyMap.entries())
-      if (entries.length > 0) {
-        const values = Prisma.join(entries.map(([id, qty]) => Prisma.sql`(${id}::uuid, ${Number(qty)}::int)`))
-        updatedProducts = await tx.$queryRaw`
-          UPDATE products p
-          SET stock = p.stock - v.qty
-          FROM (VALUES ${values}) AS v(id, qty)
-          WHERE p.id = v.id
-          RETURNING p.id, p.name, p.stock, p.min_stock
-        `
-      }
+      // Descontar stock (kits → componentes)
+      const stockMap = await expandLinesToStockMap(
+        tx,
+        resolvedItems.map((it) => ({ product_id: it.product_id, qty: it.qty }))
+      )
+      const updatedProducts = await deductStockMap(tx, stockMap)
       await ensureStockAlertsBatch(tx, updatedProducts)
 
       // 3) Guardar promociones con descuento efectivo e incrementar solo esos códigos
@@ -810,23 +763,11 @@ exports.updateStatus = async (req, res, next) => {
         if (!wasCompleted && willBeCompleted) {
           console.log(`[STOCK ADJUSTMENT] Venta ${id}: ${prevStatusName} -> Completada. Descontando stock...`)
 
-          // Agrupar items por producto (acumular qty si se repite)
-          const productQtyMap = new Map()
-          current.sale_items.forEach(si => {
-            const currentQty = productQtyMap.get(si.product_id) || 0
-            productQtyMap.set(si.product_id, currentQty + si.qty)
-          })
-
-          // Actualizar productos agrupados en paralelo (menos queries)
-          const updatePromises = Array.from(productQtyMap.entries()).map(([productId, totalQty]) => {
-            console.log(`[STOCK ADJUSTMENT] Producto ${productId}: -${totalQty} unidades`)
-            return tx.product.update({
-              where: { id: productId },
-              data: { stock: { decrement: totalQty } },
-              select: { id: true, name: true, stock: true, min_stock: true }
-            })
-          })
-          const updatedProducts = await Promise.all(updatePromises)
+          const stockMap = await expandLinesToStockMap(
+            tx,
+            current.sale_items.map((si) => ({ product_id: si.product_id, qty: si.qty }))
+          )
+          const updatedProducts = await deductStockMap(tx, stockMap)
 
           updatedProducts.forEach(p => {
             console.log(`[STOCK ADJUSTMENT] ${p.name}: nuevo stock = ${p.stock}`)
@@ -841,23 +782,11 @@ exports.updateStatus = async (req, res, next) => {
         if (wasCompleted && willBeCancelled) {
           console.log(`[STOCK REVERT] Venta ${id}: Completada -> Cancelada. Revirtiendo ajustes de stock...`)
 
-          // Agrupar items por producto (acumular qty si se repite)
-          const productQtyMap = new Map()
-          current.sale_items.forEach(si => {
-            const currentQty = productQtyMap.get(si.product_id) || 0
-            productQtyMap.set(si.product_id, currentQty + si.qty)
-          })
-
-          // Restaurar stock (incrementar las cantidades que se descontaron)
-          const updatePromises = Array.from(productQtyMap.entries()).map(([productId, totalQty]) => {
-            console.log(`[STOCK REVERT] Producto ${productId}: +${totalQty} unidades (restauración)`)
-            return tx.product.update({
-              where: { id: productId },
-              data: { stock: { increment: totalQty } },
-              select: { id: true, name: true, stock: true, min_stock: true }
-            })
-          })
-          const updatedProducts = await Promise.all(updatePromises)
+          const stockMap = await expandLinesToStockMap(
+            tx,
+            current.sale_items.map((si) => ({ product_id: si.product_id, qty: si.qty }))
+          )
+          const updatedProducts = await restoreStockMap(tx, stockMap)
 
           updatedProducts.forEach(p => {
             console.log(`[STOCK REVERT] ${p.name}: stock restaurado = ${p.stock}`)
