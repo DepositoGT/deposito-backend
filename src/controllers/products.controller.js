@@ -377,6 +377,10 @@ exports.update = async (req, res, next) => {
       }
     }
 
+    if (current.kind === 'KIT' || safePayload.kind === 'KIT') {
+      safePayload.stock = 0
+    }
+
     // Opcionales: mayoreo / promoción (null borra en BD)
     for (const decField of ['price_wholesale', 'price_promotion']) {
       if (safePayload[decField] === undefined) continue
@@ -852,6 +856,7 @@ exports.critical = async (req, res, next) => {
 
     // filter server-side for products where stock < min_stock
     const critical = products.filter((p) => {
+      if (p.kind === 'KIT') return false
       const stock = Number(p.stock || 0)
       const min = Number(p.min_stock || 0)
       return stock < min
@@ -978,7 +983,9 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
       // Verify supplier still exists
       const supplier = await tx.supplier.findUnique({ where: { id: supplier_id } })
       if (!supplier || supplier.deleted) {
-        throw new Error('Proveedor no encontrado')
+        const err = new Error('Proveedor no encontrado')
+        err.status = 400
+        throw err
       }
 
       // Verify all products exist and belong to the supplier
@@ -997,7 +1004,16 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
       // Verify all products belong to the supplier
       for (const product of products) {
         if (product.supplier_id !== supplier_id) {
-          throw new Error(`El producto ${product.name} no pertenece al proveedor seleccionado`)
+          const err = new Error(`El producto ${product.name} no pertenece al proveedor seleccionado`)
+          err.status = 400
+          throw err
+        }
+        if (product.kind === 'KIT') {
+          const err = new Error(
+            `No se puede registrar entrada de mercancía sobre el kit "${product.name}". Registra los componentes por separado.`
+          )
+          err.status = 400
+          throw err
         }
       }
 
