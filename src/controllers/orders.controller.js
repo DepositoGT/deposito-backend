@@ -21,7 +21,6 @@ const {
   reserveForDocument,
   releaseByDocument,
   consumePartialByDocument,
-  lockProductsForUpdate,
 } = require('../services/stockAvailability')
 const {
   isOrderFullyFulfilled,
@@ -554,26 +553,10 @@ exports.convertToSale = async (req, res, next) => {
         throw err
       }
 
-      const lockedProducts = await lockProductsForUpdate(
+      await assertLinesAvailable(
         tx,
-        fulfillments.map((f) => f.line.product_id)
+        fulfillments.map(({ line, qty }) => ({ product_id: line.product_id, qty }))
       )
-
-      for (const { line, qty } of fulfillments) {
-        const row = lockedProducts.get(String(line.product_id))
-        if (!row || row.deleted) {
-          const err = new Error(`Producto no encontrado: ${line.product_id}`)
-          err.status = 400
-          throw err
-        }
-        if (Number(row.stock) < qty) {
-          const err = new Error(
-            `Stock físico insuficiente para ${row.name}. Físico: ${row.stock}, entrega: ${qty}`
-          )
-          err.status = 400
-          throw err
-        }
-      }
 
       const completadaStatus = await tx.saleStatus.findFirst({ where: { name: 'Completada' } })
       if (!completadaStatus) throw new Error("No existe el estado 'Completada'")
