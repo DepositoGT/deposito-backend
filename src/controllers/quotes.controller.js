@@ -7,7 +7,13 @@
 const { prisma } = require('../models/prisma')
 const { Prisma } = require('@prisma/client')
 const crypto = require('crypto')
-const { resolvePriceTierForContext, resolveUnitPriceFromProduct, VALID_CHANNELS } = require('../services/priceResolution')
+const {
+  resolvePriceTierForContext,
+  resolveUnitPriceFromProduct,
+  productSupportsPriceTier,
+  parsePriceTier,
+  VALID_CHANNELS,
+} = require('../services/priceResolution')
 const { nextDocumentReference } = require('../services/referenceGenerator')
 const {
   appendCommercialDocSearchFilter,
@@ -258,8 +264,24 @@ async function resolveQuoteLines(tx, items, ctx) {
     }
   }
 
-  const priceTier = await resolvePriceTierForContext(tx, ctx)
+  const priceTier = ctx.explicitPriceTier
+    ? ctx.explicitPriceTier
+    : await resolvePriceTierForContext(tx, ctx)
   const priceNow = new Date()
+
+  if (ctx.explicitPriceTier) {
+    for (const pid of productIds) {
+      const p = prodMap.get(pid)
+      const check = productSupportsPriceTier(p, priceTier, priceNow)
+      if (!check.ok) {
+        const err = new Error(
+          `Producto "${p.name}": ${check.reason === 'sin precio promocional' || check.reason === 'promoción vencida o no vigente' ? 'no tiene promoción activa' : check.reason}`
+        )
+        err.status = 400
+        throw err
+      }
+    }
+  }
 
   const normalized = []
   let sortOrder = 0
@@ -372,9 +394,11 @@ exports.create = async (req, res, next) => {
       sales_channel: salesChannelRaw,
       notes,
       valid_until: validUntilRaw,
+      price_tier: priceTierRaw,
     } = req.body || {}
 
     const salesChannel = parseSalesChannel(salesChannelRaw)
+    const explicitPriceTier = parsePriceTier(priceTierRaw)
     let customerContactId = null
     if (customerContactIdRaw != null && String(customerContactIdRaw).trim() !== '') {
       customerContactId = String(customerContactIdRaw).trim()
@@ -385,6 +409,7 @@ exports.create = async (req, res, next) => {
       const { lines, subtotal, total } = await resolveQuoteLines(tx, items, {
         customerContactId,
         salesChannel,
+        explicitPriceTier,
       })
 
       await assertLinesAvailable(
@@ -456,9 +481,11 @@ exports.update = async (req, res, next) => {
       sales_channel: salesChannelRaw,
       notes,
       valid_until: validUntilRaw,
+      price_tier: priceTierRaw,
     } = req.body || {}
 
     const salesChannel = parseSalesChannel(salesChannelRaw ?? existing.sales_channel)
+    const explicitPriceTier = parsePriceTier(priceTierRaw)
     let customerContactId = existing.customer_contact_id
     if (customerContactIdRaw !== undefined) {
       customerContactId =
@@ -472,6 +499,7 @@ exports.update = async (req, res, next) => {
       const { lines, subtotal, total } = await resolveQuoteLines(tx, items, {
         customerContactId,
         salesChannel,
+        explicitPriceTier,
       })
 
       await assertLinesAvailable(

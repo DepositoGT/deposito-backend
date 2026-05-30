@@ -11,6 +11,17 @@
 const { prisma } = require('../models/prisma')
 const { DateTime } = require('luxon')
 const { ensureStockAlertsBatch } = require('../services/stockAlerts')
+const { expandLinesToStockMap, restoreStockMap } = require('../services/bomStock')
+
+async function restoreReturnItemsStock(tx, returnItems) {
+  const stockMap = await expandLinesToStockMap(
+    tx,
+    returnItems.map((item) => ({ product_id: item.product_id, qty: item.qty_returned }))
+  )
+  const updatedProducts = await restoreStockMap(tx, stockMap)
+  await ensureStockAlertsBatch(tx, updatedProducts)
+  return updatedProducts
+}
 
 /** Resuelve sale_id (UUID o referencia ej. V-000001) al id interno de la venta */
 async function resolveSaleId(saleIdOrRef) {
@@ -492,64 +503,20 @@ exports.updateStatus = async (req, res, next) => {
 
         // 4c. Restaurar stock de productos (solo cuando se completa desde Pendiente)
         console.log(`[RETURN STOCK RESTORE] Return ${id}: ${prevStatusName} -> ${newStatusName}. Restaurando stock al completar...`)
-        
-        // Agrupar cantidades por producto
-        const productQtyMap = new Map()
-        currentReturn.return_items.forEach(item => {
-          const current = productQtyMap.get(item.product_id) || 0
-          productQtyMap.set(item.product_id, current + item.qty_returned)
-        })
-
-        // Restaurar stock en paralelo
-        const updatePromises = Array.from(productQtyMap.entries()).map(([productId, qty]) => {
-          console.log(`[RETURN STOCK RESTORE] Producto ${productId}: +${qty} unidades`)
-          return tx.product.update({
-            where: { id: productId },
-            data: { stock: { increment: qty } },
-            select: { id: true, name: true, stock: true, min_stock: true }
-          })
-        })
-
-        const updatedProducts = await Promise.all(updatePromises)
-
-        updatedProducts.forEach(p => {
+        const updatedProducts = await restoreReturnItemsStock(tx, currentReturn.return_items)
+        updatedProducts.forEach((p) => {
           console.log(`[RETURN STOCK RESTORE] ${p.name}: stock restaurado = ${p.stock}`)
         })
-
-        // Actualizar alertas de stock
-        await ensureStockAlertsBatch(tx, updatedProducts)
         console.log(`[RETURN STOCK RESTORE] Alertas de stock actualizadas`)
       }
 
       // CASO 3: Si se aprueba desde "Pendiente", restaurar stock solo si restore_stock es true
       if (isApproving && shouldRestoreStock) {
         console.log(`[RETURN STOCK RESTORE] Return ${id}: ${prevStatusName} -> ${newStatusName}. Restaurando stock solamente...`)
-
-        // Agrupar cantidades por producto
-        const productQtyMap = new Map()
-        currentReturn.return_items.forEach(item => {
-          const current = productQtyMap.get(item.product_id) || 0
-          productQtyMap.set(item.product_id, current + item.qty_returned)
-        })
-
-        // Restaurar stock en paralelo
-        const updatePromises = Array.from(productQtyMap.entries()).map(([productId, qty]) => {
-          console.log(`[RETURN STOCK RESTORE] Producto ${productId}: +${qty} unidades`)
-          return tx.product.update({
-            where: { id: productId },
-            data: { stock: { increment: qty } },
-            select: { id: true, name: true, stock: true, min_stock: true }
-          })
-        })
-
-        const updatedProducts = await Promise.all(updatePromises)
-
-        updatedProducts.forEach(p => {
+        const updatedProducts = await restoreReturnItemsStock(tx, currentReturn.return_items)
+        updatedProducts.forEach((p) => {
           console.log(`[RETURN STOCK RESTORE] ${p.name}: stock restaurado = ${p.stock}`)
         })
-
-        // Actualizar alertas de stock
-        await ensureStockAlertsBatch(tx, updatedProducts)
         console.log(`[RETURN STOCK RESTORE] Alertas de stock actualizadas`)
       } else if (isApproving && !shouldRestoreStock) {
         console.log(`[RETURN STATUS UPDATE] Return ${id}: ${prevStatusName} -> ${newStatusName}. Stock NO será restaurado (restore_stock=false)`)

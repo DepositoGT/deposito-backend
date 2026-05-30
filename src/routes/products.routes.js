@@ -295,6 +295,8 @@ router.post(
  *               $ref: '#/components/schemas/Product'
  *       404: { description: No encontrado }
  */
+router.get('/:id/bom', Products.getBom)
+router.put('/:id/bom', Auth, hasPermission('products.edit'), Products.updateBom)
 router.get('/:id', Products.getOne)
 
 /**
