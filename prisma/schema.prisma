@@ -47,6 +47,11 @@ model StockStatus {
   @@map("stock_statuses")
 }
 
+enum ProductKind {
+  STANDARD
+  KIT
+}
+
 model PaymentMethod {
   id                    Int                  @id @default(autoincrement())
   name                  String               @unique @db.VarChar(50)
@@ -222,11 +227,14 @@ model Product {
   barcode                    String?                   @unique @db.VarChar(100)
   /// Si es false, el producto no aparece en el punto de venta ni puede venderse por la API.
   available_for_sale         Boolean                   @default(true)
+  kind                       ProductKind               @default(STANDARD)
   description                String?                   @db.Text
   deleted                    Boolean                   @default(false)
   deleted_at                 DateTime?
   status_id                  Int
   status                     StockStatus               @relation(fields: [status_id], references: [id])
+  kit_components             ProductBomLine[]          @relation("KitParent")
+  used_in_kits               ProductBomLine[]          @relation("KitComponent")
   alerts                     Alert[]
   sale_items                 SaleItem[]
   purchase_logs              PurchaseLog[]
@@ -238,6 +246,21 @@ model Product {
   stock_reservations         StockReservation[]
 
   @@map("products")
+}
+
+model ProductBomLine {
+  id                   String  @id @default(uuid()) @db.Uuid
+  kit_product_id       String  @db.Uuid
+  kit_product          Product @relation("KitParent", fields: [kit_product_id], references: [id], onDelete: Cascade)
+  component_product_id String  @db.Uuid
+  component_product    Product @relation("KitComponent", fields: [component_product_id], references: [id], onDelete: Restrict)
+  qty_per_unit         Int     @default(1)
+  sort_order           Int     @default(0)
+
+  @@unique([kit_product_id, component_product_id])
+  @@index([kit_product_id], map: "idx_product_bom_lines_kit")
+  @@index([component_product_id], map: "idx_product_bom_lines_component")
+  @@map("product_bom_lines")
 }
 
 model Role {

@@ -21,7 +21,12 @@ const { getBrandingForPdf } = require('../utils/pdfBranding')
 
 // Bulk import service
 const { parseExcel, validateBulkData, bulkCreateProducts, generateTemplateWithCatalogs } = require('../services/bulkImport')
-const { getAvailabilityBatch } = require('../services/stockAvailability')
+const {
+  parseKind,
+  replaceProductBom,
+  BOM_INCLUDE,
+  getAvailabilityBatchWithKits,
+} = require('../services/bomStock')
 
 // Inicializar cliente de Supabase con service role key (solo para backend)
 const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL
@@ -130,6 +135,17 @@ exports.create = async (req, res, next) => {
       }
     }
 
+    const kind = parseKind(payload.kind)
+    const bomComponents = payload.bom_components
+    delete safePayload.bom_components
+    delete safePayload.kind
+    if (kind === 'KIT') {
+      safePayload.kind = 'KIT'
+      safePayload.stock = 0
+    } else {
+      safePayload.kind = 'STANDARD'
+    }
+
     // create product and, if initial stock > 0, create a purchase log in the same transaction
     // Use prismaTransaction (DIRECT_URL) for transactions as pooled connections don't support them
     const result = await prismaTransaction.$transaction(async (tx) => {
@@ -153,9 +169,18 @@ exports.create = async (req, res, next) => {
         }
       }
 
+      if (kind === 'KIT') {
+        if (!bomComponents?.length) {
+          const err = new Error('Un kit debe incluir al menos un componente (bom_components)')
+          err.status = 400
+          throw err
+        }
+        await replaceProductBom(tx, product.id, bomComponents)
+      }
+
       let purchaseLog = null
 
-      if (stock > 0) {
+      if (stock > 0 && kind !== 'KIT') {
         // supplier_id is required on Product model, but validate to ensure purchase log can be created
         const supplierId = product.supplier_id || payload.supplier_id
         if (!supplierId) {
@@ -215,10 +240,63 @@ exports.create = async (req, res, next) => {
 
 exports.getOne = async (req, res, next) => {
   try {
-    const item = await prisma.product.findUnique({ where: { id: req.params.id } })
+    const item = await prisma.product.findUnique({
+      where: { id: req.params.id },
+      include: BOM_INCLUDE,
+    })
     if (!item || item.deleted) return res.status(404).json({ message: 'No encontrado' })
     res.json(item)
   } catch (e) { next(e) }
+}
+
+exports.getBom = async (req, res, next) => {
+  try {
+    const product = await prisma.product.findFirst({
+      where: { id: req.params.id, deleted: false },
+      select: { id: true, name: true, kind: true },
+    })
+    if (!product) return res.status(404).json({ message: 'Producto no encontrado' })
+    if (product.kind !== 'KIT') {
+      return res.json({ kind: product.kind, components: [] })
+    }
+    const components = await prisma.productBomLine.findMany({
+      where: { kit_product_id: product.id },
+      orderBy: { sort_order: 'asc' },
+      include: {
+        component_product: {
+          select: { id: true, name: true, barcode: true, price: true, stock: true, kind: true },
+        },
+      },
+    })
+    res.json({ kind: product.kind, components })
+  } catch (e) {
+    next(e)
+  }
+}
+
+exports.updateBom = async (req, res, next) => {
+  try {
+    const id = req.params.id
+    const { components } = req.body || {}
+    const updated = await prismaTransaction.$transaction(async (tx) => {
+      const product = await tx.product.findFirst({
+        where: { id, deleted: false },
+        select: { id: true, kind: true },
+      })
+      if (!product) {
+        const err = new Error('Producto no encontrado')
+        err.status = 404
+        throw err
+      }
+      if (product.kind !== 'KIT') {
+        await tx.product.update({ where: { id }, data: { kind: 'KIT', stock: 0 } })
+      }
+      return replaceProductBom(tx, id, components)
+    })
+    res.json({ components: updated })
+  } catch (e) {
+    next(e)
+  }
 }
 
 /**
@@ -238,7 +316,7 @@ exports.availability = async (req, res, next) => {
     if (ids.length > 200) {
       return res.status(400).json({ message: 'Máximo 200 productos por consulta' })
     }
-    const availability = await getAvailabilityBatch(ids)
+    const availability = await getAvailabilityBatchWithKits(ids)
     res.json({ availability })
   } catch (e) {
     next(e)
@@ -278,11 +356,29 @@ exports.update = async (req, res, next) => {
       'supplier_id',
       'status_id',
       'available_for_sale',
+      'kind',
     ]
     for (const field of allowedFields) {
       if (payload[field] !== undefined) {
         safePayload[field] = payload[field]
       }
+    }
+
+    if (safePayload.kind !== undefined) {
+      safePayload.kind = parseKind(safePayload.kind)
+      if (safePayload.kind === 'KIT') {
+        safePayload.stock = 0
+        const bomCount = await prisma.productBomLine.count({ where: { kit_product_id: id } })
+        if (bomCount === 0) {
+          return res.status(400).json({
+            message: 'Un kit debe tener al menos un componente. Configúralos con PUT /api/products/:id/bom antes de marcar kind=KIT.',
+          })
+        }
+      }
+    }
+
+    if (current.kind === 'KIT' || safePayload.kind === 'KIT') {
+      safePayload.stock = 0
     }
 
     // Opcionales: mayoreo / promoción (null borra en BD)
@@ -760,6 +856,7 @@ exports.critical = async (req, res, next) => {
 
     // filter server-side for products where stock < min_stock
     const critical = products.filter((p) => {
+      if (p.kind === 'KIT') return false
       const stock = Number(p.stock || 0)
       const min = Number(p.min_stock || 0)
       return stock < min
@@ -886,7 +983,9 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
       // Verify supplier still exists
       const supplier = await tx.supplier.findUnique({ where: { id: supplier_id } })
       if (!supplier || supplier.deleted) {
-        throw new Error('Proveedor no encontrado')
+        const err = new Error('Proveedor no encontrado')
+        err.status = 400
+        throw err
       }
 
       // Verify all products exist and belong to the supplier
@@ -905,7 +1004,16 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
       // Verify all products belong to the supplier
       for (const product of products) {
         if (product.supplier_id !== supplier_id) {
-          throw new Error(`El producto ${product.name} no pertenece al proveedor seleccionado`)
+          const err = new Error(`El producto ${product.name} no pertenece al proveedor seleccionado`)
+          err.status = 400
+          throw err
+        }
+        if (product.kind === 'KIT') {
+          const err = new Error(
+            `No se puede registrar entrada de mercancía sobre el kit "${product.name}". Registra los componentes por separado.`
+          )
+          err.status = 400
+          throw err
         }
       }
 
@@ -1280,9 +1388,15 @@ exports.validateImportMapped = async (req, res, next) => {
  */
 exports.pricingPreview = async (req, res, next) => {
   try {
-    const { customer_contact_id: customerContactIdRaw, sales_channel: salesChannelRaw, product_ids: productIdsRaw } =
+    const { customer_contact_id: customerContactIdRaw, sales_channel: salesChannelRaw, product_ids: productIdsRaw, price_tier: priceTierRaw } =
       req.body || {}
-    const { resolvePriceTierForContext, resolveUnitPriceFromProduct, VALID_CHANNELS } = require('../services/priceResolution')
+    const {
+      resolvePriceTierForContext,
+      resolveUnitPriceFromProduct,
+      productSupportsPriceTier,
+      parsePriceTier,
+      VALID_CHANNELS,
+    } = require('../services/priceResolution')
 
     const schRaw = salesChannelRaw != null ? String(salesChannelRaw).toUpperCase() : 'POS'
     const salesChannel = VALID_CHANNELS.has(schRaw) ? schRaw : 'POS'
@@ -1295,19 +1409,28 @@ exports.pricingPreview = async (req, res, next) => {
       ? [...new Set(productIdsRaw.map((x) => String(x)).filter(Boolean))]
       : []
 
-    const tier = await resolvePriceTierForContext(prisma, {
-      customerContactId,
-      salesChannel,
-    })
+    const explicitTier = parsePriceTier(priceTierRaw)
+    const tier = explicitTier
+      ? explicitTier
+      : await resolvePriceTierForContext(prisma, {
+          customerContactId,
+          salesChannel,
+        })
 
     if (ids.length === 0) {
-      return res.json({ price_tier_used: tier, sales_channel: salesChannel, unit_prices: {} })
+      return res.json({
+        price_tier_used: tier,
+        sales_channel: salesChannel,
+        unit_prices: {},
+        tier_unavailable: [],
+      })
     }
 
     const products = await prisma.product.findMany({
       where: { id: { in: ids }, deleted: false, available_for_sale: true },
       select: {
         id: true,
+        name: true,
         price: true,
         price_wholesale: true,
         price_promotion: true,
@@ -1315,10 +1438,24 @@ exports.pricingPreview = async (req, res, next) => {
       },
     })
     const now = new Date()
-    const unit_prices = Object.fromEntries(
-      products.map((p) => [String(p.id), resolveUnitPriceFromProduct(p, tier, now)])
-    )
-    res.json({ price_tier_used: tier, sales_channel: salesChannel, unit_prices })
+    const unit_prices = {}
+    const tier_unavailable = []
+
+    for (const p of products) {
+      if (explicitTier) {
+        const check = productSupportsPriceTier(p, tier, now)
+        if (!check.ok) {
+          tier_unavailable.push({
+            product_id: String(p.id),
+            name: p.name,
+            reason: check.reason,
+          })
+          continue
+        }
+      }
+      unit_prices[String(p.id)] = resolveUnitPriceFromProduct(p, tier, now)
+    }
+    res.json({ price_tier_used: tier, sales_channel: salesChannel, unit_prices, tier_unavailable })
   } catch (e) {
     next(e)
   }

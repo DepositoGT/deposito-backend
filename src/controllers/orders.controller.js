@@ -9,6 +9,7 @@ const { Prisma } = require('@prisma/client')
 const { DateTime } = require('luxon')
 const { getTimezone } = require('../utils/getTimezone')
 const { ensureStockAlertsBatch } = require('../services/stockAlerts')
+const { expandLinesToStockMap, deductStockMap } = require('../services/bomStock')
 const { resolvePriceTierForContext, resolveUnitPriceFromProduct, VALID_CHANNELS } = require('../services/priceResolution')
 const { nextDocumentReference } = require('../services/referenceGenerator')
 const {
@@ -20,7 +21,6 @@ const {
   reserveForDocument,
   releaseByDocument,
   consumePartialByDocument,
-  lockProductsForUpdate,
 } = require('../services/stockAvailability')
 const {
   isOrderFullyFulfilled,
@@ -553,26 +553,11 @@ exports.convertToSale = async (req, res, next) => {
         throw err
       }
 
-      const lockedProducts = await lockProductsForUpdate(
+      await assertLinesAvailable(
         tx,
-        fulfillments.map((f) => f.line.product_id)
+        fulfillments.map(({ line, qty }) => ({ product_id: line.product_id, qty })),
+        { excludeDocumentId: order.id }
       )
-
-      for (const { line, qty } of fulfillments) {
-        const row = lockedProducts.get(String(line.product_id))
-        if (!row || row.deleted) {
-          const err = new Error(`Producto no encontrado: ${line.product_id}`)
-          err.status = 400
-          throw err
-        }
-        if (Number(row.stock) < qty) {
-          const err = new Error(
-            `Stock físico insuficiente para ${row.name}. Físico: ${row.stock}, entrega: ${qty}`
-          )
-          err.status = 400
-          throw err
-        }
-      }
 
       const completadaStatus = await tx.saleStatus.findFirst({ where: { name: 'Completada' } })
       if (!completadaStatus) throw new Error("No existe el estado 'Completada'")
@@ -630,18 +615,11 @@ exports.convertToSale = async (req, res, next) => {
         })),
       })
 
-      const entries = fulfillments.map(({ line, qty }) => [line.product_id, qty])
-      let updatedProducts = []
-      if (entries.length > 0) {
-        const values = Prisma.join(entries.map(([id, qty]) => Prisma.sql`(${id}::uuid, ${Number(qty)}::int)`))
-        updatedProducts = await tx.$queryRaw`
-          UPDATE products p
-          SET stock = p.stock - v.qty
-          FROM (VALUES ${values}) AS v(id, qty)
-          WHERE p.id = v.id
-          RETURNING p.id, p.name, p.stock, p.min_stock
-        `
-      }
+      const stockMap = await expandLinesToStockMap(
+        tx,
+        fulfillments.map(({ line, qty }) => ({ product_id: line.product_id, qty }))
+      )
+      const updatedProducts = await deductStockMap(tx, stockMap)
       await ensureStockAlertsBatch(tx, updatedProducts)
 
       await consumePartialByDocument(

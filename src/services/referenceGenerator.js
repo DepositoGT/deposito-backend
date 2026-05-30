@@ -25,43 +25,68 @@ function fromBase62(s) {
   return n
 }
 
+const REF_LOCK_KEYS = { V: 910001, Q: 910002, P: 910003 }
+
 /**
  * @param {import('@prisma/client').Prisma.TransactionClient} tx
  * @param {'V'|'Q'|'P'} prefix
  */
 async function nextDocumentReference(tx, prefix) {
-  const pattern = new RegExp(`^${prefix}-([0-9A-Za-z]+)$`)
-  let lastRef = null
+  const lockKey = REF_LOCK_KEYS[prefix]
+  if (lockKey != null) {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${lockKey})`
+  }
 
+  const pattern = new RegExp(`^${prefix}-([0-9A-Za-z]+)$`)
+  const formatRef = (num) => `${prefix}-${toBase62(num).padStart(6, '0')}`
+
+  const referenceExists = async (reference) => {
+    if (prefix === 'V') {
+      return Boolean(await tx.sale.findFirst({
+        where: { reference },
+        select: { id: true },
+      }))
+    }
+    return Boolean(await tx.commercialDocument.findFirst({
+      where: { reference },
+      select: { id: true },
+    }))
+  }
+
+  let lastRef = null
   if (prefix === 'V') {
     const last = await tx.sale.findFirst({
-      where: { reference: { not: null } },
+      where: { reference: { startsWith: `${prefix}-` } },
       orderBy: { reference: 'desc' },
       select: { reference: true },
     })
     lastRef = last?.reference
   } else {
     const last = await tx.commercialDocument.findFirst({
-      where: {
-        reference: { startsWith: `${prefix}-` },
-      },
+      where: { reference: { startsWith: `${prefix}-` } },
       orderBy: { reference: 'desc' },
       select: { reference: true },
     })
     lastRef = last?.reference
   }
 
-  let next = `${prefix}-000001`
+  let nextNum = 1
   if (lastRef) {
     const match = String(lastRef).match(pattern)
     if (match) {
       const num = fromBase62(match[1])
       if (Number.isFinite(num) && num >= 0) {
-        next = `${prefix}-${toBase62(num + 1).padStart(6, '0')}`
+        nextNum = num + 1
       }
     }
   }
-  return next
+
+  let candidate = formatRef(nextNum)
+  while (await referenceExists(candidate)) {
+    nextNum += 1
+    candidate = formatRef(nextNum)
+  }
+  return candidate
 }
 
 module.exports = {
