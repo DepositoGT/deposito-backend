@@ -21,12 +21,6 @@ const router = Router()
 router.get('/', Auth, hasPermission('merchandise.view'), IncomingMerchandise.list)
 
 /**
- * GET /api/incoming-merchandise/report/pdf
- * (Antes de /:id para no capturar "report" como id)
- */
-router.get('/report/pdf', Auth, hasPermission('merchandise.reports'), IncomingMerchandise.generateReport)
-
-/**
  * PATCH /api/incoming-merchandise/:id/payment
  * Actualizar datos de pago del registro
  */

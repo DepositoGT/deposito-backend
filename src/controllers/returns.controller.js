@@ -8,7 +8,7 @@
  * For licensing inquiries: GitHub @dpatzan2
  */
 
-const { prisma } = require('../models/prisma')
+const { prisma, prismaTransaction } = require('../models/prisma')
 const { DateTime } = require('luxon')
 const { ensureStockAlertsBatch } = require('../services/stockAlerts')
 const { expandLinesToStockMap, restoreStockMap } = require('../services/bomStock')
@@ -169,7 +169,7 @@ exports.create = async (req, res, next) => {
       return res.status(404).json({ message: 'Venta no encontrada' })
     }
 
-    const created = await prisma.$transaction(async (tx) => {
+    const created = await prismaTransaction.$transaction(async (tx) => {
       // 1. Validar que la venta existe y está completada
       const sale = await tx.sale.findUnique({
         where: { id: sale_id },
@@ -361,7 +361,7 @@ exports.updateStatus = async (req, res, next) => {
       ? (restore_stock !== undefined ? restore_stock : true)
       : false
 
-    const result = await prisma.$transaction(async (tx) => {
+    const result = await prismaTransaction.$transaction(async (tx) => {
       // 1. Cargar devolución actual
       const currentReturn = await tx.return.findUnique({
         where: { id },

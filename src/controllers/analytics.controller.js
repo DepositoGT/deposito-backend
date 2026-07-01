@@ -79,7 +79,9 @@ exports.summary = async (req, res, next) => {
         date: true,
         total: true,
         total_returned: true,
-        adjusted_total: true
+        adjusted_total: true,
+        sales_channel: true,
+        payment_method: { select: { name: true } },
       }
     })
 
@@ -101,7 +103,10 @@ exports.summary = async (req, res, next) => {
     let totalUnits = 0
     const productAgg = new Map() // id -> { name, category, ventas(units), revenue }
     const categoryAgg = new Map() // name -> revenue
+    const categoryCostAgg = new Map() // name -> costo
     const costByMonth = new Map() // mes -> costo total del mes
+    const byPaymentMethod = new Map() // name -> { total, count }
+    const byChannel = new Map() // channel -> { total, count }
 
     // Primero procesar items para productos/categorías/costos
     for (const si of saleItems) {
@@ -123,6 +128,7 @@ exports.summary = async (req, res, next) => {
       productAgg.set(pId, pEntry)
 
       categoryAgg.set(pCat, number(categoryAgg.get(pCat)) + revenue)
+      categoryCostAgg.set(pCat, number(categoryCostAgg.get(pCat)) + cost)
     }
 
     // Luego procesar sales para totales/devoluciones correctos
@@ -139,6 +145,17 @@ exports.summary = async (req, res, next) => {
 
       totalRevenueGross += saleTotal
       totalReturns += returned
+
+      const net = saleTotal - returned
+      const pmName = sale.payment_method?.name || 'Otro'
+      const pm = byPaymentMethod.get(pmName) || { total: 0, count: 0 }
+      pm.total += net; pm.count += 1
+      byPaymentMethod.set(pmName, pm)
+
+      const ch = sale.sales_channel || 'POS'
+      const chRow = byChannel.get(ch) || { total: 0, count: 0 }
+      chRow.total += net; chRow.count += 1
+      byChannel.set(ch, chRow)
     }
 
     const monthly = Array.from(monthlyMap.values()).map(r => ({
@@ -162,8 +179,82 @@ exports.summary = async (req, res, next) => {
     const categoryPerformance = catEntries.map(([category, rev]) => ({
       category,
       revenue: Number(number(rev).toFixed(2)),
+      cost: Number(number(categoryCostAgg.get(category)).toFixed(2)),
+      profit: Number((number(rev) - number(categoryCostAgg.get(category))).toFixed(2)),
+      margin: number(rev) > 0 ? Math.round(((number(rev) - number(categoryCostAgg.get(category))) / number(rev)) * 100) : 0,
       percentage: totalRevenueGross > 0 ? Math.round((number(rev) / totalRevenueGross) * 100) : 0,
     })).sort((a, b) => b.revenue - a.revenue)
+
+    const paymentMethods = Array.from(byPaymentMethod.entries())
+      .map(([method, v]) => ({ method, total: Number(v.total.toFixed(2)), count: v.count }))
+      .sort((a, b) => b.total - a.total)
+
+    const channelLabels = { POS: 'Punto de venta', WHOLESALE: 'Mayoreo', ONLINE: 'En línea' }
+    const channels = Array.from(byChannel.entries())
+      .map(([channel, v]) => ({ channel, label: channelLabels[channel] || channel, total: Number(v.total.toFixed(2)), count: v.count }))
+      .sort((a, b) => b.total - a.total)
+
+    // Inventario: snapshot actual (no depende del año)
+    const products = await prisma.product.findMany({
+      where: { deleted: false },
+      select: { name: true, stock: true, min_stock: true, cost: true, price: true, category: { select: { name: true } } },
+    })
+    let stockValue = 0, retailValue = 0, lowStockCount = 0, outOfStockCount = 0
+    const stockByCategory = new Map() // name -> { value, units }
+    for (const p of products) {
+      const stock = number(p.stock)
+      const value = stock * number(p.cost)
+      stockValue += value
+      retailValue += stock * number(p.price)
+      if (stock <= 0) outOfStockCount += 1
+      else if (stock <= number(p.min_stock)) lowStockCount += 1
+      const cat = p.category?.name || 'Sin categoría'
+      const row = stockByCategory.get(cat) || { value: 0, units: 0 }
+      row.value += value; row.units += stock
+      stockByCategory.set(cat, row)
+    }
+    const inventoryByCategory = Array.from(stockByCategory.entries())
+      .map(([category, v]) => ({ category, value: Number(v.value.toFixed(2)), units: v.units }))
+      .sort((a, b) => b.value - a.value)
+
+    // Compras / cuentas por pagar (ingresos de mercancía del período)
+    const incoming = await prisma.incomingMerchandise.findMany({
+      where: { date: { gte: startUtc, lte: endUtc } },
+      select: {
+        date: true,
+        payment_status: true,
+        supplier: { select: { name: true } },
+        items: { select: { quantity: true, unit_cost: true } },
+        paymentEntries: { select: { amount: true } },
+      },
+    })
+    const purchasesMonthly = new Map()
+    for (let m = 1; m <= 12; m++) purchasesMonthly.set(m, 0)
+    const supplierAgg = new Map()
+    let purchasesTotal = 0, payablePending = 0, payableCount = 0
+    for (const inc of incoming) {
+      const total = inc.items.reduce((s, it) => s + number(it.quantity) * number(it.unit_cost), 0)
+      const paid = inc.paymentEntries.reduce((s, e) => s + number(e.amount), 0)
+      const month = new Date(inc.date).getUTCMonth() + 1
+      purchasesMonthly.set(month, purchasesMonthly.get(month) + total)
+      purchasesTotal += total
+      const sName = inc.supplier?.name || '—'
+      supplierAgg.set(sName, number(supplierAgg.get(sName)) + total)
+      if (inc.payment_status !== 'PAID') {
+        payableCount += 1
+        payablePending += Math.max(0, total - paid)
+      }
+    }
+    const purchases = {
+      total: Number(purchasesTotal.toFixed(2)),
+      payableCount,
+      payablePending: Number(payablePending.toFixed(2)),
+      monthly: Array.from(purchasesMonthly.entries()).map(([month, amount]) => ({ month, amount: Number(amount.toFixed(2)) })),
+      topSuppliers: Array.from(supplierAgg.entries())
+        .map(([name, amount]) => ({ name, amount: Number(number(amount).toFixed(2)) }))
+        .sort((a, b) => b.amount - a.amount)
+        .slice(0, 6),
+    }
 
     res.json({
       year: isAll ? 'all' : year,
@@ -180,6 +271,18 @@ exports.summary = async (req, res, next) => {
       monthly,
       topProducts,
       categoryPerformance,
+      paymentMethods,
+      channels,
+      inventory: {
+        stockValue: Number(stockValue.toFixed(2)),
+        retailValue: Number(retailValue.toFixed(2)),
+        potentialProfit: Number((retailValue - stockValue).toFixed(2)),
+        lowStockCount,
+        outOfStockCount,
+        productsCount: products.length,
+        byCategory: inventoryByCategory,
+      },
+      purchases,
     })
   } catch (e) { next(e) }
 }

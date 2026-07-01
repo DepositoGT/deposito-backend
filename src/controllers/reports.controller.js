@@ -2320,6 +2320,101 @@ async function inventoryCountsHistoryReport(req, res, next) {
   }
 }
 
+async function merchandiseReport(req, res, next) {
+  try {
+    const branding = await getBrandingForPdf(prisma)
+    const companyName = branding.company_name
+    const logoBuffer = branding.logoBuffer
+    const money = makeMoney(branding.currency_code)
+    const { period = 'month', year, format = 'pdf', month, quarter, semester } = req.query
+    const { startUtc, endUtc, label } = periodRange(period, year, { month, quarter, semester })
+
+    const records = await prisma.incomingMerchandise.findMany({
+      where: { date: { gte: startUtc, lte: endUtc } },
+      include: {
+        supplier: { select: { name: true } },
+        registeredBy: { select: { name: true } },
+        items: { select: { quantity: true, unit_cost: true } },
+      },
+      orderBy: { date: 'desc' },
+    })
+
+    const statusLabel = (s) => (s === 'PAID' ? 'Pagado' : s === 'PARTIAL' ? 'Pago parcial' : 'Pendiente')
+    const recordTotal = (r) => r.items.reduce((sum, it) => sum + number(it.quantity) * number(it.unit_cost), 0)
+
+    let totalAmount = 0
+    let paidCount = 0, partialCount = 0, pendingCount = 0
+    const bySupplier = new Map()
+    const detail = records.map((r) => {
+      const total = recordTotal(r)
+      totalAmount += total
+      if (r.payment_status === 'PAID') paidCount++
+      else if (r.payment_status === 'PARTIAL') partialCount++
+      else pendingCount++
+      const sName = r.supplier?.name || '—'
+      const agg = bySupplier.get(sName) || { count: 0, amount: 0 }
+      agg.count += 1; agg.amount += total
+      bySupplier.set(sName, agg)
+      return {
+        date: DateTime.fromJSDate(r.date).setZone('America/Guatemala').toFormat('yyyy-LL-dd'),
+        supplier: sName,
+        registeredBy: r.registeredBy?.name || '—',
+        status: statusLabel(r.payment_status),
+        total,
+      }
+    })
+    const supplierRows = [...bySupplier.entries()]
+      .sort((a, b) => b[1].amount - a[1].amount)
+      .map(([name, v]) => [name, String(v.count), money(v.amount)])
+
+    if (String(format).toLowerCase() === 'csv' || String(format).toLowerCase() === 'excel') {
+      sendCsv(res, 'reporte-mercancia', [
+        'REPORTE DE INGRESOS DE MERCANCÍA',
+        `Periodo,${label}`,
+        `Generado,${DateTime.now().setZone('America/Guatemala').toFormat('yyyy-LL-dd HH:mm')}`,
+        `Registros,${records.length}`,
+        `Monto Total,${money(totalAmount)}`,
+        `Pagados,${paidCount}`,
+        `Pago parcial,${partialCount}`,
+        `Pendientes,${pendingCount}`,
+      ], [
+        { title: 'Detalle de Ingresos', columns: ['Fecha', 'Proveedor', 'Registrado por', 'Estado', 'Total'], rows: detail.map((d) => [d.date, d.supplier, d.registeredBy, d.status, money(d.total)]) },
+        { title: 'Por Proveedor', columns: ['Proveedor', 'Registros', 'Monto'], rows: supplierRows },
+      ])
+      return
+    }
+
+    const doc = newDoc(res, 'Reporte de Mercancía')
+    header(doc, 'Reporte de Ingresos de Mercancía', label, companyName, logoBuffer)
+    sectionTitle(doc, 'Resumen')
+    drawSummaryCards(doc, [
+      { label: 'Registros', value: String(records.length) },
+      { label: 'Monto Total', value: money(totalAmount) },
+      { label: 'Pagados', value: String(paidCount) },
+      { label: 'Pago parcial', value: String(partialCount) },
+      { label: 'Pendientes', value: String(pendingCount) },
+    ])
+    sectionTitle(doc, 'Detalle de Ingresos')
+    drawTable(
+      doc,
+      ['Fecha', 'Proveedor', 'Registrado por', 'Estado', 'Total'],
+      detail.map((d) => [d.date, d.supplier, d.registeredBy, d.status, money(d.total)]),
+      [70, 150, 110, 80, 80],
+      { align: ['left', 'left', 'left', 'left', 'right'], headerAlign: ['left', 'left', 'left', 'left', 'right'] }
+    )
+    sectionTitle(doc, 'Por Proveedor')
+    drawTable(
+      doc,
+      ['Proveedor', 'Registros', 'Monto'],
+      supplierRows,
+      [240, 90, 100],
+      { align: ['left', 'right', 'right'], headerAlign: ['left', 'right', 'right'] }
+    )
+    footer(doc, companyName)
+    doc.end()
+  } catch (e) { next(e) }
+}
+
 module.exports = {
   salesReport,
   inventoryReport,
@@ -2327,6 +2422,7 @@ module.exports = {
   financialReport,
   alertsReport,
   productsReport,
+  merchandiseReport,
   inventoryCountSessionReport,
   inventoryCountsHistoryReport,
 }
