@@ -17,6 +17,7 @@ const {
   financialReport,
   alertsReport,
   productsReport,
+  merchandiseReport,
   inventoryCountSessionReport,
   inventoryCountsHistoryReport,
 } = require('../controllers/reports.controller')
@@ -29,6 +30,12 @@ router.get('/suppliers', suppliersReport)
 router.get('/financial', financialReport)
 router.get('/alerts', alertsReport)
 router.get('/products', productsReport)
+router.get(
+  '/merchandise',
+  Auth,
+  hasPermission('merchandise.reports', 'reports.view'),
+  merchandiseReport
+)
 router.get(
   '/inventory-count-session/:id',
   Auth,
