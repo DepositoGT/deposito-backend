@@ -319,6 +319,8 @@ model User {
   inventory_count_lines_counted         InventoryCountLine[]    @relation("InventoryCountLineCountedBy")
   inventory_count_lines_secondary_count InventoryCountLine[]    @relation("InventoryCountLineSecondaryCountedBy")
   commercial_documents_created        CommercialDocument[]    @relation("CommercialDocCreatedBy")
+  accounting_periods_closed AccountingPeriod[] @relation("PeriodClosedBy")
+  journal_entries_created   JournalEntry[]     @relation("JournalCreatedBy")
 
   // Campos de empleado
   is_employee Boolean   @default(false)
@@ -1041,4 +1043,99 @@ model SystemSetting {
   updated_at  DateTime @updatedAt
 
   @@map("system_settings")
+}
+
+// ========================================
+// Contabilidad (partida doble)
+// ========================================
+
+enum AccountType {
+  ASSET
+  LIABILITY
+  EQUITY
+  INCOME
+  COST
+  EXPENSE
+}
+
+enum AccountingPeriodStatus {
+  OPEN
+  CLOSED
+}
+
+enum JournalSourceType {
+  MANUAL
+  SALE
+  RETURN
+  PURCHASE
+  PURCHASE_PAYMENT
+  CLOSING
+}
+
+/// Cuenta contable (catálogo). `is_group` = agrupadora, no recibe movimientos.
+model Account {
+  id        Int           @id @default(autoincrement())
+  code      String        @unique @db.VarChar(20)
+  name      String        @db.VarChar(150)
+  type      AccountType
+  parent_id Int?
+  parent    Account?      @relation("AccountHierarchy", fields: [parent_id], references: [id], onDelete: SetNull)
+  children  Account[]     @relation("AccountHierarchy")
+  is_group  Boolean       @default(false)
+  active    Boolean       @default(true)
+  /// Usada por el posteo automático; no se puede desactivar ni eliminar
+  system    Boolean       @default(false)
+  lines     JournalLine[]
+
+  @@map("accounts")
+}
+
+model AccountingPeriod {
+  id        Int                    @id @default(autoincrement())
+  year      Int
+  month     Int
+  status    AccountingPeriodStatus @default(OPEN)
+  closed_at DateTime?
+  closed_by String?                @db.Uuid
+  closedBy  User?                  @relation("PeriodClosedBy", fields: [closed_by], references: [id], onDelete: SetNull)
+
+  @@unique([year, month])
+  @@map("accounting_periods")
+}
+
+/// Asiento contable. Inmutable una vez creado; se anula con contra-asiento.
+model JournalEntry {
+  id             String            @id @default(uuid()) @db.Uuid
+  entry_number   String            @unique @db.VarChar(20) // A-000001
+  date           DateTime
+  description    String            @db.VarChar(255)
+  source_type    JournalSourceType @default(MANUAL)
+  source_id      String?           @db.VarChar(64)
+  reversal_of_id String?           @db.Uuid
+  reversalOf     JournalEntry?     @relation("EntryReversal", fields: [reversal_of_id], references: [id])
+  reversals      JournalEntry[]    @relation("EntryReversal")
+  created_by     String?           @db.Uuid
+  createdBy      User?             @relation("JournalCreatedBy", fields: [created_by], references: [id], onDelete: SetNull)
+  created_at     DateTime          @default(now())
+  lines          JournalLine[]
+
+  /// Idempotencia del motor de posteo
+  @@unique([source_type, source_id])
+  @@index([date])
+  @@map("journal_entries")
+}
+
+model JournalLine {
+  id          Int          @id @default(autoincrement())
+  entry_id    String       @db.Uuid
+  entry       JournalEntry @relation(fields: [entry_id], references: [id], onDelete: Cascade)
+  account_id  Int
+  account     Account      @relation(fields: [account_id], references: [id])
+  debit       Decimal      @default(0) @db.Decimal(12, 2)
+  credit      Decimal      @default(0) @db.Decimal(12, 2)
+  description String?      @db.VarChar(255)
+
+  @@index([entry_id])
+  @@index([account_id])
+  @@map("journal_lines")
 }

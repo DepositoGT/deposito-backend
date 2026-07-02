@@ -4,7 +4,7 @@
  * Pedidos comerciales (CommercialDocument doc_type ORDER) + reserva de stock.
  */
 
-const { prisma } = require('../models/prisma')
+const { prisma, prismaTransaction } = require('../models/prisma')
 const { Prisma } = require('@prisma/client')
 const { DateTime } = require('luxon')
 const { getTimezone } = require('../utils/getTimezone')
@@ -302,7 +302,7 @@ exports.create = async (req, res, next) => {
       customerContactId = String(customerContactIdRaw).trim()
     }
 
-    const created = await prisma.$transaction(async (tx) => {
+    const created = await prismaTransaction.$transaction(async (tx) => {
       await validateCustomerContact(tx, customerContactId)
       const { lines, subtotal, total } = await resolveOrderLines(tx, items, {
         customerContactId,
@@ -378,7 +378,7 @@ exports.update = async (req, res, next) => {
           : null
     }
 
-    const updated = await prisma.$transaction(async (tx) => {
+    const updated = await prismaTransaction.$transaction(async (tx) => {
       await validateCustomerContact(tx, customerContactId)
       const { lines, subtotal, total } = await resolveOrderLines(tx, items, {
         customerContactId,
@@ -446,7 +446,7 @@ exports.confirm = async (req, res, next) => {
 
     const lineRows = order.lines
 
-    await prisma.$transaction(async (tx) => {
+    await prismaTransaction.$transaction(async (tx) => {
       await assertLinesAvailable(
         tx,
         lineRows.map((l) => ({ product_id: l.product_id, qty: l.qty }))
@@ -494,7 +494,7 @@ exports.cancel = async (req, res, next) => {
       return res.status(400).json({ message: 'No se puede cancelar un pedido con ventas registradas' })
     }
 
-    const updated = await prisma.$transaction(async (tx) => {
+    const updated = await prismaTransaction.$transaction(async (tx) => {
       if (order.status === 'CONFIRMED' || order.status === 'PARTIALLY_FULFILLED') {
         await releaseByDocument(tx, order.id, { status: 'RELEASED' })
       }
@@ -543,7 +543,7 @@ exports.convertToSale = async (req, res, next) => {
       return res.status(400).json({ message: 'No hay líneas pendientes por entregar' })
     }
 
-    const result = await prisma.$transaction(async (tx) => {
+    const result = await prismaTransaction.$transaction(async (tx) => {
       const cashSessionIdForSale = await requireCashSession(tx, user)
 
       const paymentMethod = await tx.paymentMethod.findUnique({ where: { id: paymentMethodId } })
