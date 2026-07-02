@@ -55,6 +55,8 @@ router.use('/quotes', require('./quotes.routes'))
 router.use('/orders', require('./orders.routes'))
 // Cotiz/pedidos: vencimientos y reportes operativos
 router.use('/commercial-documents', require('./commercialDocuments.routes'))
+// Contabilidad (partida doble)
+router.use('/accounting', require('./accounting.routes'))
 
 
 module.exports = router
