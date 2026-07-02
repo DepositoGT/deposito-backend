@@ -167,6 +167,11 @@ async function main() {
       name: 'Marcar pago de mercancía',
       description: 'Puede actualizar término de pago, estado y fechas de pago en registros de ingreso',
     },
+
+    // Contabilidad
+    { code: 'accounting.view', name: 'Ver contabilidad', description: 'Puede consultar libros y reportes contables' },
+    { code: 'accounting.create', name: 'Registrar asientos', description: 'Puede crear asientos manuales, anular y contabilizar operaciones' },
+    { code: 'accounting.manage', name: 'Administrar contabilidad', description: 'Puede gestionar catálogo de cuentas, períodos y cierre anual' },
   ]
 
   // Crear todos los permisos (idempotente)
@@ -356,6 +361,70 @@ async function main() {
     }
   })
   console.log('  Caja principal (cash_registers) lista')
+
+  // ========================================
+  // 7c. CONTABILIDAD - catálogo de cuentas GT
+  // ========================================
+  console.log('Creando catálogo de cuentas...')
+  const accountsSeed = [
+    { code: '1', name: 'ACTIVO', type: 'ASSET', is_group: true },
+    { code: '1101', name: 'Caja', type: 'ASSET', parent: '1', system: true },
+    { code: '1102', name: 'Bancos', type: 'ASSET', parent: '1', system: true },
+    { code: '1103', name: 'Clientes', type: 'ASSET', parent: '1' },
+    { code: '1104', name: 'IVA Crédito Fiscal', type: 'ASSET', parent: '1', system: true },
+    { code: '1105', name: 'Inventario de Mercaderías', type: 'ASSET', parent: '1', system: true },
+    { code: '2', name: 'PASIVO', type: 'LIABILITY', is_group: true },
+    { code: '2101', name: 'Proveedores', type: 'LIABILITY', parent: '2', system: true },
+    { code: '2102', name: 'IVA Débito Fiscal', type: 'LIABILITY', parent: '2', system: true },
+    { code: '3', name: 'CAPITAL', type: 'EQUITY', is_group: true },
+    { code: '3101', name: 'Capital', type: 'EQUITY', parent: '3' },
+    { code: '3201', name: 'Utilidades Acumuladas', type: 'EQUITY', parent: '3', system: true },
+    { code: '3202', name: 'Utilidad del Ejercicio', type: 'EQUITY', parent: '3', system: true },
+    { code: '4', name: 'INGRESOS', type: 'INCOME', is_group: true },
+    { code: '4101', name: 'Ventas', type: 'INCOME', parent: '4', system: true },
+    { code: '4102', name: 'Devoluciones sobre Ventas', type: 'INCOME', parent: '4', system: true },
+    { code: '5', name: 'COSTOS', type: 'COST', is_group: true },
+    { code: '5101', name: 'Costo de Ventas', type: 'COST', parent: '5', system: true },
+    { code: '6', name: 'GASTOS', type: 'EXPENSE', is_group: true },
+    { code: '6101', name: 'Sueldos y Salarios', type: 'EXPENSE', parent: '6' },
+    { code: '6102', name: 'Alquileres', type: 'EXPENSE', parent: '6' },
+    { code: '6103', name: 'Servicios (agua, luz, internet)', type: 'EXPENSE', parent: '6' },
+    { code: '6104', name: 'Otros Gastos', type: 'EXPENSE', parent: '6' },
+  ]
+  const accountIdByCode = {}
+  for (const acc of accountsSeed) {
+    const created = await prisma.account.upsert({
+      where: { code: acc.code },
+      update: {},
+      create: {
+        code: acc.code,
+        name: acc.name,
+        type: acc.type,
+        is_group: acc.is_group === true,
+        system: acc.system === true,
+        parent_id: acc.parent ? accountIdByCode[acc.parent] : null,
+      },
+    })
+    accountIdByCode[acc.code] = created.id
+  }
+  console.log(`  ${accountsSeed.length} cuentas contables`)
+
+  await prisma.systemSetting.upsert({
+    where: { key: 'accounting.defaultAccounts' },
+    update: {},
+    create: {
+      key: 'accounting.defaultAccounts',
+      type: 'json',
+      description: 'Mapeo de cuentas por defecto para asientos automáticos',
+      value: JSON.stringify({
+        cash: '1101', bank: '1102', sales: '4101', salesReturns: '4102',
+        cogs: '5101', inventory: '1105', payables: '2101',
+        ivaDebit: '2102', ivaCredit: '1104',
+        currentEarnings: '3202', retainedEarnings: '3201',
+      }),
+    },
+  })
+  console.log('  Mapeo de cuentas por defecto listo')
 
   // ========================================
   // 8. USUARIO ADMIN POR DEFECTO (OPCIONAL)
