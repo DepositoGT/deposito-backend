@@ -5,16 +5,83 @@
  * Unauthorized copying, modification, distribution, or use of this file,
  * via any medium, is strictly prohibited without express written permission.
  * 
- * For licensing inquiries: GitHub @dpatzan
+ * For licensing inquiries: GitHub @dpatzan2
  */
 
 const { prisma } = require('../models/prisma')
 const { DateTime } = require('luxon')
+const { getTimezone } = require('../utils/getTimezone')
 
 const number = (v) => {
   if (v === null || v === undefined) return 0
   const n = typeof v === 'number' ? v : parseFloat(String(v))
   return Number.isFinite(n) ? n : 0
+}
+
+function isCashPaymentMethodName(name) {
+  const n = String(name || '').toLowerCase()
+  return n.includes('efectivo') || n.includes('cash')
+}
+
+/** Suma el fondo inicial al teórico de efectivo (arqueo por turno). */
+async function applyOpeningFloatToCashBreakdown(paymentMethodsMap, openingFloat) {
+  const float = number(openingFloat)
+  if (float <= 0) {
+    return { openingFloat: 0, cashSalesAmount: 0 }
+  }
+
+  let cashEntry = null
+  for (const method of paymentMethodsMap.values()) {
+    if (isCashPaymentMethodName(method.name)) {
+      cashEntry = method
+      break
+    }
+  }
+
+  if (!cashEntry) {
+    const cashPm = await prisma.paymentMethod.findFirst({
+      where: {
+        OR: [
+          { name: { equals: 'Efectivo', mode: 'insensitive' } },
+          { name: { contains: 'efectivo', mode: 'insensitive' } },
+          { name: { contains: 'cash', mode: 'insensitive' } }
+        ]
+      }
+    })
+    if (cashPm) {
+      cashEntry = {
+        id: cashPm.id,
+        name: cashPm.name,
+        theoretical_amount: 0,
+        theoretical_count: 0,
+        sales: []
+      }
+      paymentMethodsMap.set(cashPm.id, cashEntry)
+    }
+  }
+
+  if (!cashEntry) {
+    return { openingFloat: float, cashSalesAmount: 0 }
+  }
+
+  const cashSalesAmount = number(cashEntry.theoretical_amount)
+  cashEntry.theoretical_amount = cashSalesAmount + float
+  return { openingFloat: float, cashSalesAmount }
+}
+
+/** Verifica permiso según tipo de cierre (día = todos, own = solo mi cierre). Devuelve { allowed } o { allowed: false, status, message }. */
+function checkClosureScopePermission(req, isOwnClosure) {
+  const user = req.user
+  if (!user) return { allowed: false, status: 401, message: 'No autenticado' }
+  const perms = Array.isArray(user.permissions) ? user.permissions.map(String) : []
+  const isAdmin = (user.role?.name || user.role_name || '').toLowerCase() === 'admin'
+  if (isAdmin) return { allowed: true }
+  if (isOwnClosure) {
+    const has = perms.includes('cashclosure.create') || perms.includes('cashclosure.create_own')
+    return has ? { allowed: true } : { allowed: false, status: 403, message: 'No tiene permiso para generar solo su cierre' }
+  }
+  const has = perms.includes('cashclosure.create') || perms.includes('cashclosure.create_day')
+  return has ? { allowed: true } : { allowed: false, status: 403, message: 'No tiene permiso para generar cierre del día' }
 }
 
 /**
@@ -66,55 +133,138 @@ exports.validateStocks = async (req, res, next) => {
  */
 exports.calculateTheoretical = async (req, res, next) => {
   try {
-    // Aceptar tanto startDate/endDate como start_date/end_date
+    // Aceptar tanto startDate/endDate como start_date/end_date; cashier_id opcional para filtrar por cajero
     const startDate = req.query.startDate || req.query.start_date
     const endDate = req.query.endDate || req.query.end_date
-    
-    if (!startDate || !endDate) {
-      return res.status(400).json({ message: 'startDate y endDate son requeridos' })
+    const cashierId = req.query.cashier_id || req.query.cashierId || null
+    const cashRegisterSessionIdRaw =
+      req.query.cash_register_session_id || req.query.cashRegisterSessionId || null
+    const cashRegisterSessionId = cashRegisterSessionIdRaw
+      ? String(cashRegisterSessionIdRaw).trim()
+      : null
+
+    // Permiso según tipo de cierre: día (sin cashier_id) vs propio (con cashier_id)
+    const isOwn = !!cashierId
+    const permCheck = checkClosureScopePermission(req, isOwn)
+    if (!permCheck.allowed) {
+      return res.status(permCheck.status || 403).json({ message: permCheck.message || 'No autorizado' })
+    }
+    if (isOwn && req.user?.sub && cashierId !== req.user.sub) {
+      return res.status(403).json({ message: 'Solo puede generar el cierre de su propia caja' })
     }
 
-    // Parsear fechas en zona horaria de Guatemala (UTC-6)
-    // Si las fechas vienen sin Z, las tratamos como hora local de Guatemala
-    let start, end;
-    
-    if (startDate.includes('Z')) {
-      // Si viene con Z, convertir de UTC a Guatemala
-      start = DateTime.fromISO(startDate, { zone: 'utc' })
-        .setZone('America/Guatemala')
-        .toJSDate();
-      end = DateTime.fromISO(endDate, { zone: 'utc' })
-        .setZone('America/Guatemala')
-        .toJSDate();
+    const isAdminRole = String(req.user?.role?.name || req.user?.role_name || '').toLowerCase() === 'admin'
+
+    const tz = await getTimezone(prisma)
+    let start
+    let end
+    let sessionOpeningFloat = 0
+
+    if (isOwn) {
+      if (!cashRegisterSessionId) {
+        return res.status(400).json({
+          message:
+            'Para «mi cierre» debe enviar cash_register_session_id (turno ya cerrado en «Nueva venta», pendiente de arqueo).'
+        })
+      }
+      const sess = await prisma.cashRegisterSession.findFirst({
+        where: { id: cashRegisterSessionId }
+      })
+      if (!sess) {
+        return res.status(400).json({ message: 'Sesión de caja no encontrada' })
+      }
+      if (!isAdminRole && String(sess.opened_by_id) !== String(cashierId)) {
+        return res.status(403).json({ message: 'La sesión no corresponde a su turno de caja' })
+      }
+      if (sess.status !== 'CLOSED') {
+        return res.status(400).json({
+          message:
+            'El turno debe estar cerrado en «Nueva venta» (fin de turno) antes de calcular el cierre. Mientras la caja siga abierta no se puede arquear.'
+        })
+      }
+      if (sess.cash_closure_id) {
+        return res.status(400).json({ message: 'Este turno de caja ya tiene un cierre de caja registrado.' })
+      }
+      if (!sess.closed_at) {
+        return res.status(400).json({ message: 'La sesión no tiene fecha de cierre; no se puede calcular.' })
+      }
+      sessionOpeningFloat = number(sess.opening_float)
+      // Fuente de verdad: horas del turno en BD (evita desajuste con sold_at vs strings del formulario)
+      start = sess.opened_at
+      end = sess.closed_at
     } else {
-      // Si no tiene Z, tratarla como hora local de Guatemala
-      start = DateTime.fromISO(startDate, { zone: 'America/Guatemala' }).toJSDate();
-      end = DateTime.fromISO(endDate, { zone: 'America/Guatemala' }).toJSDate();
+      if (!startDate || !endDate) {
+        return res.status(400).json({ message: 'startDate y endDate son requeridos' })
+      }
+      if (startDate.includes('Z')) {
+        start = DateTime.fromISO(startDate, { zone: 'utc' }).setZone(tz).toJSDate()
+        end = DateTime.fromISO(endDate, { zone: 'utc' }).setZone(tz).toJSDate()
+      } else {
+        start = DateTime.fromISO(startDate, { zone: tz }).toJSDate()
+        end = DateTime.fromISO(endDate, { zone: tz }).toJSDate()
+      }
     }
-    
-    // Validar que las fechas sean válidas
+
     if (!start || !end || isNaN(start.getTime()) || isNaN(end.getTime())) {
       return res.status(400).json({ message: 'Fechas inválidas' })
     }
-    
+
     console.log('Calculando cierre para período:', {
-      startDate,
-      endDate,
+      startDate: startDate || '(sesión)',
+      endDate: endDate || '(sesión)',
+      cashier_id: cashierId || '(todos)',
+      cash_register_session_id: cashRegisterSessionId || '(n/a)',
       start: start.toISOString(),
-      end: end.toISOString()
+      end: end.toISOString(),
+      own_closure: isOwn
     })
-    
+
     // Obtener estado "Completada"
     const completedStatus = await prisma.saleStatus.findFirst({
       where: { name: 'Completada' }
     })
 
-    // Obtener todas las ventas completadas en el período
+    const periodOr = {
+      OR: [
+        { sold_at: { gte: start, lte: end } },
+        { date: { gte: start, lte: end } }
+      ]
+    }
+
+    /**
+     * Mi cierre con sesión: NO filtrar por sold_at/date entre opened_at y closed_at.
+     * Las ventas guardan sold_at con convención «hora local como UTC» (sales.controller);
+     * la sesión usa timestamps UTC reales → el rango excluye todas las ventas del turno.
+     * Basta cash_register_session_id = turno. Legado: sin sesión, sí período + created_by.
+     */
+    let salesWhere
+    if (isOwn && cashRegisterSessionId) {
+      salesWhere = {
+        status_id: completedStatus?.id,
+        OR: [
+          { cash_register_session_id: cashRegisterSessionId },
+          {
+            AND: [
+              { cash_register_session_id: null },
+              ...(cashierId ? [{ created_by: String(cashierId) }] : []),
+              periodOr
+            ]
+          }
+        ]
+      }
+    } else {
+      salesWhere = {
+        status_id: completedStatus?.id,
+        ...periodOr
+      }
+      if (cashierId) {
+        salesWhere.created_by = String(cashierId)
+      }
+    }
+
+    // Obtener ventas completadas en el período (opcionalmente filtradas por cajero)
     const sales = await prisma.sale.findMany({
-      where: {
-        sold_at: { gte: start, lte: end },
-        status_id: completedStatus?.id
-      },
+      where: salesWhere,
       include: {
         payment_method: true,
         returns: {
@@ -162,7 +312,12 @@ exports.calculateTheoretical = async (req, res, next) => {
       })
     }
 
-    const theoreticalTotal = theoreticalSales - theoreticalReturns
+    let theoreticalTotal = theoreticalSales - theoreticalReturns
+
+    const cashDetail = await applyOpeningFloatToCashBreakdown(paymentMethodsMap, sessionOpeningFloat)
+    if (cashDetail.openingFloat > 0) {
+      theoreticalTotal += cashDetail.openingFloat
+    }
 
     // Calcular métricas adicionales
     const totalTransactions = sales.length
@@ -188,6 +343,15 @@ exports.calculateTheoretical = async (req, res, next) => {
         total_returns: Number(theoreticalReturns.toFixed(2)),
         net_total: Number(theoreticalTotal.toFixed(2))
       },
+      cash_session: cashDetail.openingFloat > 0
+        ? {
+            opening_float: Number(cashDetail.openingFloat.toFixed(2)),
+            cash_sales_amount: Number(cashDetail.cashSalesAmount.toFixed(2)),
+            expected_cash_in_drawer: Number(
+              (cashDetail.cashSalesAmount + cashDetail.openingFloat).toFixed(2)
+            )
+          }
+        : null,
       metrics: {
         total_transactions: totalTransactions,
         total_customers: totalCustomers,
@@ -211,8 +375,10 @@ exports.create = async (req, res, next) => {
       endDate,
       cashierName,
       cashierSignature,
+      cashierId,
       supervisorName,
       supervisorSignature,
+      supervisorId,
       theoreticalTotal,
       theoreticalSales,
       theoreticalReturns,
@@ -222,22 +388,33 @@ exports.create = async (req, res, next) => {
       averageTicket,
       paymentBreakdowns,  // Array de { payment_method_id, theoretical_amount, theoretical_count, actual_amount, actual_count, notes }
       denominations,      // Array de { denomination, type, quantity }
-      notes
+      notes,
+      cash_register_session_id: cashRegisterSessionIdBody
     } = req.body
+    const authUser = req.user
 
     // Validaciones
     if (!startDate || !endDate || !cashierName) {
       return res.status(400).json({ message: 'Datos incompletos' })
     }
 
-    // Parsear fechas correctamente (sin conversión de zona horaria)
-    // Las fechas vienen sin 'Z', son hora local de Guatemala
+    // Permiso según tipo de cierre: día (sin cashierId) vs propio (con cashierId)
+    const isOwnClosure = !!cashierId
+    const permCheck = checkClosureScopePermission(req, isOwnClosure)
+    if (!permCheck.allowed) {
+      return res.status(permCheck.status || 403).json({ message: permCheck.message || 'No autorizado' })
+    }
+    if (isOwnClosure && authUser?.sub && cashierId !== authUser.sub) {
+      return res.status(403).json({ message: 'Solo puede registrar el cierre de su propia caja' })
+    }
+
+    const tz = await getTimezone(prisma)
+    // Parsear fechas: vienen sin 'Z', son hora local configurada
     const cleanStartDate = String(startDate).replace('Z', '').replace(/[+-]\d{2}:\d{2}$/, '');
     const cleanEndDate = String(endDate).replace('Z', '').replace(/[+-]\d{2}:\d{2}$/, '');
     
-    // Crear fechas UTC con los valores de Guatemala
-    const startDt = DateTime.fromISO(cleanStartDate, { zone: 'America/Guatemala' });
-    const endDt = DateTime.fromISO(cleanEndDate, { zone: 'America/Guatemala' });
+    const startDt = DateTime.fromISO(cleanStartDate, { zone: tz });
+    const endDt = DateTime.fromISO(cleanEndDate, { zone: tz });
     
     const startDateUTC = DateTime.utc(
       startDt.year, startDt.month, startDt.day,
@@ -262,101 +439,183 @@ exports.create = async (req, res, next) => {
       ? (difference / theoreticalTotal) * 100 
       : 0
 
-    // Obtener fecha actual en hora de Guatemala
-    const nowGuatemala = DateTime.now().setZone('America/Guatemala');
+    const nowLocal = DateTime.now().setZone(tz);
     const dateUTC = DateTime.utc(
-      nowGuatemala.year, nowGuatemala.month, nowGuatemala.day,
-      nowGuatemala.hour, nowGuatemala.minute, nowGuatemala.second, nowGuatemala.millisecond
+      nowLocal.year, nowLocal.month, nowLocal.day,
+      nowLocal.hour, nowLocal.minute, nowLocal.second, nowLocal.millisecond
     ).toJSDate();
 
     console.log('[CASH CLOSURE] Fecha de creación:', {
       dateUTC: dateUTC.toISOString(),
-      dateGt: nowGuatemala.toFormat('yyyy-MM-dd HH:mm:ss')
+      dateLocal: nowLocal.toFormat('yyyy-MM-dd HH:mm:ss')
     });
 
-    // Crear cierre de caja
-    const cashClosure = await prisma.cashClosure.create({
-      data: {
-        date: dateUTC,
-        start_date: startDateUTC,
-        end_date: endDateUTC,
-        cashier_name: cashierName,
-        cashier_signature: cashierSignature || null,
-        supervisor_name: supervisorName || null,
-        supervisor_signature: supervisorSignature || null,
-        supervisor_validated_at: supervisorSignature ? dateUTC : null,
-        theoretical_total: theoreticalTotal,
-        theoretical_sales: theoreticalSales,
-        theoretical_returns: theoreticalReturns,
-        actual_total: actualTotal,
-        difference: difference,
-        difference_percentage: Number(differencePercentage.toFixed(2)),
-        total_transactions: totalTransactions,
-        total_customers: totalCustomers,
-        average_ticket: averageTicket,
-        notes: notes || null,
-        status: supervisorSignature ? 'Validado' : 'Pendiente'
-      }
-    })
+    const cashierUuidStored = isOwnClosure ? (cashierId ? String(cashierId) : authUser?.sub || null) : null
+    const supervisorUuid = supervisorId || null
+    const rawSession = cashRegisterSessionIdBody ?? req.body.cashRegisterSessionId ?? null
+    const cashRegisterSessionId = rawSession ? String(rawSession).trim() : null
 
-    // Crear desglose por método de pago
-    if (paymentBreakdowns && paymentBreakdowns.length > 0) {
-      for (const breakdown of paymentBreakdowns) {
-        const methodDiff = number(breakdown.actual_amount) - number(breakdown.theoretical_amount)
-        
-        await prisma.cashClosurePayment.create({
-          data: {
-            cash_closure_id: cashClosure.id,
-            payment_method_id: breakdown.payment_method_id,
-            theoretical_amount: breakdown.theoretical_amount,
-            theoretical_count: breakdown.theoretical_count,
-            actual_amount: breakdown.actual_amount,
-            actual_count: breakdown.actual_count || null,
-            difference: methodDiff,
-            notes: breakdown.notes || null
-          }
-        })
-      }
+    if (isOwnClosure && !cashRegisterSessionId) {
+      return res.status(400).json({
+        message: 'El cierre por cajero debe incluir cash_register_session_id (turno cerrado en «Nueva venta», pendiente de arqueo).'
+      })
     }
 
-    // Crear conteo de denominaciones
-    if (denominations && denominations.length > 0) {
-      for (const denom of denominations) {
-        if (denom.quantity > 0) {
-          const subtotal = number(denom.denomination) * denom.quantity
-          
-          await prisma.cashClosureDenomination.create({
+    const createdClosure = await prisma.$transaction(async (tx) => {
+      let sessionToCloseOnSave = null
+      let linkedSession = null
+      if (cashRegisterSessionId) {
+        linkedSession = await tx.cashRegisterSession.findFirst({
+          where: { id: cashRegisterSessionId }
+        })
+        if (!linkedSession) {
+          throw new Error('INVALID_SESSION')
+        }
+
+        if (isOwnClosure) {
+          if (cashierId && String(linkedSession.opened_by_id) !== String(cashierId)) {
+            const adminCloser = String(authUser?.role?.name || authUser?.role_name || '').toLowerCase() === 'admin'
+            if (!adminCloser) throw new Error('SESSION_NOT_YOURS')
+          }
+          if (linkedSession.status !== 'CLOSED') {
+            throw new Error('SESSION_NOT_CLOSED')
+          }
+          if (linkedSession.cash_closure_id) {
+            throw new Error('SESSION_ALREADY_LINKED')
+          }
+        } else if (linkedSession.status === 'OPEN') {
+          sessionToCloseOnSave = linkedSession
+        }
+      }
+
+      const cashClosure = await tx.cashClosure.create({
+        data: {
+          date: dateUTC,
+          opening_float: isOwnClosure && linkedSession ? linkedSession.opening_float : null,
+          start_date: startDateUTC,
+          end_date: endDateUTC,
+          cashier_name: cashierName,
+          cashier_signature: cashierSignature || null,
+          cashier_id: cashierUuidStored || undefined,
+          supervisor_name: supervisorName || null,
+          supervisor_signature: supervisorSignature || null,
+          supervisor_validated_at: supervisorSignature ? dateUTC : null,
+          supervisor_id: supervisorUuid || undefined,
+          theoretical_total: theoreticalTotal,
+          theoretical_sales: theoreticalSales,
+          theoretical_returns: theoreticalReturns,
+          actual_total: actualTotal,
+          difference: difference,
+          difference_percentage: Number(differencePercentage.toFixed(2)),
+          total_transactions: totalTransactions,
+          total_customers: totalCustomers,
+          average_ticket: averageTicket,
+          notes: notes || null,
+          status: 'Pendiente'
+        }
+      })
+
+      if (paymentBreakdowns && paymentBreakdowns.length > 0) {
+        for (const breakdown of paymentBreakdowns) {
+          const methodDiff = number(breakdown.actual_amount) - number(breakdown.theoretical_amount)
+
+          await tx.cashClosurePayment.create({
             data: {
               cash_closure_id: cashClosure.id,
-              denomination: denom.denomination,
-              type: denom.type,
-              quantity: denom.quantity,
-              subtotal: subtotal
+              payment_method_id: breakdown.payment_method_id,
+              theoretical_amount: breakdown.theoretical_amount,
+              theoretical_count: breakdown.theoretical_count,
+              actual_amount: breakdown.actual_amount,
+              actual_count: breakdown.actual_count || null,
+              difference: methodDiff,
+              notes: breakdown.notes || null
             }
           })
         }
       }
-    }
 
-    // Devolver cierre creado con relaciones
-    const createdClosure = await prisma.cashClosure.findUnique({
-      where: { id: cashClosure.id },
-      include: {
-        payment_breakdowns: {
-          include: {
-            payment_method: true
-          }
-        },
-        denominations: {
-          orderBy: {
-            denomination: 'desc'
+      if (denominations && denominations.length > 0) {
+        for (const denom of denominations) {
+          if (denom.quantity > 0) {
+            const subtotal = number(denom.denomination) * denom.quantity
+
+            await tx.cashClosureDenomination.create({
+              data: {
+                cash_closure_id: cashClosure.id,
+                denomination: denom.denomination,
+                type: denom.type,
+                quantity: denom.quantity,
+                subtotal: subtotal
+              }
+            })
           }
         }
       }
+
+      if (cashRegisterSessionId) {
+        if (isOwnClosure) {
+          const linked = await tx.cashRegisterSession.updateMany({
+            where: { id: cashRegisterSessionId, status: 'CLOSED', cash_closure_id: null },
+            data: { cash_closure_id: cashClosure.id }
+          })
+          if (linked.count !== 1) {
+            throw new Error('SESSION_RACE')
+          }
+        } else if (sessionToCloseOnSave) {
+          const upd = await tx.cashRegisterSession.updateMany({
+            where: { id: cashRegisterSessionId, status: 'OPEN' },
+            data: {
+              status: 'CLOSED',
+              closed_at: dateUTC,
+              closed_by_id: authUser.sub,
+              cash_closure_id: cashClosure.id
+            }
+          })
+          if (upd.count !== 1) {
+            throw new Error('SESSION_RACE')
+          }
+        }
+      }
+
+      return tx.cashClosure.findUnique({
+        where: { id: cashClosure.id },
+        include: {
+          payment_breakdowns: {
+            include: {
+              payment_method: true
+            }
+          },
+          denominations: {
+            orderBy: {
+              denomination: 'desc'
+            }
+          }
+        }
+      })
     })
 
     res.status(201).json(createdClosure)
   } catch (e) {
+    if (e.message === 'SESSION_NOT_YOURS') {
+      return res.status(403).json({ message: 'La sesión de caja no corresponde a este cajero.' })
+    }
+    if (e.message === 'INVALID_SESSION') {
+      return res.status(400).json({
+        message: 'Sesión de caja inválida. Actualice la página y vuelva a intentar.'
+      })
+    }
+    if (e.message === 'SESSION_NOT_CLOSED') {
+      return res.status(400).json({
+        message:
+          'El turno debe estar cerrado en «Nueva venta» antes de guardar el cierre. Mientras la caja siga abierta no se registra el arqueo.'
+      })
+    }
+    if (e.message === 'SESSION_ALREADY_LINKED') {
+      return res.status(400).json({ message: 'Este turno de caja ya tiene un cierre registrado.' })
+    }
+    if (e.message === 'SESSION_RACE') {
+      return res.status(409).json({ message: 'La sesión de caja ya fue cerrada por otro proceso.' })
+    }
     next(e)
   }
 }
@@ -441,6 +700,14 @@ exports.getById = async (req, res, next) => {
           orderBy: {
             denomination: 'desc'
           }
+        },
+        cash_register_session: {
+          select: {
+            id: true,
+            opening_float: true,
+            opened_at: true,
+            closed_at: true
+          }
         }
       }
     })
@@ -449,7 +716,17 @@ exports.getById = async (req, res, next) => {
       return res.status(404).json({ message: 'Cierre de caja no encontrado' })
     }
 
-    res.json(closure)
+    const openingFloat =
+      closure.opening_float != null
+        ? number(closure.opening_float)
+        : closure.cash_register_session?.opening_float != null
+          ? number(closure.cash_register_session.opening_float)
+          : null
+
+    res.json({
+      ...closure,
+      opening_float: openingFloat
+    })
   } catch (e) {
     next(e)
   }
@@ -468,20 +745,20 @@ exports.validate = async (req, res, next) => {
       return res.status(400).json({ message: 'Nombre y firma del supervisor son requeridos' })
     }
 
-    // Obtener fecha actual en hora de Guatemala
-    const nowGuatemala = DateTime.now().setZone('America/Guatemala');
+    const tz = await getTimezone(prisma)
+    const nowLocal = DateTime.now().setZone(tz);
     const validatedAtUTC = DateTime.utc(
-      nowGuatemala.year, nowGuatemala.month, nowGuatemala.day,
-      nowGuatemala.hour, nowGuatemala.minute, nowGuatemala.second, nowGuatemala.millisecond
+      nowLocal.year, nowLocal.month, nowLocal.day,
+      nowLocal.hour, nowLocal.minute, nowLocal.second, nowLocal.millisecond
     ).toJSDate();
 
+    // status se mantiene (Pendiente); aprobación/rechazo vía PATCH :id/status
     const updated = await prisma.cashClosure.update({
       where: { id },
       data: {
         supervisor_name: supervisorName,
         supervisor_signature: supervisorSignature,
-        supervisor_validated_at: validatedAtUTC,
-        status: 'Validado'
+        supervisor_validated_at: validatedAtUTC
       },
       include: {
         payment_breakdowns: {
@@ -505,7 +782,16 @@ exports.validate = async (req, res, next) => {
  */
 exports.getLastClosureDate = async (req, res, next) => {
   try {
+    const scope = String(req.query.scope || 'day').toLowerCase() === 'mine' ? 'mine' : 'day'
+    const authUser = req.user
+
+    const where =
+      scope === 'mine' && authUser?.sub
+        ? { cashier_id: authUser.sub }
+        : undefined
+
     const lastClosure = await prisma.cashClosure.findFirst({
+      where,
       orderBy: {
         end_date: 'desc'
       },
@@ -515,10 +801,13 @@ exports.getLastClosureDate = async (req, res, next) => {
       }
     })
 
+    const tz = await getTimezone(prisma)
+    const fallbackStart = DateTime.now().setZone(tz).startOf('day').toJSDate()
+
     res.json({
       last_end_date: lastClosure?.end_date || null,
       last_closure_number: lastClosure?.closure_number || 0,
-      suggested_start: lastClosure?.end_date || DateTime.now().setZone('America/Guatemala').startOf('day').toJSDate()
+      suggested_start: lastClosure?.end_date || fallbackStart
     })
   } catch (e) {
     next(e)
@@ -532,7 +821,8 @@ exports.getLastClosureDate = async (req, res, next) => {
 exports.updateStatus = async (req, res, next) => {
   try {
     const { id } = req.params
-    const { status, supervisor_name, rejection_reason } = req.body
+    const { status, supervisor_name, supervisor_id: bodySupervisorId, rejection_reason } = req.body
+    const authUser = req.user
 
     // Validar que el estado sea válido
     const validStatuses = ['Aprobado', 'Rechazado', 'Pendiente']
@@ -563,14 +853,19 @@ exports.updateStatus = async (req, res, next) => {
         updateData.supervisor_name = supervisor_name
       }
       updateData.supervisor_validated_at = new Date()
+      const supervisorUuid = bodySupervisorId || authUser?.sub || null
+      if (supervisorUuid) {
+        updateData.supervisor_id = supervisorUuid
+      }
     }
 
-    // Si se rechaza, agregar razón en las notas
     if (status === 'Rechazado' && rejection_reason) {
+      const tz = await getTimezone(prisma)
+      const nowStr = DateTime.now().setZone(tz).toFormat('dd/MM/yyyy HH:mm')
       const existingNotes = closure.notes || ''
       updateData.notes = existingNotes 
-        ? `${existingNotes}\n\n--- RECHAZADO ---\nRazón: ${rejection_reason}\nFecha: ${DateTime.now().setZone('America/Guatemala').toFormat('dd/MM/yyyy HH:mm')}`
-        : `--- RECHAZADO ---\nRazón: ${rejection_reason}\nFecha: ${DateTime.now().setZone('America/Guatemala').toFormat('dd/MM/yyyy HH:mm')}`
+        ? `${existingNotes}\n\n--- RECHAZADO ---\nRazón: ${rejection_reason}\nFecha: ${nowStr}`
+        : `--- RECHAZADO ---\nRazón: ${rejection_reason}\nFecha: ${nowStr}`
     }
 
     const updatedClosure = await prisma.cashClosure.update({

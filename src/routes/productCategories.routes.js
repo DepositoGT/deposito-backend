@@ -5,13 +5,26 @@
  * Unauthorized copying, modification, distribution, or use of this file,
  * via any medium, is strictly prohibited without express written permission.
  * 
- * For licensing inquiries: GitHub @dpatzan
+ * For licensing inquiries: GitHub @dpatzan2
  */
 
 const { Router } = require('express')
-const { Auth, hasAnyRole } = require('../middlewares/autenticacion')
+const multer = require('multer')
+const { Auth, hasAnyRole, hasPermission } = require('../middlewares/autenticacion')
 const ctrl = require('../controllers/productCategories.controller')
 const router = Router()
+
+const uploadImage = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true)
+    } else {
+      cb(new Error('Solo se permiten archivos de imagen'))
+    }
+  },
+})
 
 /**
  * @openapi
@@ -72,7 +85,7 @@ router.get('/template', ctrl.downloadTemplate)
  *       200:
  *         description: Resultado de validación
  */
-router.post('/validate-import-mapped', Auth, hasAnyRole('admin'), ctrl.validateImportMapped)
+router.post('/validate-import-mapped', Auth, hasPermission('catalogs.manage'), ctrl.validateImportMapped)
 
 /**
  * @openapi
@@ -98,7 +111,37 @@ router.post('/validate-import-mapped', Auth, hasAnyRole('admin'), ctrl.validateI
  *       400:
  *         description: Error de validación
  */
-router.post('/bulk-import-mapped', Auth, hasAnyRole('admin'), ctrl.bulkImportMapped)
+router.post('/bulk-import-mapped', Auth, hasPermission('catalogs.manage'), ctrl.bulkImportMapped)
+
+/**
+ * @openapi
+ * /catalogs/product-categories/upload-image:
+ *   post:
+ *     tags: [ProductCategories]
+ *     summary: Subir imagen representativa de categoría
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               image:
+ *                 type: string
+ *                 format: binary
+ *     responses:
+ *       200:
+ *         description: URL pública de la imagen
+ */
+router.post(
+  '/upload-image',
+  Auth,
+  hasPermission('catalogs.manage'),
+  uploadImage.single('image'),
+  ctrl.uploadImage
+)
 
 /**
  * @openapi

@@ -1,19 +1,124 @@
 /**
  * Copyright (c) 2026 Diego Patzán. All Rights Reserved.
- * 
+ *
  * This source code is licensed under a Proprietary License.
  * Unauthorized copying, modification, distribution, or use of this file,
  * via any medium, is strictly prohibited without express written permission.
- * 
- * For licensing inquiries: GitHub @dpatzan
+ *
+ * For licensing inquiries: GitHub @dpatzan2
  */
 
 /**
- * Bulk Import Service for Suppliers
- * Handles Excel parsing, validation, and batch import
+ * Bulk Import Service for Contacts (suppliers & customers)
+ * Validación estricta; valores de catálogo desconocidos se resuelven con
  */
 const XLSX = require('xlsx')
 const { prisma } = require('../models/prisma')
+
+function stripDiacritics(s) {
+    return String(s).normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+}
+
+/**
+ * @param {unknown} raw
+ * @returns {'SUPPLIER'|'CUSTOMER'|{ error: string }}
+ */
+function parsePartyTypeFromExcel(raw) {
+    const s = stripDiacritics(String(raw ?? '').trim()).toLowerCase()
+    if (!s) return 'SUPPLIER'
+    const customer = new Set(['cliente', 'customer', 'comprador', 'buyer'])
+    const supplier = new Set(['proveedor', 'supplier', 'vendor'])
+    if (customer.has(s)) return 'CUSTOMER'
+    if (supplier.has(s)) return 'SUPPLIER'
+    return { error: `tipo_relacion "${String(raw).trim()}" no válido. Use proveedor o cliente.` }
+}
+
+/**
+ * @param {unknown} raw
+ * @returns {{ kind: 'PERSON'|'ORGANIZATION' } | { error: string }}
+ */
+function parseEntityKindFromExcel(raw) {
+    const s = stripDiacritics(String(raw ?? '').trim()).toLowerCase()
+    if (!s) return { kind: 'ORGANIZATION' }
+    const personTokens = new Set(['persona', 'individual', 'natural', 'pf', 'fisica', 'person'])
+    const orgTokens = new Set([
+        'empresa',
+        'organizacion',
+        'juridica',
+        'pj',
+        'moral',
+        'organization',
+        'company',
+        'org',
+    ])
+    if (personTokens.has(s)) return { kind: 'PERSON' }
+    if (orgTokens.has(s)) return { kind: 'ORGANIZATION' }
+    return { error: `Naturaleza "${String(raw).trim()}" no válida. Use empresa o persona.` }
+}
+
+/**
+ * @param {unknown} raw
+ */
+function normalizeImportOptions(raw) {
+    const o = raw && typeof raw === 'object' ? raw : {}
+    const v = o.paymentTermsWhenEmpty
+    const createCategories = Array.isArray(o.createCategories)
+        ? o.createCategories.map(s => String(s).trim()).filter(Boolean)
+        : []
+    const createPaymentTerms = Array.isArray(o.createPaymentTerms)
+        ? o.createPaymentTerms.map(s => String(s).trim()).filter(Boolean)
+        : []
+    const skipRowIndexes = Array.isArray(o.skipRowIndexes)
+        ? o.skipRowIndexes.map(n => Number(n)).filter(n => Number.isFinite(n) && n >= 2)
+        : []
+    return {
+        paymentTermsWhenEmpty: v === 'require' ? 'require' : 'default',
+        createCategorySet: new Set(createCategories.map(s => s.toLowerCase())),
+        createPaymentTermSet: new Set(createPaymentTerms.map(s => s.toLowerCase())),
+        skipRowSet: new Set(skipRowIndexes),
+        createCategories,
+        createPaymentTerms,
+        skipRowIndexes,
+    }
+}
+
+function mergeResolutionHints(invalidRows) {
+    const catMap = new Map()
+    const ptMap = new Map()
+    for (const ir of invalidRows) {
+        const h = ir.hints || { unknownCategories: [], unknownPaymentTerms: [] }
+        for (const c of h.unknownCategories || []) {
+            const display = String(c).trim()
+            if (!display) continue
+            const k = display.toLowerCase()
+            if (!catMap.has(k)) catMap.set(k, { value: display, rowIndexes: new Set() })
+            catMap.get(k).rowIndexes.add(ir.rowIndex)
+        }
+        for (const p of h.unknownPaymentTerms || []) {
+            const display = String(p).trim()
+            if (!display) continue
+            const k = display.toLowerCase()
+            if (!ptMap.has(k)) ptMap.set(k, { value: display, rowIndexes: new Set() })
+            ptMap.get(k).rowIndexes.add(ir.rowIndex)
+        }
+    }
+    const resolutionHints = []
+    for (const { value, rowIndexes } of catMap.values()) {
+        resolutionHints.push({
+            kind: 'category',
+            value,
+            rowIndexes: [...rowIndexes].sort((a, b) => a - b),
+        })
+    }
+    for (const { value, rowIndexes } of ptMap.values()) {
+        resolutionHints.push({
+            kind: 'payment_term',
+            value,
+            rowIndexes: [...rowIndexes].sort((a, b) => a - b),
+        })
+    }
+    return resolutionHints
+}
 
 /**
  * Parse Excel buffer and extract supplier rows
@@ -29,39 +134,55 @@ function parseExcel(buffer) {
 }
 
 /**
- * Validate a single supplier row against business rules and database
- * @param {Object} row - Supplier row data
- * @param {number} rowIndex - Row index for error reporting
- * @param {Map} categoriesMap - Map of category names to IDs
- * @param {Map} paymentTermsMap - Map of payment term names to IDs
- * @param {Set} existingEmails - Set of existing emails in DB
- * @param {Set} batchEmails - Set of emails seen in current batch
- * @returns {Object} { valid: boolean, errors: string[], data: Object }
+ * @param {Map<string, number>} categoriesMap
+ * @param {Map<string, number>} paymentTermsMap
  */
-function validateSupplierRow(row, rowIndex, categoriesMap, paymentTermsMap, existingEmails, batchEmails) {
+function validateSupplierRow(
+    row,
+    rowIndex,
+    existingEmails,
+    batchEmails,
+    importOptions,
+    categoriesMap,
+    paymentTermsMap,
+) {
     const errors = []
     const data = {}
+    const hints = { unknownCategories: [], unknownPaymentTerms: [] }
+    const paymentOpt = importOptions
 
-    // Field aliases - support both Spanish headers and English system names
     const fieldAliases = {
-        'name': ['nombre', 'name', 'empresa'],
-        'contact': ['contacto', 'contact', 'persona_contacto'],
-        'phone': ['telefono', 'phone', 'tel'],
-        'email': ['email', 'correo', 'correo_electronico'],
-        'address': ['direccion', 'address', 'domicilio'],
-        'category': ['categoria', 'category'],
-        'payment_terms': ['terminos_pago', 'payment_terms', 'pago'],
-        'rating': ['calificacion', 'rating', 'puntuacion']
+        party_type: [
+            'tipo_relacion',
+            'party_type',
+            'rol_contacto',
+            'tipo_contacto_negocio',
+            'relacion',
+        ],
+        entity_kind: [
+            'naturaleza_contacto',
+            'naturaleza',
+            'tipo_entidad',
+            'entidad',
+            'tipo_contacto',
+            'entity_kind',
+        ],
+        name: ['nombre', 'name', 'empresa', 'razon_social'],
+        contact: ['contacto', 'contact', 'persona_contacto'],
+        phone: ['telefono', 'phone', 'tel'],
+        email: ['email', 'correo', 'correo_electronico'],
+        address: ['direccion', 'address', 'domicilio'],
+        category: ['categoria', 'category'],
+        payment_terms: ['terminos_pago', 'payment_terms', 'pago'],
+        tax_id: ['id_fiscal', 'nit', 'tax_id', 'rfc'],
     }
 
-    // Normalize row keys (lowercase, trim) and resolve aliases
     const normalizedRow = {}
     const rowLower = {}
     for (const key of Object.keys(row)) {
         rowLower[key.toLowerCase().trim()] = row[key]
     }
 
-    // Map aliases to standard field names
     for (const [standardName, aliases] of Object.entries(fieldAliases)) {
         for (const alias of aliases) {
             if (rowLower[alias] !== undefined && rowLower[alias] !== '') {
@@ -71,7 +192,30 @@ function validateSupplierRow(row, rowIndex, categoriesMap, paymentTermsMap, exis
         }
     }
 
-    // Required: name
+    let partyType = 'SUPPLIER'
+    const rawParty = normalizedRow.party_type
+    if (rawParty !== undefined && rawParty !== null && String(rawParty).trim() !== '') {
+        const parsed = parsePartyTypeFromExcel(rawParty)
+        if (parsed.error) {
+            errors.push(parsed.error)
+        } else {
+            partyType = parsed
+        }
+    }
+    data.party_type = partyType
+
+    let entityKind = 'ORGANIZATION'
+    const rawEntity = normalizedRow.entity_kind
+    if (rawEntity !== undefined && rawEntity !== null && String(rawEntity).trim() !== '') {
+        const parsed = parseEntityKindFromExcel(rawEntity)
+        if (parsed.error) {
+            errors.push(parsed.error)
+        } else {
+            entityKind = parsed.kind
+        }
+    }
+    data.entity_kind = entityKind
+
     const nombre = String(normalizedRow.name || '').trim()
     if (!nombre) {
         errors.push('El campo "nombre" es requerido')
@@ -79,15 +223,17 @@ function validateSupplierRow(row, rowIndex, categoriesMap, paymentTermsMap, exis
         data.name = nombre
     }
 
-    // Required: contact
     const contacto = String(normalizedRow.contact || '').trim()
-    if (!contacto) {
-        errors.push('El campo "contacto" es requerido')
+    if (entityKind === 'ORGANIZATION') {
+        if (!contacto) {
+            errors.push('El campo "contacto" es requerido cuando la naturaleza es empresa')
+        } else {
+            data.contact = contacto
+        }
     } else {
-        data.contact = contacto
+        data.contact = contacto || nombre
     }
 
-    // Required: phone
     const telefono = String(normalizedRow.phone || '').trim()
     if (!telefono) {
         errors.push('El campo "telefono" es requerido')
@@ -95,12 +241,14 @@ function validateSupplierRow(row, rowIndex, categoriesMap, paymentTermsMap, exis
         data.phone = telefono
     }
 
-    // Required: email (must be unique)
     const email = String(normalizedRow.email || '').trim().toLowerCase()
     if (!email) {
-        errors.push('El campo "email" es requerido')
+        if (partyType === 'SUPPLIER') {
+            errors.push('El campo "email" es requerido para proveedores')
+        } else {
+            data.email = null
+        }
     } else {
-        // Validate email format
         const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
         if (!emailRegex.test(email)) {
             errors.push(`Email "${email}" tiene formato inválido`)
@@ -114,7 +262,6 @@ function validateSupplierRow(row, rowIndex, categoriesMap, paymentTermsMap, exis
         }
     }
 
-    // Required: address
     const direccion = String(normalizedRow.address || '').trim()
     if (!direccion) {
         errors.push('El campo "direccion" es requerido')
@@ -122,129 +269,241 @@ function validateSupplierRow(row, rowIndex, categoriesMap, paymentTermsMap, exis
         data.address = direccion
     }
 
-    // Required: category (must exist in DB)
-    const categoria = String(normalizedRow.category || '').trim()
-    if (!categoria) {
-        errors.push('El campo "categoria" es requerido')
-    } else {
-        const categoryId = categoriesMap.get(categoria.toLowerCase())
-        if (!categoryId) {
-            errors.push(`Categoría "${categoria}" no existe en el sistema`)
+    if (partyType === 'SUPPLIER') {
+        const categoria = String(normalizedRow.category || '').trim()
+        if (!categoria) {
+            errors.push('La categoría es obligatoria para proveedores (los clientes no usan categoría)')
         } else {
-            data.category_id = categoryId
+            const rawNames = categoria
+                .split(/[;,/]/)
+                .map(v => v.trim())
+                .filter(Boolean)
+            if (rawNames.length === 0) {
+                errors.push('La categoría es obligatoria para proveedores')
+            } else {
+                const resolvedLabels = []
+                for (const name of rawNames) {
+                    const inDb = categoriesMap.has(name.toLowerCase())
+                    const approved = paymentOpt.createCategorySet.has(name.toLowerCase())
+                    if (inDb || approved) {
+                        resolvedLabels.push(name)
+                    } else {
+                        errors.push(
+                            `Categoría "${name}" no existe. Cree este valor en catálogo u omita las filas donde aparece.`,
+                        )
+                        hints.unknownCategories.push(name)
+                    }
+                }
+                if (resolvedLabels.length === rawNames.length && rawNames.length > 0) {
+                    data.category_labels = resolvedLabels
+                }
+            }
         }
     }
 
-    // Optional: payment_terms (if provided, must exist)
     const terminosPago = String(normalizedRow.payment_terms || '').trim()
-    if (terminosPago) {
-        const paymentTermId = paymentTermsMap.get(terminosPago.toLowerCase())
-        if (!paymentTermId) {
-            errors.push(`Términos de pago "${terminosPago}" no existe en el sistema`)
+    if (!terminosPago) {
+        if (paymentOpt.paymentTermsWhenEmpty === 'require') {
+            errors.push('El campo "terminos_pago" es requerido (o elija usar término por defecto en la importación)')
         } else {
-            data.payment_terms_id = paymentTermId
+            data.payment_terms_use_default = true
+        }
+    } else {
+        const parts = terminosPago
+            .split(/[|;,\n]/)
+            .map((s) => String(s).trim())
+            .filter(Boolean)
+        const unknown = []
+        const resolvedNames = []
+        for (const part of parts) {
+            const inDb = paymentTermsMap.has(part.toLowerCase())
+            const approved = paymentOpt.createPaymentTermSet.has(part.toLowerCase())
+            if (inDb || approved) {
+                resolvedNames.push(part)
+            } else {
+                unknown.push(part)
+            }
+        }
+        if (unknown.length > 0) {
+            for (const u of unknown) {
+                errors.push(
+                    `Término de pago "${u}" no existe. Cree este valor u omita las filas donde aparece.`,
+                )
+                hints.unknownPaymentTerms.push(u)
+            }
+        } else if (resolvedNames.length > 0) {
+            data.payment_term_names = resolvedNames
         }
     }
 
-    // Optional: rating (0-5)
-    const calificacion = normalizedRow.rating
-    if (calificacion !== undefined && calificacion !== '') {
-        const rating = parseFloat(calificacion)
-        if (isNaN(rating) || rating < 0 || rating > 5) {
-            errors.push('La calificación debe ser un número entre 0 y 5')
-        } else {
-            data.rating = rating
-        }
+    const taxRaw = normalizedRow.tax_id
+    if (taxRaw !== undefined && taxRaw !== null && String(taxRaw).trim() !== '') {
+        data.tax_id = String(taxRaw).trim()
     }
 
     return {
         valid: errors.length === 0,
         errors,
         data,
-        rowIndex
+        rowIndex,
+        hints,
     }
 }
 
 /**
- * Bulk validate suppliers from parsed Excel data
- * @param {Object[]} rows - Array of supplier row data
- * @returns {Promise<Object>} { validRows: Object[], invalidRows: Object[], totals: Object }
+ * @param {Object[]} rows
+ * @param {object} [importOptionsRaw]
+ * @returns {Promise<Object>}
  */
-async function bulkValidateSuppliers(rows) {
-    // Load categories from DB
-    const categoriesRaw = await prisma.productCategory.findMany({
-        where: { deleted: false },
-        select: { id: true, name: true }
-    })
-    const categoriesMap = new Map(
-        categoriesRaw.map(c => [c.name.toLowerCase(), c.id])
-    )
+async function bulkValidateSuppliers(rows, importOptionsRaw) {
+    const importOptions = normalizeImportOptions(importOptionsRaw)
 
-    // Load payment terms from DB
-    const paymentTermsRaw = await prisma.paymentTerm.findMany({
-        select: { id: true, name: true }
-    })
-    const paymentTermsMap = new Map(
-        paymentTermsRaw.map(p => [p.name.toLowerCase(), p.id])
-    )
+    const [categoriesRaw, paymentTermsRaw, existingSuppliersRaw] = await Promise.all([
+        prisma.productCategory.findMany({
+            where: { deleted: false },
+            select: { id: true, name: true },
+        }),
+        prisma.paymentTerm.findMany({
+            where: { deleted: false },
+            select: { id: true, name: true },
+        }),
+        prisma.supplier.findMany({
+            where: { deleted: false },
+            select: { email: true },
+        }),
+    ])
+    const categoriesMap = new Map(categoriesRaw.map(c => [c.name.toLowerCase(), c.id]))
+    const paymentTermsMap = new Map(paymentTermsRaw.map(p => [p.name.toLowerCase(), p.id]))
 
-    // Load existing emails
-    const existingSuppliersRaw = await prisma.supplier.findMany({
-        where: { deleted: false },
-        select: { email: true }
-    })
     const existingEmails = new Set(
-        existingSuppliersRaw.map(s => s.email?.toLowerCase()).filter(Boolean)
+        existingSuppliersRaw.map(s => s.email?.toLowerCase()).filter(Boolean),
     )
 
     const batchEmails = new Set()
 
     const validRows = []
     const invalidRows = []
+    const skippedRows = []
 
     for (let i = 0; i < rows.length; i++) {
+        const rowIndex = i + 2
+        if (importOptions.skipRowSet.has(rowIndex)) {
+            skippedRows.push({ rowIndex, reason: 'Omitida por el usuario' })
+            continue
+        }
         const result = validateSupplierRow(
             rows[i],
-            i + 2, // Excel row (1-indexed + header)
+            rowIndex,
+            existingEmails,
+            batchEmails,
+            importOptions,
             categoriesMap,
             paymentTermsMap,
-            existingEmails,
-            batchEmails
         )
 
         if (result.valid) {
             validRows.push({ rowIndex: result.rowIndex, data: result.data })
         } else {
-            invalidRows.push({ rowIndex: result.rowIndex, errors: result.errors })
+            invalidRows.push({
+                rowIndex: result.rowIndex,
+                errors: result.errors,
+                hints: result.hints,
+            })
         }
     }
+
+    const resolutionHints = mergeResolutionHints(invalidRows)
 
     return {
         validRows,
         invalidRows,
+        skippedRows,
+        resolutionHints,
         totals: {
             total: rows.length,
             valid: validRows.length,
-            invalid: invalidRows.length
-        }
+            invalid: invalidRows.length,
+            skipped: skippedRows.length,
+        },
     }
 }
 
+async function getDefaultPaymentTermId() {
+    const first = await prisma.paymentTerm.findFirst({
+       where: { deleted: false },
+       orderBy: { id: 'asc' },
+    })
+    if (!first) throw new Error('No hay términos de pago en el sistema. Cree al menos uno.')
+    return first.id
+}
+
 /**
- * Import validated suppliers - create each one individually
- * Continues on error, skipping failed suppliers
- * @param {Object[]} validRows - Array of validated supplier data objects
- * @returns {Promise<Object>} { created: number, skipped: number, errors: Object[] }
+ * @param {string} name
+ * @param {Map<string, number>} cache lower -> id
  */
-async function bulkCreateSuppliers(validRows) {
+async function ensureProductCategoryId(name, cache) {
+    const trimmed = String(name || '').trim()
+    if (!trimmed) return null
+    const key = trimmed.toLowerCase()
+    if (cache.has(key)) return cache.get(key)
+
+    let cat = await prisma.productCategory.findFirst({
+        where: { deleted: false, name: { equals: trimmed, mode: 'insensitive' } },
+    })
+    if (!cat) {
+        const safe = trimmed.slice(0, 100)
+        cat = await prisma.productCategory.create({ data: { name: safe } })
+    }
+    cache.set(key, cat.id)
+    return cat.id
+}
+
+/**
+ * @param {string} name
+ * @param {Map<string, number>} cache
+ */
+async function ensurePaymentTermId(name, cache) {
+    const trimmed = String(name || '').trim()
+    if (!trimmed) return null
+    const key = trimmed.toLowerCase()
+    if (cache.has(key)) return cache.get(key)
+
+    let pt = await prisma.paymentTerm.findFirst({
+        where: { deleted: false, name: { equals: trimmed, mode: 'insensitive' } },
+    })
+    if (!pt) {
+        const safe = trimmed.slice(0, 50)
+        pt = await prisma.paymentTerm.create({ data: { name: safe } })
+    }
+    cache.set(key, pt.id)
+    return pt.id
+}
+
+/**
+ * @param {Object[]} validRows
+ * @param {object} [importOptionsRaw]
+ * @returns {Promise<Object>}
+ */
+async function bulkCreateSuppliers(validRows, importOptionsRaw) {
+    normalizeImportOptions(importOptionsRaw)
+
     const errors = []
     let created = 0
     let skipped = 0
+    const categoryCache = new Map()
+    const paymentCache = new Map()
+    let defaultPaymentIdCached = null
+    const resolveDefaultPaymentId = async () => {
+        if (defaultPaymentIdCached == null) defaultPaymentIdCached = await getDefaultPaymentTermId()
+        return defaultPaymentIdCached
+    }
 
-    // Create suppliers one by one, continuing on errors
     for (const row of validRows) {
         try {
+            const partyType = row.data.party_type || 'SUPPLIER'
             const createData = {
+                party_type: partyType,
+                entity_kind: row.data.entity_kind || 'ORGANIZATION',
                 name: row.data.name,
                 contact: row.data.contact,
                 phone: row.data.phone,
@@ -252,21 +511,52 @@ async function bulkCreateSuppliers(validRows) {
                 address: row.data.address,
                 products: 0,
                 total_purchases: 0,
+                estado: 1,
+            }
+            if (row.data.tax_id) {
+                createData.tax_id = row.data.tax_id
             }
 
-            // Connect relations
-            if (row.data.category_id) {
-                createData.category = { connect: { id: row.data.category_id } }
-            }
-            if (row.data.payment_terms_id) {
-                createData.payment_term = { connect: { id: row.data.payment_terms_id } }
-            }
-            if (row.data.rating !== undefined) {
-                createData.rating = row.data.rating
+            if (partyType === 'SUPPLIER' && Array.isArray(row.data.category_labels) && row.data.category_labels.length > 0) {
+                const ids = []
+                for (const label of row.data.category_labels) {
+                    const id = await ensureProductCategoryId(label, categoryCache)
+                    if (id && !ids.includes(id)) ids.push(id)
+                }
+                if (ids.length > 0) {
+                    createData.categories = {
+                        create: ids.map(id => ({ category: { connect: { id } } })),
+                    }
+                }
             }
 
-            // Default status to active (id: 1)
-            createData.status = { connect: { id: 1 } }
+            if (row.data.payment_terms_use_default) {
+                const defId = await resolveDefaultPaymentId()
+                createData.supplier_payment_terms = {
+                    create: [{ payment_term_id: defId, is_default: true, sort_order: 0 }],
+                }
+            } else if (Array.isArray(row.data.payment_term_names) && row.data.payment_term_names.length > 0) {
+                const ids = []
+                for (let i = 0; i < row.data.payment_term_names.length; i++) {
+                    const ptId = await ensurePaymentTermId(row.data.payment_term_names[i], paymentCache)
+                    if (ptId) ids.push(ptId)
+                }
+                if (ids.length === 0) {
+                    throw new Error('No se pudieron resolver los términos de pago')
+                }
+                createData.supplier_payment_terms = {
+                    create: ids.map((ptId, i) => ({
+                        payment_term_id: ptId,
+                        is_default: i === 0,
+                        sort_order: i,
+                    })),
+                }
+            } else {
+                const defId = await resolveDefaultPaymentId()
+                createData.supplier_payment_terms = {
+                    create: [{ payment_term_id: defId, is_default: true, sort_order: 0 }],
+                }
+            }
 
             await prisma.supplier.create({ data: createData })
             created++
@@ -274,9 +564,8 @@ async function bulkCreateSuppliers(validRows) {
             skipped++
             errors.push({
                 rowIndex: row.rowIndex,
-                error: err.message
+                error: err.message,
             })
-            // Continue with next supplier
         }
     }
 
@@ -284,24 +573,21 @@ async function bulkCreateSuppliers(validRows) {
 }
 
 /**
- * Generate Excel template with headers, example data, and catalogs sheet
- * @returns {Promise<Buffer>} Excel file buffer
+ * @returns {Promise<Buffer>}
  */
 async function generateSupplierTemplate() {
-    // Fetch categories and payment terms from DB
-    const [categories, paymentTerms] = await Promise.all([
-        prisma.productCategory.findMany({
+    const [paymentTerms] = await Promise.all([
+        prisma.paymentTerm.findMany({
             where: { deleted: false },
             select: { name: true },
-            orderBy: { name: 'asc' }
+            orderBy: { name: 'asc' },
+            take: 5,
         }),
-        prisma.paymentTerm.findMany({
-            select: { name: true },
-            orderBy: { name: 'asc' }
-        })
     ])
 
     const headers = [
+        'tipo_relacion',
+        'naturaleza_contacto',
         'nombre',
         'contacto',
         'telefono',
@@ -309,49 +595,71 @@ async function generateSupplierTemplate() {
         'direccion',
         'categoria',
         'terminos_pago',
-        'calificacion'
+        'id_fiscal',
     ]
 
-    const example = [
-        'Distribuidora Ejemplo',
+    const exampleSupplierOrg = [
+        'proveedor',
+        'empresa',
+        'Distribuidora Ejemplo, S.A.',
         'Juan Pérez',
         '+502 5555-1234',
-        'contacto@ejemplo.com',
+        'compras@ejemplo.com',
         'Zona 10, Ciudad de Guatemala',
-        categories[0]?.name || 'Cervezas',
+        'Bebidas; Snacks',
         paymentTerms[0]?.name || '30 días',
-        '4.5'
+        '',
+    ]
+
+    const exampleClientPerson = [
+        'cliente',
+        'persona',
+        'María López',
+        '',
+        '+502 5555-9999',
+        'maria@email.com',
+        'Ciudad',
+        '',
+        paymentTerms[0]?.name || 'Contado',
+        '12345678-9',
     ]
 
     const workbook = XLSX.utils.book_new()
-    const worksheet = XLSX.utils.aoa_to_sheet([headers, example])
+    const worksheet = XLSX.utils.aoa_to_sheet([headers, exampleSupplierOrg, exampleClientPerson])
 
-    // Set column widths
     worksheet['!cols'] = [
-        { wch: 25 }, // nombre
-        { wch: 20 }, // contacto
-        { wch: 18 }, // telefono
-        { wch: 30 }, // email
-        { wch: 35 }, // direccion
-        { wch: 20 }, // categoria
-        { wch: 20 }, // terminos_pago
-        { wch: 12 }, // calificacion
+        { wch: 14 },
+        { wch: 20 },
+        { wch: 28 },
+        { wch: 22 },
+        { wch: 18 },
+        { wch: 30 },
+        { wch: 35 },
+        { wch: 28 },
+        { wch: 22 },
+        { wch: 18 },
     ]
 
-    XLSX.utils.book_append_sheet(workbook, worksheet, 'Proveedores')
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Contactos')
 
-    // Catálogos sheet - list of valid categories and payment terms
-    const maxRows = Math.max(categories.length, paymentTerms.length)
-    const catalogData = [['Categorías Válidas', 'Términos de Pago Válidos']]
-    for (let i = 0; i < maxRows; i++) {
-        catalogData.push([
-            categories[i]?.name || '',
-            paymentTerms[i]?.name || ''
-        ])
-    }
-    const catalogsWs = XLSX.utils.aoa_to_sheet(catalogData)
-    catalogsWs['!cols'] = [{ wch: 25 }, { wch: 25 }]
-    XLSX.utils.book_append_sheet(workbook, catalogsWs, 'Catálogos')
+    const helpRows = [
+        ['Instrucciones'],
+        [''],
+        ['tipo_relacion: proveedor o cliente. Si se omite, se asume proveedor.'],
+        ['naturaleza_contacto: empresa o persona (vacío = empresa).'],
+        ['  — Cliente + empresa: nombre = razón social; contacto = persona de contacto (obligatorio).'],
+        ['  — Cliente + persona: nombre = nombre completo; contacto puede ir vacío.'],
+        ['  — Proveedor + empresa: igual que cliente empresa; categoría obligatoria.'],
+        ['  — Proveedor + persona: nombre y categoría obligatorios; contacto puede vaciarse (se usa el nombre).'],
+        ['categoria: obligatoria solo para proveedores (una o varias separadas por ; , o /). Si el nombre no existe en el catálogo, «Probar» fallará hasta que en pantalla elija «Crear» esa categoría u «Omitir» las filas.'],
+        ['terminos_pago: si el nombre no existe, mismo criterio: crear el término desde la importación u omitir filas.'],
+        ['  Celda vacía: en pantalla puede usarse el término por defecto del sistema o exigir valor en cada fila.'],
+        ['email: obligatorio para proveedores; opcional para clientes (celda vacía = sin email).'],
+        ['id_fiscal: opcional.'],
+    ]
+    const helpWs = XLSX.utils.aoa_to_sheet(helpRows)
+    helpWs['!cols'] = [{ wch: 92 }]
+    XLSX.utils.book_append_sheet(workbook, helpWs, 'Instrucciones')
 
     const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' })
     return buffer
@@ -362,6 +670,5 @@ module.exports = {
     validateSupplierRow,
     bulkValidateSuppliers,
     bulkCreateSuppliers,
-    generateSupplierTemplate
+    generateSupplierTemplate,
 }
-

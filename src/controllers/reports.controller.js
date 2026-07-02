@@ -5,12 +5,13 @@
  * Unauthorized copying, modification, distribution, or use of this file,
  * via any medium, is strictly prohibited without express written permission.
  * 
- * For licensing inquiries: GitHub @dpatzan
+ * For licensing inquiries: GitHub @dpatzan2
  */
 
 const { prisma } = require('../models/prisma')
 const { DateTime } = require('luxon')
 const PDFDocument = require('pdfkit')
+const { getBrandingForPdf } = require('../utils/pdfBranding')
 
 // Brand & styles inspired by Products PDF
 const BRAND = {
@@ -92,7 +93,10 @@ function number(v) {
   return Number.isFinite(n) ? n : 0
 }
 
-const money = (v) => 'Q ' + number(v).toLocaleString('es-GT')
+function makeMoney(currencyCode) {
+  const code = (currencyCode && String(currencyCode).trim()) || 'GTQ'
+  return (v) => new Intl.NumberFormat('es-GT', { style: 'currency', currency: code }).format(number(v))
+}
 
 function newDoc(res, title) {
   // Switch to US Letter for better print alignment (612 x 792 points) and slightly smaller margins
@@ -123,20 +127,32 @@ function ensureSpace(doc, needed) {
   if (doc.y + needed > bottom) addPageWithBand(doc)
 }
 
-function header(doc, title, periodLabel) {
+function header(doc, title, periodLabel, companyName = 'Depósito', logoBuffer = null) {
   const left = doc.page.margins.left
   const right = doc.page.width - doc.page.margins.right
-  // More compact header for Letter
-  doc.fillColor(BRAND.primary).fontSize(20).text(title, left, 32, { align: 'left' })
-  doc.fontSize(9).fillColor(BRAND.muted).text(`Generado: ${DateTime.now().setZone('America/Guatemala').toFormat('yyyy-LL-dd HH:mm')}  |  Período: ${periodLabel}`, { align: 'left' })
+  let titleX = left
+  let titleY = 32
+
+  if (logoBuffer) {
+    try {
+      doc.image(logoBuffer, left, 16, { fit: [44, 26] })
+      titleX = left + 50
+      titleY = 26
+    } catch {
+      /* sin logo */
+    }
+  }
+
+  doc.fillColor(BRAND.primary).fontSize(20).text(title, titleX, titleY, { align: 'left', width: Math.max(80, right - titleX) })
+  doc.fontSize(9).fillColor(BRAND.muted).text(`Generado: ${DateTime.now().setZone('America/Guatemala').toFormat('yyyy-LL-dd HH:mm')}  |  Período: ${periodLabel}`, titleX, doc.y + 2, { align: 'left', width: Math.max(80, right - titleX) })
   doc.moveTo(left, doc.y + 4).lineTo(right, doc.y + 4).lineWidth(1).strokeColor(BRAND.border).stroke()
   doc.moveDown(0.6)
 }
 
-function footer(doc) {
+function footer(doc, companyName = 'Depósito') {
   const bottom = doc.page.height - doc.page.margins.bottom + 12
   doc.fontSize(8).fillColor(BRAND.muted)
-    .text(`Reporte generado por Depósito GT  |  Página ${doc.page.number}`, doc.page.margins.left, bottom, { align: 'center' })
+    .text(`Reporte generado por ${companyName}`, doc.page.margins.left, bottom, { align: 'center' })
 }
 
 function sectionTitle(doc, text) {
@@ -170,8 +186,9 @@ function drawTable(doc, columns, rows, widths, options = {}) {
     const y0 = doc.y
   const headerHeight = 20
     doc.save()
-    doc.rect(left, y0, usableWidth, headerHeight).fill('#f1f5f9')
-    doc.fillColor(BRAND.primary).fontSize(9)
+    // Cabecera estilo plataforma: banda ámbar + texto claro
+    doc.rect(left, y0, usableWidth, headerHeight).fill(BRAND.accent)
+    doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(9)
     let x = left
     columns.forEach((c, idx) => {
       const label = typeof c === 'string' ? c : (c.text || '')
@@ -203,21 +220,23 @@ function drawTable(doc, columns, rows, widths, options = {}) {
       addPageWithBand(doc)
       drawHeaderBand()
     }
+    // Y fija por fila: PDFKit mueve doc.y tras cada text(); si reutilizáramos doc.y por celda, los datos quedan escalonados.
+    const rowTop = doc.y
     // zebra background
     if (rIdx % 2 === 1) {
-      doc.save(); doc.rect(left, doc.y - 1, usableWidth, rowHeight + 2).fill('#fafafa'); doc.restore()
+      doc.save(); doc.rect(left, rowTop - 1, usableWidth, rowHeight + 2).fill('#fafafa'); doc.restore()
     }
-    // draw text cells
+    // draw text cells (misma línea base vertical para todas las columnas)
     let rx = left
     row.forEach((cell, cIdx) => {
       const text = String(cell)
       const forcedAlign = colAligns[cIdx]
       const align = forcedAlign || (isNumeric(text) ? 'right' : 'left')
-      doc.fillColor('#111').text(text, rx + padX, doc.y + (padY / 2), { width: colWidths[cIdx] - padX * 2, align })
+      doc.fillColor('#111').text(text, rx + padX, rowTop + padY / 2, { width: colWidths[cIdx] - padX * 2, align })
       rx += colWidths[cIdx]
     })
     // row divider
-    const yAfter = doc.y + rowHeight
+    const yAfter = rowTop + rowHeight
     doc.moveTo(left, yAfter).lineTo(right, yAfter).strokeColor('#f3f4f6').lineWidth(1).stroke()
     doc.y = yAfter + 1
   }
@@ -294,8 +313,8 @@ function drawSuppliersGrid(doc, suppliers) {
     const yNeededForHeader = 26
     if (doc.y + yNeededForHeader > doc.page.height - doc.page.margins.bottom) newPageWithHeader()
     doc.save()
-    doc.rect(left, doc.y, usableWidth, 20).fill('#f1f5f9')
-    doc.fillColor(BRAND.primary).font('Helvetica-Bold').fontSize(11)
+    doc.rect(left, doc.y, usableWidth, 20).fill(BRAND.accent)
+    doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(11)
       .text(letter, left + pad, doc.y + 4)
     doc.restore()
     doc.y += 24
@@ -320,7 +339,11 @@ function drawSuppliersGrid(doc, suppliers) {
       const contactH = doc.heightOfString(contactText, { width: contentWidth })
       const phoneH = doc.heightOfString(phoneText, { width: contentWidth })
       const emailH = doc.heightOfString(emailText, { width: contentWidth })
-      const inner = nameH + 6 + contactH + 2 + phoneH + 2 + emailH
+      doc.font('Helvetica').fontSize(7)
+      const metricsH = s.metricsLine
+        ? doc.heightOfString(s.metricsLine, { width: contentWidth }) + 2
+        : 0
+      const inner = nameH + 6 + contactH + 2 + phoneH + 2 + emailH + metricsH
       return Math.max(baseCardH, 8 + inner + 8)
     }
 
@@ -331,7 +354,7 @@ function drawSuppliersGrid(doc, suppliers) {
       if (yRowTop + projectedRowH > bottom) {
         newPageWithHeader()
         // letter header on new page
-        doc.save(); doc.rect(left, doc.y, usableWidth, 20).fill('#f1f5f9'); doc.fillColor(BRAND.primary).font('Helvetica-Bold').fontSize(11).text(letter, left + pad, doc.y + 4); doc.restore(); doc.y += 24
+        doc.save(); doc.rect(left, doc.y, usableWidth, 20).fill(BRAND.accent); doc.fillColor('#ffffff').font('Helvetica-Bold').fontSize(11).text(letter, left + pad, doc.y + 4); doc.restore(); doc.y += 24
         x = left; yRowTop = doc.y; colIndex = 0; rowMaxH = 0
       }
       // background + border
@@ -354,6 +377,11 @@ function drawSuppliersGrid(doc, suppliers) {
       doc.text(phoneText, x + pad, lineY, { width: cardW - pad * 2 })
       lineY += doc.heightOfString(phoneText, { width: cardW - pad * 2 }) + 2
       doc.text(emailText, x + pad, lineY, { width: cardW - pad * 2 })
+      if (s.metricsLine) {
+        lineY += doc.heightOfString(emailText, { width: cardW - pad * 2 }) + 2
+        doc.font('Helvetica').fontSize(7).fillColor(BRAND.muted)
+        doc.text(s.metricsLine, x + pad, lineY, { width: cardW - pad * 2 })
+      }
 
       // track tallest card in this row
       rowMaxH = Math.max(rowMaxH, cardH)
@@ -382,14 +410,26 @@ function drawSuppliersGrid(doc, suppliers) {
 
 async function getSalesData(startUtc, endUtc) {
   const status = await prisma.saleStatus.findFirst({ where: { name: 'Completada' } })
-  
-  // Obtener sale_items para calcular revenue por producto/categoría
+
+  // Obtener sale_items (productos / categorías / costos)
   const items = await prisma.saleItem.findMany({
     where: { sale: { date: { gte: startUtc, lte: endUtc }, ...(status ? { status_id: status.id } : {}) } },
-    include: { product: { include: { category: true } } }
+    include: {
+      product: { include: { category: true } },
+      sale: {
+        select: {
+          id: true,
+          date: true,
+          total: true,
+          total_returned: true,
+          payment_method: { select: { name: true } },
+          createdBy: { select: { name: true } }
+        }
+      }
+    }
   })
-  
-  // Obtener ventas para calcular devoluciones totales
+
+  // También obtener ventas a nivel cabecera para conteos rápidos
   const sales = await prisma.sale.findMany({
     where: {
       date: { gte: startUtc, lte: endUtc },
@@ -397,70 +437,389 @@ async function getSalesData(startUtc, endUtc) {
     },
     select: {
       id: true,
+      date: true,
       total: true,
       total_returned: true,
-      adjusted_total: true
+      adjusted_total: true,
+      payment_method: { select: { name: true } },
+      createdBy: { select: { name: true } }
     }
   })
-  
-  let totalRevenueGross = 0, totalCost = 0, totalReturned = 0
+
+  let totalRevenueGross = 0
+  let totalReturned = 0
+  let totalCost = 0
+
+  // Agregados
   const catAgg = {}
   const topAgg = {}
-  
-  // Procesar items solo para desglose de productos/categorías/costos
+  const paymentAgg = {}
+  const timeAgg = {}   // key: 'YYYY-MM-DD' o 'YYYY-MM'
+  const cashierAgg = {}
+  // Para agregar ingresos por cabecera (una vez por venta) pero unidades desde sale_items
+  const unitsBySaleId = new Map()
+
+  // Helper: clave temporal (día o mes) según rango
+  const rangeDays = (endUtc.getTime() - startUtc.getTime()) / (1000 * 60 * 60 * 24)
+  const useDaily = rangeDays <= 62 // ~2 meses → por día, si no por mes
+
+  const makeTimeKey = (d) => {
+    const dt = DateTime.fromJSDate(d).setZone('America/Guatemala')
+    if (useDaily) {
+      return dt.toFormat('yyyy-LL-dd')
+    }
+    return dt.toFormat('yyyy-LL')
+  }
+
+  const getPaymentKey = (pm) => (pm?.name ? String(pm.name) : 'Sin método')
+  const getCashierKey = (cb) => (cb?.name ? String(cb.name) : 'Sin asignar')
+
+  // Procesar items: productos / categorías / costos / top productos.
+  // Para método/tiempo/cajero solo acumulamos UNIDADES por venta (no el ingreso).
   items.forEach(i => {
-    const revenue = number(i.price) * number(i.qty)
-    const cost = number(i.product?.cost) * number(i.qty)
+    const qty = number(i.qty)
+    const revenue = number(i.price) * qty
+    const cost = number(i.product?.cost) * qty
     totalCost += cost
+
     const cat = i.product?.category?.name || 'Sin categoría'
     catAgg[cat] = (catAgg[cat] || 0) + revenue
-    const p = i.product?.name || 'Producto'
-    topAgg[p] = (topAgg[p] || { name: p, ventas: 0, revenue: 0 })
-    topAgg[p].ventas += number(i.qty)
-    topAgg[p].revenue += revenue
+
+    const pname = i.product?.name || 'Producto'
+    topAgg[pname] = (topAgg[pname] || { name: pname, ventas: 0, revenue: 0 })
+    topAgg[pname].ventas += qty
+    topAgg[pname].revenue += revenue
+    const sale = i.sale
+    if (sale?.id) {
+      unitsBySaleId.set(String(sale.id), (unitsBySaleId.get(String(sale.id)) || 0) + qty)
+    }
   })
-  
-  // Calcular totales correctos desde sale.total (incluye descuentos)
+
+  // Agregados de ingreso y conteos UNA VEZ por venta (cabecera)
   sales.forEach(sale => {
-    totalRevenueGross += number(sale.total)  // ✅ Usa sale.total, no sum(items)
+    totalRevenueGross += number(sale.total)
     totalReturned += number(sale.total_returned)
+    const adjusted = number(sale.adjusted_total ?? (number(sale.total) - number(sale.total_returned || 0)))
+
+    const pmKey = getPaymentKey(sale.payment_method)
+    const cashKey = getCashierKey(sale.createdBy)
+    const tKey = makeTimeKey(sale.date)
+    const units = unitsBySaleId.get(String(sale.id)) || 0
+
+    paymentAgg[pmKey] = paymentAgg[pmKey] || { method: pmKey, ventas: 0, unidades: 0, revenue: 0 }
+    paymentAgg[pmKey].ventas += 1
+    paymentAgg[pmKey].unidades += units
+    paymentAgg[pmKey].revenue += adjusted
+
+    cashierAgg[cashKey] = cashierAgg[cashKey] || { cajero: cashKey, ventas: 0, unidades: 0, revenue: 0 }
+    cashierAgg[cashKey].ventas += 1
+    cashierAgg[cashKey].unidades += units
+    cashierAgg[cashKey].revenue += adjusted
+
+    timeAgg[tKey] = timeAgg[tKey] || { periodo: tKey, ventas: 0, unidades: 0, revenue: 0 }
+    timeAgg[tKey].ventas += 1
+    timeAgg[tKey].unidades += units
+    timeAgg[tKey].revenue += adjusted
   })
-  
-  // Revenue neto = bruto - devoluciones
+
   const totalRevenue = totalRevenueGross - totalReturned
-  
-  const categories = Object.entries(catAgg).map(([category, revenue]) => ({ category, revenue: Number(revenue.toFixed(2)) }))
-  const topProducts = Object.values(topAgg).sort((a,b)=>b.revenue-a.revenue).slice(0,10).map(p=>({ name:p.name, ventas:p.ventas, revenue:Number(p.revenue.toFixed(2)) }))
-  
-  return { 
-    totalRevenue: Number(totalRevenue.toFixed(2)),  // Neto (con devoluciones)
-    totalRevenueGross: Number(totalRevenueGross.toFixed(2)),  // Bruto (sin devoluciones)
-    totalReturned: Number(totalReturned.toFixed(2)),  // Total devuelto
-    totalCost: Number(totalCost.toFixed(2)), 
-    totalProfit: Number((totalRevenue-totalCost).toFixed(2)), 
-    categories, 
-    topProducts 
+
+  const categories = Object.entries(catAgg).map(([category, revenue]) => ({
+    category,
+    revenue: Number(revenue.toFixed(2))
+  }))
+
+  const topProducts = Object.values(topAgg)
+    .sort((a, b) => b.revenue - a.revenue)
+    .slice(0, 10)
+    .map(p => ({
+      name: p.name,
+      ventas: p.ventas,
+      revenue: Number(p.revenue.toFixed(2))
+    }))
+
+  const salesByMethod = Object.values(paymentAgg).map(p => ({
+    method: p.method,
+    ventas: p.ventas,
+    unidades: p.unidades,
+    revenue: Number(p.revenue.toFixed(2))
+  }))
+
+  const salesByPeriod = Object.values(timeAgg)
+    .sort((a, b) => a.periodo.localeCompare(b.periodo))
+    .map(p => ({
+      periodo: p.periodo,
+      ventas: p.ventas,
+      unidades: p.unidades,
+      revenue: Number(p.revenue.toFixed(2))
+    }))
+
+  const salesByCashier = Object.values(cashierAgg).map(p => ({
+    cajero: p.cajero,
+    ventas: p.ventas,
+    unidades: p.unidades,
+    revenue: Number(p.revenue.toFixed(2))
+  }))
+
+  const tickets = sales.length
+  const unidadesTotales = items.reduce((acc, i) => acc + number(i.qty), 0)
+  const ticketPromedio = tickets > 0 ? totalRevenue / tickets : 0
+
+  return {
+    totalRevenue: Number(totalRevenue.toFixed(2)),              // Neto (con devoluciones)
+    totalRevenueGross: Number(totalRevenueGross.toFixed(2)),    // Bruto (sin devoluciones)
+    totalReturned: Number(totalReturned.toFixed(2)),            // Total devuelto
+    totalCost: Number(totalCost.toFixed(2)),
+    totalProfit: Number((totalRevenue - totalCost).toFixed(2)),
+    tickets,
+    unidadesTotales,
+    ticketPromedio: Number(ticketPromedio.toFixed(2)),
+    categories,
+    topProducts,
+    salesByMethod,
+    salesByPeriod,
+    salesByCashier,
+    useDaily
   }
 }
 
+/**
+ * Datos para reporte financiero: P&L del período + inventario a la fecha + compras registradas.
+ * No sustituye al reporte de ventas (sin desglose operativo por cajero/método/top productos).
+ */
+async function getFinancialData(startUtc, endUtc) {
+  const sales = await getSalesData(startUtc, endUtc)
+
+  const products = await prisma.product.findMany({
+    where: { deleted: false, deleted_at: null },
+    select: { stock: true, cost: true }
+  })
+  let inventoryValue = 0
+  let inventoryUnits = 0
+  for (const p of products) {
+    const st = number(p.stock)
+    inventoryValue += st * number(p.cost)
+    inventoryUnits += st
+  }
+
+  const purchaseLogs = await prisma.purchaseLog.findMany({
+    where: { date: { gte: startUtc, lte: endUtc } },
+    select: {
+      qty: true,
+      cost: true,
+      supplier: { select: { name: true } }
+    }
+  })
+  let purchasesTotal = 0
+  const purchasesBySupplier = {}
+  for (const pl of purchaseLogs) {
+    const lineVal = number(pl.qty) * number(pl.cost)
+    purchasesTotal += lineVal
+    const name = pl.supplier?.name || '—'
+    if (!purchasesBySupplier[name]) {
+      purchasesBySupplier[name] = { supplier: name, lines: 0, units: 0, amount: 0 }
+    }
+    purchasesBySupplier[name].lines += 1
+    purchasesBySupplier[name].units += number(pl.qty)
+    purchasesBySupplier[name].amount += lineVal
+  }
+  const purchasesBySupplierList = Object.values(purchasesBySupplier)
+    .map((p) => ({
+      supplier: p.supplier,
+      lines: p.lines,
+      units: p.units,
+      amount: Number(p.amount.toFixed(2))
+    }))
+    .sort((a, b) => b.amount - a.amount)
+
+  const status = await prisma.saleStatus.findFirst({ where: { name: 'Completada' } })
+  const saleItems = await prisma.saleItem.findMany({
+    where: {
+      sale: {
+        date: { gte: startUtc, lte: endUtc },
+        ...(status ? { status_id: status.id } : {})
+      }
+    },
+    include: { product: { include: { category: true } } }
+  })
+  const byCat = {}
+  for (const i of saleItems) {
+    const cat = i.product?.category?.name || 'Sin categoría'
+    const rev = number(i.price) * number(i.qty)
+    const c = number(i.product?.cost) * number(i.qty)
+    if (!byCat[cat]) byCat[cat] = { revenue: 0, cost: 0 }
+    byCat[cat].revenue += rev
+    byCat[cat].cost += c
+  }
+  const categoryProfitability = Object.entries(byCat)
+    .map(([category, v]) => {
+      const revenue = Number(v.revenue.toFixed(2))
+      const cost = Number(v.cost.toFixed(2))
+      const profit = Number((v.revenue - v.cost).toFixed(2))
+      const marginPct = v.revenue > 0 ? Number((((v.revenue - v.cost) / v.revenue) * 100).toFixed(1)) : 0
+      return { category, revenue, cost, profit, marginPct }
+    })
+    .sort((a, b) => b.profit - a.profit)
+
+  const cogs = sales.totalCost
+  const grossMarginPct =
+    sales.totalRevenue > 0
+      ? Number(((sales.totalProfit / sales.totalRevenue) * 100).toFixed(1))
+      : 0
+
+  const inventoryTurnover =
+    inventoryValue > 0 && cogs > 0 ? Number((cogs / inventoryValue).toFixed(2)) : null
+
+  const daysInPeriod = Math.max(
+    1,
+    (endUtc.getTime() - startUtc.getTime()) / (1000 * 60 * 60 * 24)
+  )
+  const daysOfInventoryApprox =
+    cogs > 0 && inventoryValue > 0
+      ? Number(((inventoryValue / cogs) * daysInPeriod).toFixed(1))
+      : null
+
+  return {
+    ...sales,
+    inventoryValue: Number(inventoryValue.toFixed(2)),
+    inventoryUnits,
+    inventorySkuCount: products.length,
+    purchasesPeriod: Number(purchasesTotal.toFixed(2)),
+    purchaseLogLines: purchaseLogs.length,
+    purchasesBySupplier: purchasesBySupplierList,
+    categoryProfitability,
+    grossMarginPct,
+    inventoryTurnover,
+    daysOfInventoryApprox
+  }
+}
+
+/** Agrega por proveedor: conteo de SKUs activos, unidades en stock y valor de inventario (stock × costo). */
+async function getSuppliersReportData() {
+  const suppliers = await prisma.supplier.findMany({
+    where: { deleted: false, party_type: 'SUPPLIER' },
+    include: {
+      supplier_payment_terms: {
+        include: { payment_term: true },
+        orderBy: { sort_order: 'asc' },
+      },
+    },
+    orderBy: { name: 'asc' }
+  })
+
+  const productRows = await prisma.product.findMany({
+    where: { deleted: false, deleted_at: null },
+    select: { supplier_id: true, stock: true, cost: true }
+  })
+
+  const aggBySupplier = new Map()
+  for (const p of productRows) {
+    const prev = aggBySupplier.get(p.supplier_id) || { productCount: 0, stockUnits: 0, inventoryValue: 0 }
+    prev.productCount += 1
+    const st = number(p.stock)
+    const cst = number(p.cost)
+    prev.stockUnits += st
+    prev.inventoryValue += st * cst
+    aggBySupplier.set(p.supplier_id, prev)
+  }
+
+  const enriched = suppliers.map((s) => {
+    const a = aggBySupplier.get(s.id) || { productCount: 0, stockUnits: 0, inventoryValue: 0 }
+    const links = Array.isArray(s.supplier_payment_terms) ? s.supplier_payment_terms : []
+    const names = links
+      .map((l) => l.payment_term?.name)
+      .filter(Boolean)
+    const def = links.find((l) => l.is_default) || links[0]
+    return {
+      ...s,
+      productCount: a.productCount,
+      stockUnits: a.stockUnits,
+      inventoryValue: a.inventoryValue,
+      paymentTermName: names.length ? names.join(', ') : (def?.payment_term?.name || '—')
+    }
+  })
+
+  const totalInventoryValue = enriched.reduce((sum, s) => sum + s.inventoryValue, 0)
+
+  return {
+    suppliers: enriched,
+    summary: {
+      totalSuppliers: enriched.length,
+      activeSuppliers: enriched.filter((s) => s.estado === 1).length,
+      withPhone: enriched.filter((s) => s.phone && String(s.phone).trim()).length,
+      withEmail: enriched.filter((s) => s.email && String(s.email).trim()).length,
+      withoutProducts: enriched.filter((s) => s.productCount === 0).length,
+      totalProductSkus: productRows.length,
+      totalInventoryValue
+    }
+  }
+}
+
+/** Escapado RFC 4180 para celdas CSV (comas, comillas, saltos de línea). */
+function csvEscape(val) {
+  if (val === null || val === undefined) return ''
+  const s = String(val)
+  if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`
+  return s
+}
+
+function csvRow(cells) {
+  if (!Array.isArray(cells)) return csvEscape(cells)
+  return cells.map((c) => csvEscape(c)).join(',')
+}
+
+/** Línea de metadatos: si hay coma, primera coma separa clave y valor (el valor puede llevar más comas). */
+function csvHeaderMetadataLine(line) {
+  const s = String(line)
+  const i = s.indexOf(',')
+  if (i === -1) return csvRow([s])
+  return csvRow([s.slice(0, i).trim(), s.slice(i + 1)])
+}
+
+/**
+ * CSV con secciones legibles: BOM UTF-8 (Excel), bloque cabecera, separadores ▸ por tabla.
+ * @param {string[]} headerLines - Título(s) sin coma, o pares Concepto,Valor con primera coma como separador
+ * @param {{ title?: string, columns: string[], rows: (string|number)[][] }[]} sections
+ */
 function sendCsv(res, filename, headerLines = [], sections = []) {
   res.setHeader('Content-Type', 'text/csv; charset=utf-8')
   res.setHeader('Content-Disposition', `attachment; filename="${filename}.csv"`)
-  // simple CSV assembly
-  const parts = []
-  if (headerLines.length) parts.push(headerLines.join('\n'))
-  sections.forEach(sec => {
+  const lines = []
+  lines.push(csvRow([`Archivo: ${filename}.csv`]))
+  lines.push(csvRow(['Formato', 'CSV separado por comas, codificación UTF-8 (BOM). Cada bloque de tabla lleva título en la columna A.']))
+  lines.push('')
+  if (headerLines.length) {
+    lines.push(csvRow(['── Resumen del reporte (metadatos y totales) ──']))
+  }
+  for (const h of headerLines) {
+    lines.push(csvHeaderMetadataLine(h))
+  }
+
+  sections.forEach((sec, secIdx) => {
     if (!sec || !sec.rows || !sec.columns) return
-    parts.push('')
-    if (sec.title) parts.push(sec.title)
-    parts.push(sec.columns.join(','))
-    sec.rows.forEach(r => parts.push(r.map(v => typeof v === 'string' && v.includes(',') ? `"${v}"` : String(v)).join(',')))
+    lines.push('')
+    lines.push(csvRow([`── ${sec.title || `Sección ${secIdx + 1}`} ──`]))
+    lines.push(csvRow(sec.columns))
+    for (const r of sec.rows) {
+      const row = Array.isArray(r) ? r : [r]
+      while (row.length < sec.columns.length) row.push('')
+      lines.push(csvRow(row.slice(0, sec.columns.length)))
+    }
   })
-  res.send(parts.join('\n'))
+
+  lines.push('')
+  lines.push(csvRow(['Fin del reporte', DateTime.now().setZone('America/Guatemala').toFormat('yyyy-LL-dd HH:mm')]))
+
+  const body = lines.join('\r\n')
+  res.send(`\ufeff${body}`)
 }
 
 async function salesReport(req, res, next) {
   try {
+  const branding = await getBrandingForPdf(prisma)
+  const companyName = branding.company_name
+  const logoBuffer = branding.logoBuffer
+  const money = makeMoney(branding.currency_code)
   const { period='month', year, format='pdf', month, quarter, semester } = req.query
   const { startUtc, endUtc, label } = periodRange(period, year, { month, quarter, semester })
     const data = await getSalesData(startUtc, endUtc)
@@ -470,19 +829,37 @@ async function salesReport(req, res, next) {
         'REPORTE DE VENTAS',
         `Periodo,${label}`,
         `Generado,${DateTime.now().setZone('America/Guatemala').toFormat('yyyy-LL-dd HH:mm')}`,
-        `Ventas Brutas,Q ${data.totalRevenueGross.toLocaleString('es-GT')}`,
-        `Devoluciones,Q ${data.totalReturned.toLocaleString('es-GT')}`,
-        `Ventas Netas,Q ${data.totalRevenue.toLocaleString('es-GT')}`,
-        `Costos Totales,Q ${data.totalCost.toLocaleString('es-GT')}`,
-        `Ganancia Neta,Q ${data.totalProfit.toLocaleString('es-GT')}`
+        `Ventas Brutas,${money(data.totalRevenueGross)}`,
+        `Devoluciones,${money(data.totalReturned)}`,
+        `Ventas Netas,${money(data.totalRevenue)}`,
+        `Costos Totales,${money(data.totalCost)}`,
+        `Ganancia Neta,${money(data.totalProfit)}`,
+        `Tickets,${data.tickets}`,
+        `Unidades Vendidas,${data.unidadesTotales}`,
+        `Ticket Promedio,${money(data.ticketPromedio)}`
       ], [
-        { title: 'Top Productos', columns: ['Producto','Unidades','Ingresos (Q)'], rows: data.topProducts.map(p=>[p.name, p.ventas, p.revenue]) },
-        { title: 'Categorias', columns: ['Categoría','Ingresos (Q)','%'], rows: data.categories.map(c=>[c.category, c.revenue, Math.round((c.revenue/total)*100)+'%']) }
+        { title: 'Top Productos', columns: ['Producto','Unidades','Ingresos'], rows: data.topProducts.map(p=>[p.name, p.ventas, money(p.revenue)]) },
+        { title: 'Categorias', columns: ['Categoría','Ingresos','%'], rows: data.categories.map(c=>[c.category, money(c.revenue), Math.round((c.revenue/total)*100)+'%']) },
+        {
+          title: 'Ventas por Método de Pago',
+          columns: ['Método','Tickets','Unidades','Ingresos'],
+          rows: data.salesByMethod.map(m => [m.method, m.ventas, m.unidades, money(m.revenue)])
+        },
+        {
+          title: data.useDaily ? 'Ventas por Día' : 'Ventas por Mes',
+          columns: [data.useDaily ? 'Fecha' : 'Mes','Tickets','Unidades','Ingresos'],
+          rows: data.salesByPeriod.map(p => [p.periodo, p.ventas, p.unidades, money(p.revenue)])
+        },
+        {
+          title: 'Ventas por Cajero',
+          columns: ['Cajero','Tickets','Unidades','Ingresos'],
+          rows: data.salesByCashier.map(c => [c.cajero, c.ventas, c.unidades, money(c.revenue)])
+        }
       ])
       return
     }
     const doc = newDoc(res, 'Reporte de Ventas')
-    header(doc, 'Reporte de Ventas', label)
+    header(doc, 'Reporte de Ventas', label, companyName, logoBuffer)
     sectionTitle(doc, 'Resumen')
     drawSummaryCards(doc, [
       { label: 'Ventas Brutas', value: money(data.totalRevenueGross) },
@@ -490,19 +867,68 @@ async function salesReport(req, res, next) {
       { label: 'Ventas Netas', value: money(data.totalRevenue) },
       { label: 'Costos Totales', value: money(data.totalCost) },
       { label: 'Ganancia Neta', value: money(data.totalProfit) },
+      { label: 'Tickets', value: String(data.tickets) },
+      { label: 'Unidades Vendidas', value: String(data.unidadesTotales) },
+      { label: 'Ticket Promedio', value: money(data.ticketPromedio) },
     ])
-  sectionTitle(doc, 'Top Productos (por ingresos)')
-  drawTable(doc, ['Producto','Unidades','Ingresos (Q)'], data.topProducts.map(p=>[p.name, p.ventas, p.revenue.toLocaleString('es-GT')]), [150,80,100], { align: ['left','right','right'], headerAlign: ['left','right','right'] })
-  sectionTitle(doc, 'Categorías (por ingresos)')
-  const total = data.totalRevenue || 1
-  drawTable(doc, ['Categoría','Ingresos (Q)','%'], data.categories.map(c=>[c.category, c.revenue.toLocaleString('es-GT'), Math.round((c.revenue/total)*100)+'%']), [150,120,50], { align: ['left','right','right'], headerAlign: ['left','right','right'] })
-    footer(doc)
+    sectionTitle(doc, 'Top Productos (por ingresos)')
+    drawTable(
+      doc,
+      ['Producto','Unidades','Ingresos'],
+      data.topProducts.map(p=>[p.name, p.ventas, money(p.revenue)]),
+      [150,80,100],
+      { align: ['left','right','right'], headerAlign: ['left','right','right'] }
+    )
+
+    sectionTitle(doc, 'Categorías (por ingresos)')
+    {
+      const total = data.totalRevenue || 1
+      drawTable(
+        doc,
+        ['Categoría','Ingresos','%'],
+        data.categories.map(c=>[c.category, money(c.revenue), Math.round((c.revenue/total)*100)+'%']),
+        [150,120,50],
+        { align: ['left','right','right'], headerAlign: ['left','right','right'] }
+      )
+    }
+
+    sectionTitle(doc, 'Ventas por método de pago')
+    drawTable(
+      doc,
+      ['Método','Tickets','Unidades','Ingresos'],
+      data.salesByMethod.map(m => [m.method, m.ventas, m.unidades, money(m.revenue)]),
+      [130,60,60,80],
+      { align: ['left','right','right','right'], headerAlign: ['left','right','right','right'] }
+    )
+
+    sectionTitle(doc, data.useDaily ? 'Ventas por día' : 'Ventas por mes')
+    drawTable(
+      doc,
+      [data.useDaily ? 'Fecha' : 'Mes','Tickets','Unidades','Ingresos'],
+      data.salesByPeriod.map(p => [p.periodo, p.ventas, p.unidades, money(p.revenue)]),
+      [120,60,60,80],
+      { align: ['left','right','right','right'], headerAlign: ['left','right','right','right'] }
+    )
+
+    sectionTitle(doc, 'Ventas por cajero')
+    drawTable(
+      doc,
+      ['Cajero','Tickets','Unidades','Ingresos'],
+      data.salesByCashier.map(c => [c.cajero, c.ventas, c.unidades, money(c.revenue)]),
+      [130,60,60,80],
+      { align: ['left','right','right','right'], headerAlign: ['left','right','right','right'] }
+    )
+    footer(doc, companyName)
     doc.end()
   } catch(e) { next(e) }
 }
 
 async function inventoryReport(req,res,next){
   try {
+    const branding = await getBrandingForPdf(prisma)
+    const companyName = branding.company_name
+    const logoBuffer = branding.logoBuffer
+    const money = makeMoney(branding.currency_code)
     const { format='pdf' } = req.query
     const products = await prisma.product.findMany({ where:{ deleted_at: null }, include:{ category:true } })
     if (String(format).toLowerCase() === 'csv' || String(format).toLowerCase() === 'excel') {
@@ -511,16 +937,16 @@ async function inventoryReport(req,res,next){
         'REPORTE DE INVENTARIO',
         `Generado,${DateTime.now().setZone('America/Guatemala').toFormat('yyyy-LL-dd HH:mm')}`,
         `Total Productos,${products.length}`,
-        `Valor Total,Q ${totalValue.toLocaleString('es-GT')}`
+        `Valor Total,${money(totalValue)}`
       ], [{
         title:'Detalle',
-        columns:['Producto','Categoría','Stock','Costo (Q)','Valor (Q)'],
-        rows: products.map(p=>[p.name, p.category?.name||'—', p.stock, number(p.cost), (number(p.stock)*number(p.cost))])
+        columns:['Producto','Categoría','Stock','Costo','Valor'],
+        rows: products.map(p=>[p.name, p.category?.name||'—', p.stock, money(number(p.cost)), money(number(p.stock)*number(p.cost))])
       }])
       return
     }
     const doc = newDoc(res, 'Reporte de Inventario')
-    header(doc, 'Reporte de Inventario', 'Actual')
+    header(doc, 'Reporte de Inventario', 'Actual', companyName, logoBuffer)
     sectionTitle(doc, 'Resumen')
     const totalProducts = products.length
     const totalValue = products.reduce((acc,p)=>acc+ number(p.stock)* number(p.cost),0)
@@ -531,161 +957,1367 @@ async function inventoryReport(req,res,next){
       { label: 'Stock Bajo', value: String(lowStock) },
     ])
   sectionTitle(doc,'Detalle de Inventario')
-  drawTable(doc, ['Producto','Categoría','Stock','Costo (Q)','Valor (Q)'], products.slice(0,100).map(p=>[p.name, p.category?.name||'—', p.stock, number(p.cost).toLocaleString('es-GT'), (number(p.stock)*number(p.cost)).toLocaleString('es-GT')]), [170,110,50,70,80], { align: ['left','left','right','right','right'], headerAlign: ['left','left','right','right','right'] })
-    footer(doc)
+  drawTable(doc, ['Producto','Categoría','Stock','Costo','Valor'], products.slice(0,100).map(p=>[p.name, p.category?.name||'—', p.stock, money(number(p.cost)), money(number(p.stock)*number(p.cost))]), [170,110,50,70,80], { align: ['left','left','right','right','right'], headerAlign: ['left','left','right','right','right'] })
+    footer(doc, companyName)
     doc.end()
   } catch(e){ next(e) }
 }
 
-async function suppliersReport(req,res,next){
+async function suppliersReport(req, res, next) {
   try {
-    const { format='pdf' } = req.query
-    const suppliers = await prisma.supplier.findMany({ where:{ deleted_at: null } })
+    const branding = await getBrandingForPdf(prisma)
+    const companyName = branding.company_name
+    const logoBuffer = branding.logoBuffer
+    const money = makeMoney(branding.currency_code)
+    const { format = 'pdf' } = req.query
+    const data = await getSuppliersReportData()
+    const { suppliers, summary } = data
+    const fmtLast = (d) =>
+      d ? DateTime.fromJSDate(d).setZone('America/Guatemala').toFormat('yyyy-LL-dd') : '—'
+
+    const topByInv = [...suppliers]
+      .filter((s) => s.inventoryValue > 0)
+      .sort((a, b) => b.inventoryValue - a.inventoryValue)
+      .slice(0, 15)
+
+    const sinProdRows = suppliers
+      .filter((s) => s.productCount === 0)
+      .map((s) => [s.name, s.contact || '—', s.phone || '—'])
+
     if (String(format).toLowerCase() === 'csv' || String(format).toLowerCase() === 'excel') {
+      const sections = [
+        {
+          title: 'Top por valor de inventario',
+          columns: ['Proveedor', '# Productos', 'Unidades stock', 'Valor inventario'],
+          rows: topByInv.map((s) => [s.name, s.productCount, s.stockUnits, money(s.inventoryValue)])
+        },
+        {
+          title: 'Resumen por proveedor',
+          columns: [
+            'Nombre',
+            'Contacto',
+            'Teléfono',
+            'Correo',
+            'Plazo pago',
+            '# Productos',
+            'Unidades',
+            'Valor inventario',
+            'Compras acum.',
+            'Última orden',
+            'Estado'
+          ],
+          rows: suppliers.map((s) => [
+            s.name,
+            s.contact || '—',
+            s.phone || '—',
+            s.email || '—',
+            s.paymentTermName,
+            s.productCount,
+            s.stockUnits,
+            money(s.inventoryValue),
+            money(number(s.total_purchases)),
+            fmtLast(s.last_order),
+            s.estado === 1 ? 'Activo' : 'Inactivo'
+          ])
+        }
+      ]
+      if (sinProdRows.length) {
+        sections.push({
+          title: 'Proveedores sin productos vinculados',
+          columns: ['Nombre', 'Contacto', 'Teléfono'],
+          rows: sinProdRows
+        })
+      }
       sendCsv(res, 'reporte-proveedores', [
         'REPORTE DE PROVEEDORES',
         `Generado,${DateTime.now().setZone('America/Guatemala').toFormat('yyyy-LL-dd HH:mm')}`,
-        `Total Proveedores,${suppliers.length}`
-      ], [{
-        title:'Proveedores',
-        columns:['Nombre','Contacto','Teléfono','Correo'],
-        rows: suppliers.map(s=>[s.name, s.contact||'—', s.phone||'—', s.email||'—'])
-      }])
+        `Total proveedores,${summary.totalSuppliers}`,
+        `Activos,${summary.activeSuppliers}`,
+        `Con teléfono,${summary.withPhone}`,
+        `Con correo,${summary.withEmail}`,
+        `SKUs en catálogo (vinculados),${summary.totalProductSkus}`,
+        `Valor total inventario,${money(summary.totalInventoryValue)}`,
+        `Proveedores sin productos,${summary.withoutProducts}`
+      ], sections)
       return
     }
+
     const doc = newDoc(res, 'Reporte de Proveedores')
-    header(doc, 'Reporte de Proveedores', 'Actual')
-    sectionTitle(doc,'Resumen')
+    header(doc, 'Reporte de Proveedores', 'Actual', companyName, logoBuffer)
+    sectionTitle(doc, 'Resumen')
     drawSummaryCards(doc, [
-      { label: 'Proveedores Activos', value: String(suppliers.length) },
-      { label: 'Con Contacto', value: String(suppliers.filter(s=>!!s.contact).length) },
-      { label: 'Con Email', value: String(suppliers.filter(s=>!!s.email).length) },
+      { label: 'Total proveedores', value: String(summary.totalSuppliers) },
+      { label: 'Activos', value: String(summary.activeSuppliers) },
+      { label: 'SKUs vinculados', value: String(summary.totalProductSkus) },
+      { label: 'Valor inventario', value: money(summary.totalInventoryValue) },
+      { label: 'Sin productos', value: String(summary.withoutProducts) },
+      { label: 'Con teléfono', value: String(summary.withPhone) }
     ])
-  sectionTitle(doc,'Listado de Proveedores')
-  drawSuppliersGrid(doc, suppliers.slice(0,300))
-    footer(doc)
+    sectionTitle(doc, 'Top por valor de inventario')
+    drawTable(
+      doc,
+      ['Proveedor', '# Prod.', 'Unid. stock', 'Valor inv.'],
+      topByInv.map((s) => [s.name, s.productCount, s.stockUnits, money(s.inventoryValue)]),
+      [175, 52, 58, 95],
+      { align: ['left', 'right', 'right', 'right'], headerAlign: ['left', 'right', 'right', 'right'] }
+    )
+    if (!topByInv.length) {
+      ensureSpace(doc, 24)
+      doc.fontSize(9).fillColor(BRAND.muted).text('Sin datos de inventario valorizado (stock * costo).', doc.page.margins.left)
+      doc.moveDown(0.5)
+    }
+
+    sectionTitle(doc, 'Resumen por proveedor')
+    drawTable(
+      doc,
+      ['Nombre', 'Plazo', 'Prod.', 'Unid.', 'Valor inv.', 'Compras', 'Últ. orden', 'Tel.'],
+      suppliers.map((s) => [
+        s.name,
+        s.paymentTermName,
+        s.productCount,
+        s.stockUnits,
+        money(s.inventoryValue),
+        money(number(s.total_purchases)),
+        fmtLast(s.last_order),
+        s.phone || '—'
+      ]),
+      [118, 62, 34, 36, 68, 68, 62, 78],
+      {
+        align: ['left', 'left', 'right', 'right', 'right', 'right', 'left', 'left'],
+        headerAlign: ['left', 'left', 'right', 'right', 'right', 'right', 'left', 'left']
+      }
+    )
+
+    if (sinProdRows.length) {
+      sectionTitle(doc, 'Proveedores sin productos vinculados')
+      drawTable(doc, ['Nombre', 'Contacto', 'Teléfono'], sinProdRows, [200, 160, 140], {
+        align: ['left', 'left', 'left'],
+        headerAlign: ['left', 'left', 'left']
+      })
+    }
+
+    sectionTitle(doc, 'Listado visual por letra')
+    const forGrid = suppliers.slice(0, 300).map((s) => ({
+      name: s.name,
+      contact: s.contact,
+      phone: s.phone,
+      email: s.email,
+      metricsLine: `Productos: ${s.productCount} | Unid.: ${s.stockUnits} | Inv.: ${money(s.inventoryValue)}`
+    }))
+    drawSuppliersGrid(doc, forGrid)
+
+    footer(doc, companyName)
     doc.end()
-  } catch(e){ next(e) }
+  } catch (e) {
+    next(e)
+  }
 }
 
-async function financialReport(req,res,next){
+async function financialReport(req, res, next) {
   try {
-  const { period='month', year, format='pdf', month, quarter, semester } = req.query
-  const { startUtc, endUtc, label } = periodRange(period, year, { month, quarter, semester })
-    const data = await getSalesData(startUtc, endUtc)
+    const branding = await getBrandingForPdf(prisma)
+    const companyName = branding.company_name
+    const logoBuffer = branding.logoBuffer
+    const money = makeMoney(branding.currency_code)
+    const { period = 'month', year, format = 'pdf', month, quarter, semester } = req.query
+    const { startUtc, endUtc, label } = periodRange(period, year, { month, quarter, semester })
+    const data = await getFinancialData(startUtc, endUtc)
+
+    const rotTxt = data.inventoryTurnover != null ? String(data.inventoryTurnover) : '—'
+    const dInvTxt = data.daysOfInventoryApprox != null ? String(data.daysOfInventoryApprox) : '—'
+
     if (String(format).toLowerCase() === 'csv' || String(format).toLowerCase() === 'excel') {
-      const margin = data.totalRevenue ? ((data.totalProfit / data.totalRevenue) * 100).toFixed(1) : '0.0'
-      const total = data.totalRevenueGross || 1
       sendCsv(res, 'reporte-financiero', [
         'REPORTE FINANCIERO',
+        'Alcance,Resultados del período seleccionado e inventario a la fecha de generación',
         `Periodo,${label}`,
-        `Ingresos Brutos,Q ${data.totalRevenueGross.toLocaleString('es-GT')}`,
-        `Devoluciones,Q ${data.totalReturned.toLocaleString('es-GT')}`,
-        `Ingresos Netos,Q ${data.totalRevenue.toLocaleString('es-GT')}`,
-        `Costos,Q ${data.totalCost.toLocaleString('es-GT')}`,
-        `Ganancia,Q ${data.totalProfit.toLocaleString('es-GT')}`,
-        `Margen,${margin}%`
+        `Generado,${DateTime.now().setZone('America/Guatemala').toFormat('yyyy-LL-dd HH:mm')}`,
+        `Valor inventario (fecha generación),${money(data.inventoryValue)}`,
+        `Unidades en stock,${data.inventoryUnits}`,
+        `SKUs activos,${data.inventorySkuCount}`,
+        `Compras registradas período,${money(data.purchasesPeriod)}`,
+        `Líneas de compra (movimientos),${data.purchaseLogLines}`,
+        `Ingresos brutos ventas,${money(data.totalRevenueGross)}`,
+        `Devoluciones,${money(data.totalReturned)}`,
+        `Ingresos netos,${money(data.totalRevenue)}`,
+        `CMV (costo mercancía vendida),${money(data.totalCost)}`,
+        `Margen bruto,${money(data.totalProfit)}`,
+        `Margen bruto %,${data.grossMarginPct}%`,
+        `Rotación inventario (CMV / valor inv.),${rotTxt}`,
+        `Días aprox. de inventario,${dInvTxt}`
       ], [
-        { title:'Distribución por Categoría', columns:['Categoría','Ingresos (Q)','% del Total'], rows: data.categories.map(c=>[c.category, c.revenue, ((c.revenue/total)*100).toFixed(1)+'%']) },
-        { title:'Top Productos', columns:['Producto','Unidades','Ingresos (Q)'], rows: data.topProducts.map(p=>[p.name, p.ventas, p.revenue]) }
+        {
+          title: 'Estado de resultado (período)',
+          columns: ['Concepto', 'Monto'],
+          rows: [
+            ['Ingresos brutos por ventas', money(data.totalRevenueGross)],
+            ['(-) Devoluciones', money(data.totalReturned)],
+            ['Ingresos netos', money(data.totalRevenue)],
+            ['(-) Costo de mercancía vendida (CMV)', money(data.totalCost)],
+            ['Margen bruto', money(data.totalProfit)]
+          ]
+        },
+        {
+          title: 'Rentabilidad por categoría',
+          columns: ['Categoría', 'Ingresos', 'CMV', 'Margen', 'Margen %'],
+          rows: data.categoryProfitability.map((c) => [
+            c.category,
+            money(c.revenue),
+            money(c.cost),
+            money(c.profit),
+            `${c.marginPct}%`
+          ])
+        },
+        {
+          title: 'Compras por proveedor (período)',
+          columns: ['Proveedor', 'Líneas', 'Unidades', 'Monto'],
+          rows: data.purchasesBySupplier.map((p) => [p.supplier, p.lines, p.units, money(p.amount)])
+        }
       ])
       return
     }
+
     const doc = newDoc(res, 'Reporte Financiero')
-    header(doc, 'Reporte Financiero', label)
-    sectionTitle(doc,'Métricas Clave')
-    const margin = data.totalRevenue ? ((data.totalProfit / data.totalRevenue) * 100).toFixed(1) : '0.0'
+    header(doc, 'Reporte Financiero', label, companyName, logoBuffer)
+
+    sectionTitle(doc, 'Resumen - inventario, compras y margen')
     drawSummaryCards(doc, [
-      { label: 'Ingresos Brutos', value: money(data.totalRevenueGross) },
-      { label: 'Devoluciones', value: money(data.totalReturned) },
-      { label: 'Ingresos Netos', value: money(data.totalRevenue) },
-      { label: 'Costos', value: money(data.totalCost) },
-      { label: 'Margen Neto', value: `${margin}%` },
+      { label: 'Valor inventario (hoy)', value: money(data.inventoryValue) },
+      { label: 'Compras del período', value: money(data.purchasesPeriod) },
+      { label: 'Ventas netas', value: money(data.totalRevenue) },
+      { label: 'CMV (vendido)', value: money(data.totalCost) },
+      { label: 'Margen bruto', value: money(data.totalProfit) },
+      { label: 'Margen %', value: `${data.grossMarginPct}%` }
     ])
-  sectionTitle(doc,'Distribución de Ingresos por Categoría')
-  const total = data.totalRevenue || 1
-  drawTable(doc, ['Categoría','Ingresos (Q)','% del Total'], data.categories.map(c=>[c.category, c.revenue.toLocaleString('es-GT'), ((c.revenue/total)*100).toFixed(1)+'%']), [170,120,80], { align: ['left','right','right'], headerAlign: ['left','right','right'] })
-  sectionTitle(doc,'Top Productos')
-  drawTable(doc, ['Producto','Unidades','Ingresos (Q)'], data.topProducts.map(p=>[p.name, p.ventas, p.revenue.toLocaleString('es-GT')]), [170,70,100], { align: ['left','right','right'], headerAlign: ['left','right','right'] })
-    footer(doc)
+
+    ensureSpace(doc, 36)
+    doc
+      .fontSize(8)
+      .fillColor(BRAND.muted)
+      .text(
+        `Stock: ${data.inventoryUnits} u. | SKUs: ${data.inventorySkuCount} | ` +
+          `Movimientos de compra: ${data.purchaseLogLines} | ` +
+          `Rotación (CMV / valor inv.): ${rotTxt} | Días aprox. de inventario: ${dInvTxt}`,
+        doc.page.margins.left,
+        doc.y,
+        { width: doc.page.width - doc.page.margins.left - doc.page.margins.right }
+      )
+    doc.moveDown(1.1)
+
+    sectionTitle(doc, 'Estado de resultado del período')
+    drawTable(
+      doc,
+      ['Concepto', 'Monto'],
+      [
+        ['Ingresos brutos por ventas', money(data.totalRevenueGross)],
+        ['(-) Devoluciones', money(data.totalReturned)],
+        ['Ingresos netos', money(data.totalRevenue)],
+        ['(-) Costo de mercancía vendida (CMV)', money(data.totalCost)],
+        ['Margen bruto', money(data.totalProfit)]
+      ],
+      [350, 120],
+      { align: ['left', 'right'], headerAlign: ['left', 'right'] }
+    )
+
+    sectionTitle(doc, 'Rentabilidad por categoría (ingresos, CMV y margen)')
+    if (data.categoryProfitability.length) {
+      drawTable(
+        doc,
+        ['Categoría', 'Ingresos', 'CMV', 'Margen', 'Margen %'],
+        data.categoryProfitability.map((c) => [
+          c.category,
+          money(c.revenue),
+          money(c.cost),
+          money(c.profit),
+          `${c.marginPct}%`
+        ]),
+        [142, 88, 88, 88, 52],
+        {
+          align: ['left', 'right', 'right', 'right', 'right'],
+          headerAlign: ['left', 'right', 'right', 'right', 'right']
+        }
+      )
+    } else {
+      ensureSpace(doc, 20)
+      doc.fontSize(9).fillColor(BRAND.muted).text('Sin ventas en el período.', doc.page.margins.left)
+      doc.moveDown(0.5)
+    }
+
+    sectionTitle(doc, 'Compras por proveedor (período)')
+    if (data.purchasesBySupplier.length) {
+      drawTable(
+        doc,
+        ['Proveedor', 'Líneas', 'Unidades', 'Monto'],
+        data.purchasesBySupplier.map((p) => [p.supplier, p.lines, p.units, money(p.amount)]),
+        [238, 52, 70, 102],
+        {
+          align: ['left', 'right', 'right', 'right'],
+          headerAlign: ['left', 'right', 'right', 'right']
+        }
+      )
+    } else {
+      ensureSpace(doc, 20)
+      doc.fontSize(9).fillColor(BRAND.muted).text('Sin movimientos de compra en el período.', doc.page.margins.left)
+      doc.moveDown(0.5)
+    }
+
+    footer(doc, companyName)
     doc.end()
-  } catch(e){ next(e) }
+  } catch (e) {
+    next(e)
+  }
 }
 
-async function alertsReport(req,res,next){
+/** Stock, categoría, proveedor, brechas de reposición y alertas del sistema abiertas. */
+async function getAlertsReportData() {
+  const products = await prisma.product.findMany({
+    where: { deleted: false, deleted_at: null },
+    include: { category: true, supplier: true, status: true }
+  })
+
+  const gapUnits = (p) => Math.max(0, number(p.min_stock) - number(p.stock))
+
+  const critical = products.filter((p) => number(p.stock) === 0)
+  const lowWithStock = products.filter((p) => {
+    const st = number(p.stock)
+    return st > 0 && st <= number(p.min_stock)
+  })
+  const atRisk = products.filter((p) => number(p.stock) <= number(p.min_stock))
+
+  let reorderGapUnits = 0
+  let reorderGapValue = 0
+  for (const p of atRisk) {
+    const g = gapUnits(p)
+    reorderGapUnits += g
+    reorderGapValue += g * number(p.cost)
+  }
+
+  const byCategory = {}
+  for (const p of atRisk) {
+    const c = p.category?.name || 'Sin categoría'
+    if (!byCategory[c]) {
+      byCategory[c] = { category: c, enRiesgo: 0, sinStock: 0, bajoConStock: 0 }
+    }
+    byCategory[c].enRiesgo += 1
+    if (number(p.stock) === 0) byCategory[c].sinStock += 1
+    else byCategory[c].bajoConStock += 1
+  }
+  const categoryBreakdown = Object.values(byCategory).sort((a, b) => b.enRiesgo - a.enRiesgo)
+
+  const actionList = [...atRisk].sort((a, b) => {
+    const dg = gapUnits(b) - gapUnits(a)
+    if (dg !== 0) return dg
+    return number(a.stock) - number(b.stock)
+  })
+
+  const openAlertCount = await prisma.alert.count({ where: { resolved: 0 } })
+
+  const systemAlerts = await prisma.alert.findMany({
+    where: { resolved: 0 },
+    include: {
+      product: { select: { name: true } },
+      type: true,
+      priority: true,
+      status: true,
+      assignedTo: { select: { name: true } }
+    },
+    orderBy: { timestamp: 'desc' },
+    take: 250
+  })
+
+  return {
+    summary: {
+      totalSkus: products.length,
+      criticalCount: critical.length,
+      lowWithStockCount: lowWithStock.length,
+      atRiskCount: atRisk.length,
+      reorderGapUnits,
+      reorderGapValue: Number(reorderGapValue.toFixed(2)),
+      openSystemAlerts: openAlertCount
+    },
+    critical,
+    lowWithStock,
+    categoryBreakdown,
+    actionList,
+    systemAlerts
+  }
+}
+
+async function alertsReport(req, res, next) {
   try {
-    const { format='pdf' } = req.query
-    const products = await prisma.product.findMany({ where:{ deleted_at:null } })
-    const low = products.filter(p=> number(p.stock) <= number(p.min_stock))
-    const critical = products.filter(p=> number(p.stock) === 0)
+    const branding = await getBrandingForPdf(prisma)
+    const companyName = branding.company_name
+    const logoBuffer = branding.logoBuffer
+    const money = makeMoney(branding.currency_code)
+    const { format = 'pdf' } = req.query
+    const zone = 'America/Guatemala'
+    const data = await getAlertsReportData()
+    const { summary, categoryBreakdown, actionList, critical, systemAlerts } = data
+
+    const gapUnits = (p) => Math.max(0, number(p.min_stock) - number(p.stock))
+    const fmtTs = (d) =>
+      d ? DateTime.fromJSDate(d).setZone(zone).toFormat('yyyy-LL-dd HH:mm') : '—'
+
+    const rowPrioridad = (p) => [
+      p.name,
+      p.category?.name || '—',
+      number(p.stock),
+      number(p.min_stock),
+      gapUnits(p),
+      money(gapUnits(p) * number(p.cost)),
+      p.supplier?.name || '—'
+    ]
+
     if (String(format).toLowerCase() === 'csv' || String(format).toLowerCase() === 'excel') {
-      sendCsv(res, 'reporte-alertas', [
-        'REPORTE DE ALERTAS',
-        `Generado,${DateTime.now().setZone('America/Guatemala').toFormat('yyyy-LL-dd HH:mm')}`,
-        `Stock Bajo,${low.length}`,
-        `Sin Stock,${critical.length}`
-      ], [
-        { title:'Stock Bajo', columns:['Producto','Stock','Stock Mín.'], rows: low.map(p=>[p.name, p.stock, p.min_stock]) },
-        { title:'Sin Stock', columns:['Producto'], rows: critical.map(p=>[p.name]) }
-      ])
+      const sections = [
+        {
+          title: 'Concentración por categoría (SKUs en riesgo)',
+          columns: ['Categoría', 'En riesgo', 'Sin stock', 'Bajo mín. c/stock'],
+          rows: categoryBreakdown.map((c) => [
+            c.category,
+            c.enRiesgo,
+            c.sinStock,
+            c.bajoConStock
+          ])
+        },
+        {
+          title: 'Prioridad de reposición (faltante vs mínimo)',
+          columns: [
+            'Producto',
+            'Categoría',
+            'Stock',
+            'Mín.',
+            'Faltante',
+            'Valor faltante',
+            'Proveedor'
+          ],
+          rows: actionList.map(rowPrioridad)
+        },
+        {
+          title: 'Crítico: sin stock',
+          columns: ['Producto', 'Categoría', 'Mín.', 'Proveedor', 'Estado stock'],
+          rows: critical.map((p) => [
+            p.name,
+            p.category?.name || '—',
+            number(p.min_stock),
+            p.supplier?.name || '—',
+            p.status?.name || '—'
+          ])
+        }
+      ]
+      if (systemAlerts.length) {
+        sections.push({
+          title: 'Alertas del sistema (abiertas)',
+          columns: ['Fecha', 'Tipo', 'Prioridad', 'Producto', 'Título', 'Estado', 'Asignado'],
+          rows: systemAlerts.map((a) => [
+            fmtTs(a.timestamp),
+            a.type?.name || '—',
+            a.priority?.name || '—',
+            a.product?.name || '—',
+            a.title,
+            a.status?.name || '—',
+            a.assignedTo?.name || '—'
+          ])
+        })
+      }
+      const headerLines = [
+        'REPORTE DE ALERTAS E INVENTARIO CRÍTICO',
+        `Generado,${DateTime.now().setZone(zone).toFormat('yyyy-LL-dd HH:mm')}`,
+        `SKUs activos totales,${summary.totalSkus}`,
+        `Sin stock (crítico),${summary.criticalCount}`,
+        `Bajo mínimo con existencias,${summary.lowWithStockCount}`,
+        `SKUs en riesgo (total),${summary.atRiskCount}`,
+        `Unidades a reponer hasta mínimo,${summary.reorderGapUnits}`,
+        `Valor estimado reposición (faltante * costo),${money(summary.reorderGapValue)}`,
+        `Tickets de alerta abiertos (total),${summary.openSystemAlerts}`
+      ]
+      if (summary.openSystemAlerts > 250) {
+        headerLines.push(
+          'Nota,La sección CSV de alertas del sistema incluye como máximo 250 registros.'
+        )
+      }
+      sendCsv(res, 'reporte-alertas', headerLines, sections)
       return
     }
+
     const doc = newDoc(res, 'Reporte de Alertas')
-    header(doc,'Reporte de Alertas','Actual')
-    sectionTitle(doc,'Resumen')
+    header(doc, 'Reporte de Alertas', 'Actual', companyName, logoBuffer)
+
+    sectionTitle(doc, 'Resumen - riesgo de stock y seguimiento')
     drawSummaryCards(doc, [
-      { label: 'Stock Bajo', value: String(low.length) },
-      { label: 'Sin Stock', value: String(critical.length) },
-      { label: 'Total Revisados', value: String(products.length) },
+      { label: 'Sin stock', value: String(summary.criticalCount) },
+      { label: 'Bajo mín. (c/stock)', value: String(summary.lowWithStockCount) },
+      { label: 'SKUs en riesgo', value: String(summary.atRiskCount) },
+      { label: 'Unid. a reponer', value: String(summary.reorderGapUnits) },
+      { label: 'Valor reposición est.', value: money(summary.reorderGapValue) },
+      { label: 'Alertas abiertas', value: String(summary.openSystemAlerts) }
     ])
-  sectionTitle(doc,'Productos con Stock Bajo (máx 100)')
-  drawTable(doc, ['Producto','Stock','Stock Mín.'], low.slice(0,100).map(p=>[p.name, p.stock, p.min_stock]), [180,60,70], { align: ['left','right','right'], headerAlign: ['left','right','right'] })
-  sectionTitle(doc,'Productos sin Stock')
-  drawTable(doc, ['Producto'], critical.slice(0,80).map(p=>[p.name]), [200], { align: ['left'], headerAlign: ['left'] })
-    footer(doc)
+    ensureSpace(doc, 32)
+    doc
+      .fontSize(8)
+      .fillColor(BRAND.muted)
+      .text(
+        `Catálogo activo: ${summary.totalSkus} SKUs. Valor de reposición = unidades faltantes hasta el mínimo * costo actual.`,
+        doc.page.margins.left,
+        doc.y,
+        { width: doc.page.width - doc.page.margins.left - doc.page.margins.right }
+      )
+    doc.moveDown(1)
+
+    if (categoryBreakdown.length) {
+      sectionTitle(doc, 'Concentración por categoría')
+      drawTable(
+        doc,
+        ['Categoría', 'En riesgo', 'Sin stock', 'Bajo mín. c/stock'],
+        categoryBreakdown.map((c) => [c.category, c.enRiesgo, c.sinStock, c.bajoConStock]),
+        [238, 72, 72, 90],
+        {
+          align: ['left', 'right', 'right', 'right'],
+          headerAlign: ['left', 'right', 'right', 'right']
+        }
+      )
+    }
+
+    if (actionList.length) {
+      sectionTitle(doc, 'Prioridad de reposición')
+      drawTable(
+        doc,
+        ['Producto', 'Categoría', 'Stock', 'Mín.', 'Faltante', 'Valor falt.', 'Proveedor'],
+        actionList.slice(0, 120).map(rowPrioridad),
+        [118, 68, 34, 34, 46, 72, 102],
+        {
+          align: ['left', 'left', 'right', 'right', 'right', 'right', 'left'],
+          headerAlign: ['left', 'left', 'right', 'right', 'right', 'right', 'left']
+        }
+      )
+      if (actionList.length > 120) {
+        ensureSpace(doc, 20)
+        doc
+          .fontSize(8)
+          .fillColor(BRAND.muted)
+          .text(
+            `... y ${actionList.length - 120} productos más. Descarga CSV para el listado completo.`,
+            doc.page.margins.left
+          )
+        doc.moveDown(0.5)
+      }
+    } else {
+      sectionTitle(doc, 'Prioridad de reposición')
+      ensureSpace(doc, 16)
+      doc.fontSize(9).fillColor(BRAND.muted).text('Ningún SKU bajo el mínimo configurado.', doc.page.margins.left)
+      doc.moveDown(0.5)
+    }
+
+    if (critical.length) {
+      sectionTitle(doc, 'Crítico: sin stock')
+      drawTable(
+        doc,
+        ['Producto', 'Categoría', 'Mín.', 'Proveedor', 'Estado'],
+        critical.slice(0, 80).map((p) => [
+          p.name,
+          p.category?.name || '—',
+          number(p.min_stock),
+          p.supplier?.name || '—',
+          p.status?.name || '—'
+        ]),
+        [138, 78, 36, 118, 100],
+        {
+          align: ['left', 'left', 'right', 'left', 'left'],
+          headerAlign: ['left', 'left', 'right', 'left', 'left']
+        }
+      )
+    }
+
+    sectionTitle(doc, 'Alertas del sistema (sin resolver)')
+    if (systemAlerts.length) {
+      drawTable(
+        doc,
+        ['Fecha', 'Tipo', 'Prioridad', 'Producto', 'Título', 'Estado', 'Asignado'],
+        systemAlerts.slice(0, 100).map((a) => [
+          fmtTs(a.timestamp),
+          a.type?.name || '—',
+          a.priority?.name || '—',
+          a.product?.name || '—',
+          a.title,
+          a.status?.name || '—',
+          a.assignedTo?.name || '—'
+        ]),
+        [72, 58, 52, 88, 104, 58, 62],
+        {
+          align: ['left', 'left', 'left', 'left', 'left', 'left', 'left'],
+          headerAlign: ['left', 'left', 'left', 'left', 'left', 'left', 'left']
+        }
+      )
+      const shownAlerts = Math.min(100, systemAlerts.length)
+      if (summary.openSystemAlerts > shownAlerts) {
+        ensureSpace(doc, 18)
+        doc
+          .fontSize(8)
+          .fillColor(BRAND.muted)
+          .text(
+            `PDF: primeras ${shownAlerts} de ${summary.openSystemAlerts} alertas. CSV: hasta 250.`,
+            doc.page.margins.left
+          )
+        doc.moveDown(0.5)
+      }
+    } else {
+      ensureSpace(doc, 16)
+      doc.fontSize(9).fillColor(BRAND.muted).text('No hay tickets de alerta abiertos.', doc.page.margins.left)
+      doc.moveDown(0.5)
+    }
+
+    footer(doc, companyName)
     doc.end()
-  } catch(e){ next(e) }
+  } catch (e) {
+    next(e)
+  }
 }
 
-async function productsReport(req,res,next){
+/** Catálogo: márgenes, valor a costo vs precio público, mix por categoría y proveedor. */
+async function getProductsAnalysisData() {
+  const products = await prisma.product.findMany({
+    where: { deleted: false, deleted_at: null },
+    include: { category: true, supplier: true, status: true }
+  })
+
+  let inventoryValue = 0
+  let retailInventoryValue = 0
+  let marginContrib = 0
+  let pricingFlags = 0
+
+  const byCategory = {}
+  const bySupplier = {}
+
+  const enriched = products.map((p) => {
+    const st = number(p.stock)
+    const c = number(p.cost)
+    const pr = number(p.price)
+    const vInv = st * c
+    const vRetail = st * pr
+    const contrib = st * (pr - c)
+    inventoryValue += vInv
+    retailInventoryValue += vRetail
+    marginContrib += contrib
+
+    if (pr > 0 && pr < c) pricingFlags += 1
+    if (pr > 0 && c <= 0) pricingFlags += 1
+
+    const cat = p.category?.name || 'Sin categoría'
+    if (!byCategory[cat]) {
+      byCategory[cat] = { category: cat, skus: 0, units: 0, invValue: 0, retailValue: 0, contrib: 0 }
+    }
+    byCategory[cat].skus += 1
+    byCategory[cat].units += st
+    byCategory[cat].invValue += vInv
+    byCategory[cat].retailValue += vRetail
+    byCategory[cat].contrib += contrib
+
+    const sup = p.supplier?.name || '—'
+    if (!bySupplier[sup]) {
+      bySupplier[sup] = { supplier: sup, skus: 0, units: 0, invValue: 0, retailValue: 0 }
+    }
+    bySupplier[sup].skus += 1
+    bySupplier[sup].units += st
+    bySupplier[sup].invValue += vInv
+    bySupplier[sup].retailValue += vRetail
+
+    const marginPct = pr > 0 ? Number((((pr - c) / pr) * 100).toFixed(1)) : null
+
+    return {
+      ...p,
+      units: st,
+      invValue: vInv,
+      retailValue: vRetail,
+      marginPct
+    }
+  })
+
+  const weightedMarginPct =
+    retailInventoryValue > 0
+      ? Number(((marginContrib / retailInventoryValue) * 100).toFixed(1))
+      : 0
+
+  const categoryRows = Object.values(byCategory)
+    .map((row) => ({
+      category: row.category,
+      skus: row.skus,
+      units: row.units,
+      invValue: Number(row.invValue.toFixed(2)),
+      retailValue: Number(row.retailValue.toFixed(2)),
+      marginPct:
+        row.retailValue > 0
+          ? Number(((row.contrib / row.retailValue) * 100).toFixed(1))
+          : 0
+    }))
+    .sort((a, b) => b.retailValue - a.retailValue)
+
+  const supplierRows = Object.values(bySupplier)
+    .map((row) => ({
+      supplier: row.supplier,
+      skus: row.skus,
+      units: row.units,
+      invValue: Number(row.invValue.toFixed(2)),
+      retailValue: Number(row.retailValue.toFixed(2))
+    }))
+    .sort((a, b) => b.invValue - a.invValue)
+
+  const topByInv = [...enriched].sort((a, b) => b.invValue - a.invValue).slice(0, 15)
+  const topByRetail = [...enriched].sort((a, b) => b.retailValue - a.retailValue).slice(0, 15)
+  const tightMargins = [...enriched]
+    .filter((p) => p.marginPct !== null && number(p.price) > 0)
+    .sort((a, b) => (a.marginPct ?? 100) - (b.marginPct ?? 100))
+    .slice(0, 15)
+
+  const supplierCount = supplierRows.filter((s) => s.supplier !== '—').length
+
+  return {
+    products: enriched,
+    summary: {
+      totalSkus: products.length,
+      categoryCount: categoryRows.length,
+      supplierCount,
+      inventoryValue: Number(inventoryValue.toFixed(2)),
+      retailInventoryValue: Number(retailInventoryValue.toFixed(2)),
+      weightedMarginPct,
+      pricingFlags
+    },
+    categoryRows,
+    supplierRows,
+    topByInv,
+    topByRetail,
+    tightMargins
+  }
+}
+
+async function productsReport(req, res, next) {
   try {
-    const { format='pdf' } = req.query
-    const products = await prisma.product.findMany({ where:{ deleted_at:null }, include:{ category:true } })
+    const branding = await getBrandingForPdf(prisma)
+    const companyName = branding.company_name
+    const logoBuffer = branding.logoBuffer
+    const money = makeMoney(branding.currency_code)
+    const zone = 'America/Guatemala'
+    const { format = 'pdf' } = req.query
+    const data = await getProductsAnalysisData()
+    const { products, summary, categoryRows, supplierRows, topByInv, topByRetail, tightMargins } = data
+
+    const rowDetalle = (p) => [
+      p.name,
+      p.category?.name || '—',
+      p.supplier?.name || '—',
+      p.units,
+      money(number(p.cost)),
+      money(number(p.price)),
+      p.marginPct != null ? `${p.marginPct}%` : '—',
+      money(p.invValue),
+      money(p.retailValue)
+    ]
+
     if (String(format).toLowerCase() === 'csv' || String(format).toLowerCase() === 'excel') {
-      const total = products.length
-      const categories = {}
-      products.forEach(p=>{ const cat = p.category?.name || 'Sin categoría'; categories[cat]=(categories[cat]||0)+1 })
+      const sections = [
+        {
+          title: 'Categoría — mix, unidades y margen sobre valor al público',
+          columns: ['Categoría', 'SKUs', 'Unidades', 'Valor inv.', 'Valor público', 'Margen %'],
+          rows: categoryRows.map((c) => [
+            c.category,
+            c.skus,
+            c.units,
+            money(c.invValue),
+            money(c.retailValue),
+            `${c.marginPct}%`
+          ])
+        },
+        {
+          title: 'Proveedor — concentración de catálogo',
+          columns: ['Proveedor', 'SKUs', 'Unidades', 'Valor inv.', 'Valor público'],
+          rows: supplierRows.map((s) => [
+            s.supplier,
+            s.skus,
+            s.units,
+            money(s.invValue),
+            money(s.retailValue)
+          ])
+        },
+        {
+          title: 'Top valor inventario (costo)',
+          columns: ['Producto', 'Categoría', 'Stock', 'Val. inv.', 'PVP', 'Margen %'],
+          rows: topByInv.map((p) => [
+            p.name,
+            p.category?.name || '—',
+            p.units,
+            money(p.invValue),
+            money(number(p.price)),
+            p.marginPct != null ? `${p.marginPct}%` : '—'
+          ])
+        },
+        {
+          title: 'Top valor al público (stock × PVP)',
+          columns: ['Producto', 'Categoría', 'Stock', 'Valor público', 'Val. inv.', 'Margen %'],
+          rows: topByRetail.map((p) => [
+            p.name,
+            p.category?.name || '—',
+            p.units,
+            money(p.retailValue),
+            money(p.invValue),
+            p.marginPct != null ? `${p.marginPct}%` : '—'
+          ])
+        },
+        {
+          title: 'Márgenes más ajustados (menor % sobre PVP)',
+          columns: ['Producto', 'Categoría', 'Costo', 'PVP', 'Margen %'],
+          rows: tightMargins.map((p) => [
+            p.name,
+            p.category?.name || '—',
+            money(number(p.cost)),
+            money(number(p.price)),
+            `${p.marginPct}%`
+          ])
+        },
+        {
+          title: 'Catálogo completo',
+          columns: [
+            'Producto',
+            'Categoría',
+            'Proveedor',
+            'Stock',
+            'Costo',
+            'PVP',
+            'Margen %',
+            'Val. inv.',
+            'Val. público',
+            'Estado stock'
+          ],
+          rows: products.map((p) => [
+            p.name,
+            p.category?.name || '—',
+            p.supplier?.name || '—',
+            p.units,
+            money(number(p.cost)),
+            money(number(p.price)),
+            p.marginPct != null ? `${p.marginPct}%` : '—',
+            money(p.invValue),
+            money(p.retailValue),
+            p.status?.name || '—'
+          ])
+        }
+      ]
       sendCsv(res, 'reporte-productos', [
-        'REPORTE DE PRODUCTOS',
-        `Generado,${DateTime.now().setZone('America/Guatemala').toFormat('yyyy-LL-dd HH:mm')}`,
-        `Total Productos,${total}`
-      ], [
-        { title:'Distribución por Categoría', columns:['Categoría','Cantidad','%'], rows: Object.entries(categories).map(([cat,count])=>[cat, count, ((count/total)*100).toFixed(1)+'%']) },
-        { title:'Listado', columns:['Producto','Categoría','Stock','Costo (Q)'], rows: products.map(p=>[p.name, p.category?.name||'—', p.stock, number(p.cost)]) }
-      ])
+        'ANÁLISIS DE PRODUCTOS Y CATÁLOGO',
+        `Generado,${DateTime.now().setZone(zone).toFormat('yyyy-LL-dd HH:mm')}`,
+        `SKUs activos,${summary.totalSkus}`,
+        `Categorías,${summary.categoryCount}`,
+        `Proveedores (con catálogo),${summary.supplierCount}`,
+        `Valor inventario (stock × costo),${money(summary.inventoryValue)}`,
+        `Valor al público en existencias (stock × PVP),${money(summary.retailInventoryValue)}`,
+        `Margen % ponderado (sobre valor público en stock),${summary.weightedMarginPct}%`,
+        `SKUs a revisar precio/costo,${summary.pricingFlags}`
+      ], sections)
       return
     }
-    const doc = newDoc(res, 'Reporte de Productos')
-    header(doc,'Reporte de Productos','Actual')
-  sectionTitle(doc,'Resumen')
-  const total = products.length
-  const invValue = products.reduce((acc,p)=>acc+ number(p.stock)* number(p.cost),0)
-  const categories = {}
-  products.forEach(p=>{ const cat = p.category?.name || 'Sin categoría'; categories[cat]=(categories[cat]||0)+1 })
-  const catCount = Object.keys(categories).length
+
+    const doc = newDoc(res, 'Análisis de Productos')
+    header(doc, 'Análisis de Productos', 'Actual', companyName, logoBuffer)
+
+    sectionTitle(doc, 'Resumen - catálogo y rentabilidad de existencias')
     drawSummaryCards(doc, [
-      { label: 'Productos Activos', value: String(total) },
-      { label: 'Categorías', value: String(catCount) },
-      { label: 'Valor Inventario', value: money(invValue) },
+      { label: 'SKUs activos', value: String(summary.totalSkus) },
+      { label: 'Valor inventario', value: money(summary.inventoryValue) },
+      { label: 'Valor al público', value: money(summary.retailInventoryValue) },
+      { label: 'Margen % ponderado', value: `${summary.weightedMarginPct}%` },
+      { label: 'Categorías', value: String(summary.categoryCount) },
+      { label: 'Revisar PVP/costo', value: String(summary.pricingFlags) }
     ])
-  // categories already computed above
-  sectionTitle(doc,'Distribución por Categoría')
-  drawTable(doc, ['Categoría','Cantidad','% del Total'], Object.entries(categories).map(([cat,count])=>[cat, count, ((count/total)*100).toFixed(1)+'%']), [180,70,80], { align: ['left','right','right'], headerAlign: ['left','right','right'] })
-  sectionTitle(doc,'Listado (máx 120)')
-  drawTable(doc, ['Producto','Categoría','Stock','Costo (Q)'], products.slice(0,120).map(p=>[p.name, p.category?.name||'—', p.stock, number(p.cost).toLocaleString('es-GT')]), [170,120,50,70], { align: ['left','left','right','right'], headerAlign: ['left','left','right','right'] })
-    footer(doc)
+    ensureSpace(doc, 36)
+    doc
+      .fontSize(8)
+      .fillColor(BRAND.muted)
+      .text(
+        'Margen % ponderado = suma(stock * (PVP - costo)) / suma(stock * PVP). ' +
+          'Revisar: PVP menor que costo o costo en cero con PVP > 0. ' +
+          `${summary.supplierCount} proveedores con ítems activos.`,
+        doc.page.margins.left,
+        doc.y,
+        { width: doc.page.width - doc.page.margins.left - doc.page.margins.right }
+      )
+    doc.moveDown(1.05)
+
+    sectionTitle(doc, 'Categoría - mix y margen')
+    drawTable(
+      doc,
+      ['Categoría', 'SKUs', 'Unid.', 'Val. inv.', 'Val. público', 'Margen %'],
+      categoryRows.map((c) => [
+        c.category,
+        c.skus,
+        c.units,
+        money(c.invValue),
+        money(c.retailValue),
+        `${c.marginPct}%`
+      ]),
+      [128, 36, 44, 78, 82, 52],
+      {
+        align: ['left', 'right', 'right', 'right', 'right', 'right'],
+        headerAlign: ['left', 'right', 'right', 'right', 'right', 'right']
+      }
+    )
+
+    sectionTitle(doc, 'Proveedor - concentración')
+    drawTable(
+      doc,
+      ['Proveedor', 'SKUs', 'Unid.', 'Val. inv.', 'Val. público'],
+      supplierRows.slice(0, 25).map((s) => [
+        s.supplier,
+        s.skus,
+        s.units,
+        money(s.invValue),
+        money(s.retailValue)
+      ]),
+      [218, 40, 46, 78, 82],
+      {
+        align: ['left', 'right', 'right', 'right', 'right'],
+        headerAlign: ['left', 'right', 'right', 'right', 'right']
+      }
+    )
+    if (supplierRows.length > 25) {
+      ensureSpace(doc, 16)
+      doc.fontSize(8).fillColor(BRAND.muted).text(`... ${supplierRows.length - 25} proveedores más en CSV.`, doc.page.margins.left)
+      doc.moveDown(0.45)
+    }
+
+    sectionTitle(doc, 'Mayor valor a costo (existencias)')
+    drawTable(
+      doc,
+      ['Producto', 'Categoría', 'Stock', 'Val. inv.', 'PVP', 'Margen %'],
+      topByInv.map((p) => [
+        p.name,
+        p.category?.name || '—',
+        p.units,
+        money(p.invValue),
+        money(number(p.price)),
+        p.marginPct != null ? `${p.marginPct}%` : '—'
+      ]),
+      [128, 72, 34, 70, 56, 46],
+      {
+        align: ['left', 'left', 'right', 'right', 'right', 'right'],
+        headerAlign: ['left', 'left', 'right', 'right', 'right', 'right']
+      }
+    )
+
+    sectionTitle(doc, 'Mayor valor al público (existencias)')
+    drawTable(
+      doc,
+      ['Producto', 'Categoría', 'Stock', 'Val. público', 'Val. inv.', 'Margen %'],
+      topByRetail.map((p) => [
+        p.name,
+        p.category?.name || '—',
+        p.units,
+        money(p.retailValue),
+        money(p.invValue),
+        p.marginPct != null ? `${p.marginPct}%` : '—'
+      ]),
+      [118, 68, 34, 76, 70, 48],
+      {
+        align: ['left', 'left', 'right', 'right', 'right', 'right'],
+        headerAlign: ['left', 'left', 'right', 'right', 'right', 'right']
+      }
+    )
+
+    sectionTitle(doc, 'Márgenes más ajustados')
+    drawTable(
+      doc,
+      ['Producto', 'Categoría', 'Costo', 'PVP', 'Margen %'],
+      tightMargins.map((p) => [
+        p.name,
+        p.category?.name || '—',
+        money(number(p.cost)),
+        money(number(p.price)),
+        `${p.marginPct}%`
+      ]),
+      [138, 78, 58, 58, 46],
+      {
+        align: ['left', 'left', 'right', 'right', 'right'],
+        headerAlign: ['left', 'left', 'right', 'right', 'right']
+      }
+    )
+
+    sectionTitle(doc, 'Detalle de catálogo')
+    drawTable(
+      doc,
+      ['Producto', 'Cat.', 'Prov.', 'St.', 'Costo', 'PVP', 'Marg%', 'V.inv', 'V.pub'],
+      products.slice(0, 90).map(rowDetalle),
+      [102, 46, 50, 24, 52, 52, 36, 52, 52],
+      {
+        align: ['left', 'left', 'left', 'right', 'right', 'right', 'right', 'right', 'right'],
+        headerAlign: ['left', 'left', 'left', 'right', 'right', 'right', 'right', 'right', 'right']
+      }
+    )
+    if (products.length > 90) {
+      ensureSpace(doc, 18)
+      doc
+        .fontSize(8)
+        .fillColor(BRAND.muted)
+        .text(`... ${products.length - 90} productos más en CSV.`, doc.page.margins.left)
+      doc.moveDown(0.5)
+    }
+
+    footer(doc, companyName)
     doc.end()
-  } catch(e){ next(e) }
+  } catch (e) {
+    next(e)
+  }
+}
+
+/**
+ * GET /reports/inventory-count-session/:id?format=pdf|csv
+ * Resumen de una sesión de inventariado (teórico vs contado, diferencias y valor).
+ */
+async function inventoryCountSessionReport(req, res, next) {
+  try {
+    const { id } = req.params
+    const format = String(req.query.format || 'pdf').toLowerCase()
+
+    const session = await prisma.inventoryCountSession.findUnique({
+      where: { id },
+      include: {
+        createdBy: { select: { name: true, email: true } },
+        approvedBy: { select: { name: true, email: true } },
+        firstApprovedBy: { select: { name: true, email: true } },
+      },
+    })
+    if (!session) {
+      return res.status(404).json({ message: 'Sesión de inventariado no encontrada' })
+    }
+
+    const lines = await prisma.inventoryCountLine.findMany({
+      where: { session_id: id },
+      orderBy: { product: { name: 'asc' } },
+      include: {
+        product: {
+          select: {
+            name: true,
+            barcode: true,
+            cost: true,
+            category: { select: { name: true } },
+          },
+        },
+      },
+    })
+
+    const branding = await getBrandingForPdf(prisma)
+    const companyName = branding.company_name
+    const logoBuffer = branding.logoBuffer
+    const money = makeMoney(branding.currency_code)
+
+    if (format === 'csv' || format === 'excel') {
+      const rows = lines.map((L) => {
+        const diff = L.qty_counted != null ? L.qty_counted - L.stock_snapshot : ''
+        const vd =
+          L.qty_counted != null
+            ? (L.qty_counted - L.stock_snapshot) * number(L.product.cost)
+            : ''
+        return [
+          L.product.name,
+          L.product.barcode || '—',
+          L.product.category?.name || '—',
+          L.stock_snapshot,
+          L.qty_counted ?? '—',
+          L.qty_counted_secondary ?? '—',
+          diff === '' ? '—' : diff,
+          vd === '' ? '—' : money(vd),
+          (L.note || '').replace(/\n/g, ' '),
+        ]
+      })
+      return sendCsv(
+        res,
+        `inventariado-${String(session.name || id).slice(0, 24).replace(/\s+/g, '-') || id.slice(0, 8)}`,
+        [
+          'REPORTE DE INVENTARIADO',
+          `Sesión,${session.name || id}`,
+          `Estado,${inventoryCountStatusLabel(session.status)}`,
+          session.submit_reason ? `Motivo envío revisión,${String(session.submit_reason).replace(/,/g, ';')}` : null,
+          session.first_approved_at
+            ? `1.ª aprobación,${session.firstApprovedBy?.name || '—'} · ${DateTime.fromJSDate(session.first_approved_at).setZone(branding.timezone || 'America/Guatemala').toFormat('dd/LL/yyyy HH:mm')}`
+            : null,
+          session.first_approval_reason
+            ? `Motivo 1.ª aprobación,${String(session.first_approval_reason).replace(/,/g, ';')}`
+            : null,
+          session.approved_at && session.final_approval_reason
+            ? `Motivo aprobación final,${String(session.final_approval_reason).replace(/,/g, ';')}`
+            : null,
+          `Creado por,${session.createdBy?.name || '—'}`,
+          `Generado,${DateTime.now().setZone(branding.timezone || 'America/Guatemala').toFormat('yyyy-LL-dd HH:mm')}`,
+        ].filter(Boolean),
+        [
+          {
+            title: 'Líneas',
+            columns: ['Producto', 'Código', 'Categoría', 'Teórico', 'Contado', '2.ª lectura', 'Diferencia', 'Valor diff.', 'Nota'],
+            rows,
+          },
+        ]
+      )
+    }
+
+    const doc = newDoc(res, `Inventariado ${session.name || id.slice(0, 8)}`)
+    if (logoBuffer) {
+      try {
+        doc.image(logoBuffer, doc.page.margins.left, doc.y, { fit: [44, 26] })
+        doc.moveDown(1.8)
+      } catch {
+        /* sin logo */
+      }
+    }
+    doc.fontSize(16).fillColor(BRAND.primary).text('Inventariado (conteo físico)', { align: 'left' })
+    doc.moveDown(0.3)
+    doc
+      .fontSize(9)
+      .fillColor(BRAND.muted)
+      .text(`${companyName} · ${inventoryCountStatusLabel(session.status)}`, { continued: false })
+    doc.text(
+      `Sesión: ${session.name || id} · Creado: ${session.createdBy?.name || '—'} · ${DateTime.fromJSDate(session.created_at).setZone(branding.timezone || 'America/Guatemala').toFormat('dd/LL/yyyy HH:mm')}`
+    )
+    if (session.submit_reason) {
+      doc.text(`Motivo envío a revisión: ${String(session.submit_reason).slice(0, 500)}`)
+    }
+    if (session.first_approved_at) {
+      doc.text(
+        `1.ª aprobación: ${DateTime.fromJSDate(session.first_approved_at).setZone(branding.timezone || 'America/Guatemala').toFormat('dd/LL/yyyy HH:mm')} · ${session.firstApprovedBy?.name || '—'}`
+      )
+    }
+    if (session.first_approval_reason) {
+      doc.text(`Motivo 1.ª aprobación: ${String(session.first_approval_reason).slice(0, 400)}`)
+    }
+    if (session.approved_at) {
+      doc.text(
+        `Aprobación final: ${DateTime.fromJSDate(session.approved_at).setZone(branding.timezone || 'America/Guatemala').toFormat('dd/LL/yyyy HH:mm')} · ${session.approvedBy?.name || '—'}`
+      )
+    }
+    if (session.final_approval_reason) {
+      doc.text(`Motivo aprobación final: ${String(session.final_approval_reason).slice(0, 400)}`)
+    }
+    doc.moveDown(0.8)
+
+    const tableRows = lines.map((L) => {
+      const diff = L.qty_counted != null ? L.qty_counted - L.stock_snapshot : null
+      const vd = diff != null ? diff * number(L.product.cost) : null
+      return [
+        String(L.product.name).slice(0, 22),
+        L.product.barcode || '—',
+        String(L.product.category?.name || '—').slice(0, 10),
+        L.stock_snapshot,
+        L.qty_counted ?? '—',
+        L.qty_counted_secondary ?? '—',
+        diff != null ? diff : '—',
+        vd != null ? money(vd) : '—',
+      ]
+    })
+
+    sectionTitle(doc, 'Detalle de líneas')
+    drawTable(
+      doc,
+      ['Producto', 'Cód.', 'Cat.', 'Teór.', 'C1', 'C2', 'Diff.', 'Valor'],
+      tableRows.slice(0, 100),
+      [102, 54, 48, 30, 28, 28, 28, 48],
+      {
+        align: ['left', 'left', 'left', 'right', 'right', 'right', 'right', 'right'],
+        headerAlign: ['left', 'left', 'left', 'right', 'right', 'right', 'right', 'right'],
+      }
+    )
+    if (lines.length > 100) {
+      ensureSpace(doc, 20)
+      doc.fontSize(8).fillColor(BRAND.muted).text(`… ${lines.length - 100} líneas más (ver CSV).`, doc.page.margins.left)
+    }
+
+    footer(doc, companyName)
+    doc.end()
+  } catch (e) {
+    next(e)
+  }
+}
+
+function inventoryCountStatusLabel(status) {
+  const m = {
+    DRAFT: 'Pendiente de empezar',
+    IN_PROGRESS: 'Contando',
+    IN_REVIEW: 'En revisión',
+    PENDING_SECOND_APPROVAL: 'Falta segunda firma',
+    APPROVED: 'Cerrado y guardado',
+    CANCELLED: 'Cancelado',
+  }
+  return m[status] || String(status)
+}
+
+/**
+ * GET /reports/inventory-counts?period=...&year=...&format=pdf|csv
+ * Resumen de sesiones de inventariado creadas en el rango: líneas, contadas, valor de diferencias y mermas.
+ */
+async function inventoryCountsHistoryReport(req, res, next) {
+  try {
+    const branding = await getBrandingForPdf(prisma)
+    const companyName = branding.company_name
+    const logoBuffer = branding.logoBuffer
+    const money = makeMoney(branding.currency_code)
+    const zone = branding.timezone || 'America/Guatemala'
+    const { period = 'month', year, format = 'pdf', month, quarter, semester } = req.query
+    const { startUtc, endUtc, label } = periodRange(period, year, { month, quarter, semester }, zone)
+
+    const sessions = await prisma.inventoryCountSession.findMany({
+      where: {
+        created_at: { gte: startUtc, lte: endUtc },
+      },
+      include: {
+        createdBy: { select: { name: true } },
+        approvedBy: { select: { name: true } },
+        _count: { select: { lines: true } },
+      },
+      orderBy: { created_at: 'desc' },
+    })
+
+    const sessionIds = sessions.map((s) => s.id)
+    const countedBySession = new Map()
+    const valueAgg = new Map()
+
+    if (sessionIds.length) {
+      const countedAgg = await prisma.inventoryCountLine.groupBy({
+        by: ['session_id'],
+        where: { session_id: { in: sessionIds }, qty_counted: { not: null } },
+        _count: { id: true },
+      })
+      for (const c of countedAgg) countedBySession.set(c.session_id, c._count.id)
+
+      const allLines = await prisma.inventoryCountLine.findMany({
+        where: { session_id: { in: sessionIds }, qty_counted: { not: null } },
+        select: {
+          session_id: true,
+          stock_snapshot: true,
+          qty_counted: true,
+          product: { select: { cost: true } },
+        },
+      })
+      for (const L of allLines) {
+        const d = L.qty_counted - L.stock_snapshot
+        const v = d * number(L.product.cost)
+        const prev = valueAgg.get(L.session_id) || { valueDiff: 0, mermaValue: 0 }
+        prev.valueDiff += v
+        if (d < 0) prev.mermaValue += Math.abs(v)
+        valueAgg.set(L.session_id, prev)
+      }
+    }
+
+    const genAt = DateTime.now().setZone(zone).toFormat('yyyy-LL-dd HH:mm')
+    const fmtDate = (d) =>
+      d ? DateTime.fromJSDate(d).setZone(zone).toFormat('dd/LL/yyyy HH:mm') : '—'
+
+    const tableData = sessions.map((s) => {
+      const agg = valueAgg.get(s.id) || { valueDiff: 0, mermaValue: 0 }
+      const counted = countedBySession.get(s.id) || 0
+      return {
+        s,
+        counted,
+        ...agg,
+      }
+    })
+
+    let sumValueDiff = 0
+    let sumMerma = 0
+    for (const row of tableData) {
+      sumValueDiff += row.valueDiff
+      sumMerma += row.mermaValue
+    }
+    const byStatus = sessions.reduce((acc, s) => {
+      acc[s.status] = (acc[s.status] || 0) + 1
+      return acc
+    }, {})
+
+    if (String(format).toLowerCase() === 'csv' || String(format).toLowerCase() === 'excel') {
+      const rows = tableData.map(({ s, counted, valueDiff, mermaValue }) => [
+        s.name || s.id.slice(0, 8),
+        inventoryCountStatusLabel(s.status),
+        fmtDate(s.created_at),
+        s._count.lines,
+        counted,
+        money(valueDiff),
+        money(mermaValue),
+        s.approved_at ? fmtDate(s.approved_at) : '—',
+        s.approvedBy?.name || '—',
+        s.createdBy?.name || '—',
+      ])
+      return sendCsv(
+        res,
+        `historial-inventariados-${label.replace(/\s+/g, '-').slice(0, 40)}`,
+        [
+          'HISTORIAL DE INVENTARIADOS',
+          `Periodo,${label}`,
+          `Generado,${genAt}`,
+          `Sesiones,${sessions.length}`,
+          `Suma valor diferencias (contado),${money(sumValueDiff)}`,
+          `Suma mermas (valor),${money(sumMerma)}`,
+        ],
+        [
+          {
+            title: 'Sesiones',
+            columns: [
+              'Sesión',
+              'Estado',
+              'Creado',
+              'Líneas',
+              'Contadas',
+              'Valor diff.',
+              'Merma ($)',
+              'Aprobado',
+              'Aprobador',
+              'Creado por',
+            ],
+            rows,
+          },
+        ]
+      )
+    }
+
+    const doc = newDoc(res, `Historial inventariados ${label}`)
+    doc.fontSize(16).fillColor(BRAND.primary).text('Historial de inventariados', { align: 'left' })
+    doc.moveDown(0.3)
+    doc.fontSize(9).fillColor(BRAND.muted).text(`${companyName} · ${label}`)
+    doc.text(`Generado: ${genAt}`)
+    doc.moveDown(0.6)
+
+    sectionTitle(doc, 'Resumen')
+    drawSummaryCards(doc, [
+      { label: 'Sesiones', value: String(sessions.length) },
+      { label: 'Aprobadas', value: String(byStatus.APPROVED || 0) },
+      { label: 'En curso / revisión', value: String((byStatus.IN_PROGRESS || 0) + (byStatus.IN_REVIEW || 0) + (byStatus.PENDING_SECOND_APPROVAL || 0)) },
+      { label: 'Valor dif. (contado)', value: money(sumValueDiff) },
+      { label: 'Mermas (valor)', value: money(sumMerma) },
+    ])
+    doc.moveDown(0.5)
+
+    sectionTitle(doc, 'Sesiones')
+    const pdfRows = tableData.map(({ s, counted, valueDiff, mermaValue }) => [
+      String(s.name || s.id.slice(0, 8)).slice(0, 26),
+      inventoryCountStatusLabel(s.status).slice(0, 12),
+      fmtDate(s.created_at).slice(0, 16),
+      s._count.lines,
+      counted,
+      money(valueDiff),
+      money(mermaValue),
+    ])
+    drawTable(
+      doc,
+      ['Sesión', 'Estado', 'Creado', 'Lín.', 'Cont.', 'Val.diff', 'Merma'],
+      pdfRows.slice(0, 80),
+      [118, 52, 72, 28, 28, 58, 58],
+      {
+        align: ['left', 'left', 'left', 'right', 'right', 'right', 'right'],
+        headerAlign: ['left', 'left', 'left', 'right', 'right', 'right', 'right'],
+      }
+    )
+    if (tableData.length > 80) {
+      ensureSpace(doc, 18)
+      doc.fontSize(8).fillColor(BRAND.muted).text(`… ${tableData.length - 80} sesiones más (ver CSV).`, doc.page.margins.left)
+    }
+
+    footer(doc, companyName)
+    doc.end()
+  } catch (e) {
+    next(e)
+  }
 }
 
 module.exports = {
@@ -694,5 +2326,7 @@ module.exports = {
   suppliersReport,
   financialReport,
   alertsReport,
-  productsReport
+  productsReport,
+  inventoryCountSessionReport,
+  inventoryCountsHistoryReport,
 }

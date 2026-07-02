@@ -5,7 +5,7 @@
  * Unauthorized copying, modification, distribution, or use of this file,
  * via any medium, is strictly prohibited without express written permission.
  * 
- * For licensing inquiries: GitHub @dpatzan
+ * For licensing inquiries: GitHub @dpatzan2
  */
 
 const { Router } = require('express')
@@ -37,11 +37,24 @@ router.use('/analytics', require('./analytics.routes'))
 router.use('/reports', require('./reports.routes'))
 // Returns (product returns/refunds)
 router.use('/returns', require('./returns.routes'))
-// Cash Closures (cierre de caja)
+// Cash register sessions (apertura de caja)
+router.use('/cash-sessions', require('./cashSessions.routes'))
+// Cash closures (cierre de caja)
 router.use('/cash-closures', require('./cashClosures.routes'))
+// System settings (configuración)
+router.use('/settings', require('./settings.routes'))
 // Promotions (discount codes)
 router.use('/promotions', require('./promotions.routes'))
-
+// Incoming Merchandise (registro de mercancía)
+router.use('/incoming-merchandise', require('./incomingMerchandise.routes'))
+// Inventariado (conteo físico)
+router.use('/inventory-counts', require('./inventoryCounts.routes'))
+// Cotizaciones comerciales
+router.use('/quotes', require('./quotes.routes'))
+// Pedidos comerciales
+router.use('/orders', require('./orders.routes'))
+// Cotiz/pedidos: vencimientos y reportes operativos
+router.use('/commercial-documents', require('./commercialDocuments.routes'))
 
 
 module.exports = router

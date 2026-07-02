@@ -8,10 +8,10 @@ This repository is **private intellectual property** and does **NOT** accept ext
 
 ## Policy
 
-- ❌ **Pull requests will be rejected** without review
-- ❌ **Issues from non-authorized users** will be closed
-- ❌ **Forks for contribution purposes** are prohibited
-- ❌ **Code suggestions** are not accepted
+-  **Pull requests will be rejected** without review
+-  **Issues from non-authorized users** will be closed
+-  **Forks for contribution purposes** are prohibited
+-  **Code suggestions** are not accepted
 
 ---
 

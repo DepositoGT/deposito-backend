@@ -5,7 +5,7 @@
  * Unauthorized copying, modification, distribution, or use of this file,
  * via any medium, is strictly prohibited without express written permission.
  * 
- * For licensing inquiries: GitHub @dpatzan
+ * For licensing inquiries: GitHub @dpatzan2
  */
 
 const { Router } = require('express')
@@ -29,11 +29,12 @@ const router = Router()
  *       - in: query
  *         name: year
  *         schema: { type: integer, example: 2025 }
- *         description: Año del que se quiere obtener la información (>= 2025)
+ *         description: Año del que se quiere obtener la información (desde la primera venta completada)
  *     responses:
  *       200:
  *         description: Resumen preparado para dashboards
  */
+router.get('/first-sale-year', ctrl.firstSaleYear)
 router.get('/summary', ctrl.summary)
 
 module.exports = router

@@ -5,7 +5,7 @@
  * Unauthorized copying, modification, distribution, or use of this file,
  * via any medium, is strictly prohibited without express written permission.
  * 
- * For licensing inquiries: GitHub @dpatzan
+ * For licensing inquiries: GitHub @dpatzan2
  */
 
 const { prisma } = require('../models/prisma')
@@ -43,7 +43,7 @@ exports.list = async (req, res, next) => {
     const payment_terms = await prisma.paymentTerm.findMany({ 
       where,
       orderBy: { name: 'asc' },
-      include: { _count: { select: { suppliers: true } } },
+      include: { _count: { select: { supplier_payment_terms: true } } },
       skip: (safePage - 1) * pageSize,
       take: pageSize,
     })
@@ -92,12 +92,20 @@ exports.list = async (req, res, next) => {
  */
 exports.create = async (req, res, next) => {
   try {
-    const { name } = req.body
+    const { name, net_days } = req.body
     if (!name || !name.trim()) {
       return res.status(400).json({ message: 'El nombre es requerido' })
     }
-    const created = await prisma.paymentTerm.create({ 
-      data: { name: name.trim() }
+    let netDaysVal = null
+    if (net_days != null && net_days !== '') {
+      const n = Number(net_days)
+      if (!Number.isFinite(n) || n < 0 || n > 3650) {
+        return res.status(400).json({ message: 'net_days debe ser un número entre 0 y 3650' })
+      }
+      netDaysVal = Math.floor(n)
+    }
+    const created = await prisma.paymentTerm.create({
+      data: { name: name.trim(), net_days: netDaysVal },
     })
     res.status(201).json(created)
   } catch (e) {
@@ -143,13 +151,25 @@ exports.create = async (req, res, next) => {
 exports.update = async (req, res, next) => {
   try {
     const { id } = req.params
-    const { name } = req.body
+    const { name, net_days } = req.body
     if (!name || !name.trim()) {
       return res.status(400).json({ message: 'El nombre es requerido' })
     }
-    const updated = await prisma.paymentTerm.update({ 
-      where: { id: Number(id) }, 
-      data: { name: name.trim() }
+    const data = { name: name.trim() }
+    if (net_days !== undefined) {
+      if (net_days === null || net_days === '') {
+        data.net_days = null
+      } else {
+        const n = Number(net_days)
+        if (!Number.isFinite(n) || n < 0 || n > 3650) {
+          return res.status(400).json({ message: 'net_days debe ser un número entre 0 y 3650' })
+        }
+        data.net_days = Math.floor(n)
+      }
+    }
+    const updated = await prisma.paymentTerm.update({
+      where: { id: Number(id) },
+      data,
     })
     res.json(updated)
   } catch (e) {
@@ -189,13 +209,13 @@ exports.remove = async (req, res, next) => {
     const { id } = req.params
     
     // Verificar proveedores vinculados
-    const linkedSuppliers = await prisma.supplier.count({ 
-      where: { payment_terms_id: Number(id), deleted: false }
+    const linkedSuppliers = await prisma.supplierPaymentTerm.count({
+      where: { payment_term_id: Number(id), supplier: { deleted: false } },
     })
     
     if (linkedSuppliers > 0) {
       return res.status(400).json({ 
-        message: `No se puede eliminar. Tiene ${linkedSuppliers} proveedor(es) vinculado(s)` 
+        message: `No se puede eliminar. Tiene ${linkedSuppliers} contacto(s) vinculado(s)` 
       })
     }
     

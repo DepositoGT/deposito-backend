@@ -5,29 +5,50 @@
  * Unauthorized copying, modification, distribution, or use of this file,
  * via any medium, is strictly prohibited without express written permission.
  * 
- * For licensing inquiries: GitHub @dpatzan
+ * For licensing inquiries: GitHub @dpatzan2
  */
 
-const { prisma } = require('../models/prisma')
+const { prisma, prismaTransaction } = require('../models/prisma')
 const PDFDocument = require('pdfkit')
 // Luxon DateTime (single import; removed duplicate that caused startup SyntaxError)
 const { DateTime } = require('luxon')
-// Currency formatter helper (destructure format function)
-const { format } = new Intl.NumberFormat('es-GT', { style: 'currency', currency: 'GTQ' })
+const { createClient } = require('@supabase/supabase-js')
 
 // Reuse shared stock alert service
 const { ensureStockAlert } = require('../services/stockAlerts')
+const { getTimezone } = require('../utils/getTimezone')
+const { getBrandingForPdf } = require('../utils/pdfBranding')
 
 // Bulk import service
 const { parseExcel, validateBulkData, bulkCreateProducts, generateTemplateWithCatalogs } = require('../services/bulkImport')
+const {
+  parseKind,
+  replaceProductBom,
+  BOM_INCLUDE,
+  getAvailabilityBatchWithKits,
+} = require('../services/bomStock')
+
+// Inicializar cliente de Supabase con service role key (solo para backend)
+const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY
+const supabase = supabaseUrl && supabaseServiceKey 
+  ? createClient(supabaseUrl, supabaseServiceKey)
+  : null
 
 exports.list = async (req, res, next) => {
   try {
     const page = Math.max(1, Number(req.query.page ?? 1))
     const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 20)))
-    const { includeDeleted, search, category } = req.query || {}
-    
+    const { includeDeleted, search, category, supplier, forSale } = req.query || {}
+    const forSaleOnly =
+      forSale === 'true' ||
+      forSale === '1' ||
+      String(forSale || '').toLowerCase() === 'yes'
+
     const where = includeDeleted === 'true' ? {} : { deleted: false }
+    if (forSaleOnly) {
+      where.available_for_sale = true
+    }
     
     // Filtro de búsqueda
     if (search) {
@@ -43,6 +64,11 @@ exports.list = async (req, res, next) => {
       where.category = {
         name: { equals: String(category), mode: 'insensitive' }
       }
+    }
+    
+    // Filtro de proveedor
+    if (supplier) {
+      where.supplier_id = String(supplier)
     }
     
     const totalItems = await prisma.product.count({ where })
@@ -78,22 +104,91 @@ exports.create = async (req, res, next) => {
     const stock = Number(payload.stock || 0)
     const cost = payload.cost != null ? Number(payload.cost) : 0
 
+    // Preparar payload seguro: normalizar campos y validar
+    const safePayload = { ...payload }
+    
+    // Remover image_url si está vacío
+    if (safePayload.image_url === '' || safePayload.image_url === null) {
+      delete safePayload.image_url
+    }
+
+    // Validar y normalizar supplier_id: debe ser un UUID válido
+    if (safePayload.supplier_id !== undefined) {
+      const supplierId = String(safePayload.supplier_id).trim()
+      // Validar formato UUID básico (8-4-4-4-12 caracteres hex)
+      const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+      if (!uuidRegex.test(supplierId)) {
+        // Si no es un UUID válido, intentar buscar el proveedor por nombre
+        const supplier = await prisma.supplier.findFirst({
+          where: { 
+            name: { equals: supplierId, mode: 'insensitive' },
+            deleted: false
+          }
+        })
+        if (supplier) {
+          safePayload.supplier_id = supplier.id
+        } else {
+          return res.status(400).json({ message: `Proveedor no encontrado: ${supplierId}. Debe ser un UUID válido o el nombre de un proveedor existente.` })
+        }
+      } else {
+        safePayload.supplier_id = supplierId
+      }
+    }
+
+    const kind = parseKind(payload.kind)
+    const bomComponents = payload.bom_components
+    delete safePayload.bom_components
+    delete safePayload.kind
+    if (kind === 'KIT') {
+      safePayload.kind = 'KIT'
+      safePayload.stock = 0
+    } else {
+      safePayload.kind = 'STANDARD'
+    }
+
     // create product and, if initial stock > 0, create a purchase log in the same transaction
-    const result = await prisma.$transaction(async (tx) => {
-      const product = await tx.product.create({ data: payload })
+    // Use prismaTransaction (DIRECT_URL) for transactions as pooled connections don't support them
+    const result = await prismaTransaction.$transaction(async (tx) => {
+      let product
+      try {
+        product = await tx.product.create({ data: safePayload })
+      } catch (prismaError) {
+        // Si el error es porque image_url no existe en la base de datos (migración no ejecutada)
+        // Remover image_url y reintentar
+        if (prismaError.message && (
+          prismaError.message.includes('image_url') || 
+          prismaError.message.includes('Unknown argument') ||
+          prismaError.message.includes('Unknown field')
+        )) {
+          const fallbackPayload = { ...safePayload }
+          delete fallbackPayload.image_url
+          product = await tx.product.create({ data: fallbackPayload })
+          console.warn('[products.create] image_url no disponible en la base de datos. Ejecuta la migración para habilitar imágenes de productos.')
+        } else {
+          throw prismaError
+        }
+      }
+
+      if (kind === 'KIT') {
+        if (!bomComponents?.length) {
+          const err = new Error('Un kit debe incluir al menos un componente (bom_components)')
+          err.status = 400
+          throw err
+        }
+        await replaceProductBom(tx, product.id, bomComponents)
+      }
 
       let purchaseLog = null
 
-      if (stock > 0) {
+      if (stock > 0 && kind !== 'KIT') {
         // supplier_id is required on Product model, but validate to ensure purchase log can be created
         const supplierId = product.supplier_id || payload.supplier_id
         if (!supplierId) {
           throw new Error('supplier_id required when initial stock > 0')
         }
 
-        // Build a Date that represents the Guatemala local wall-clock time, but as a UTC instant
-        // so that the DB (timestamptz) will show the same clock time (e.g., 10:00 GT)
-        const nowGt = DateTime.now().setZone('America/Guatemala')
+        const tz = await getTimezone(prisma)
+        const nowGt = DateTime.now().setZone(tz)
         const dateAsUtcWithGtClock = new Date(Date.UTC(
           nowGt.year,
           nowGt.month - 1,
@@ -145,10 +240,87 @@ exports.create = async (req, res, next) => {
 
 exports.getOne = async (req, res, next) => {
   try {
-    const item = await prisma.product.findUnique({ where: { id: req.params.id } })
+    const item = await prisma.product.findUnique({
+      where: { id: req.params.id },
+      include: BOM_INCLUDE,
+    })
     if (!item || item.deleted) return res.status(404).json({ message: 'No encontrado' })
     res.json(item)
   } catch (e) { next(e) }
+}
+
+exports.getBom = async (req, res, next) => {
+  try {
+    const product = await prisma.product.findFirst({
+      where: { id: req.params.id, deleted: false },
+      select: { id: true, name: true, kind: true },
+    })
+    if (!product) return res.status(404).json({ message: 'Producto no encontrado' })
+    if (product.kind !== 'KIT') {
+      return res.json({ kind: product.kind, components: [] })
+    }
+    const components = await prisma.productBomLine.findMany({
+      where: { kit_product_id: product.id },
+      orderBy: { sort_order: 'asc' },
+      include: {
+        component_product: {
+          select: { id: true, name: true, barcode: true, price: true, stock: true, kind: true },
+        },
+      },
+    })
+    res.json({ kind: product.kind, components })
+  } catch (e) {
+    next(e)
+  }
+}
+
+exports.updateBom = async (req, res, next) => {
+  try {
+    const id = req.params.id
+    const { components } = req.body || {}
+    const updated = await prismaTransaction.$transaction(async (tx) => {
+      const product = await tx.product.findFirst({
+        where: { id, deleted: false },
+        select: { id: true, kind: true },
+      })
+      if (!product) {
+        const err = new Error('Producto no encontrado')
+        err.status = 404
+        throw err
+      }
+      if (product.kind !== 'KIT') {
+        await tx.product.update({ where: { id }, data: { kind: 'KIT', stock: 0 } })
+      }
+      return replaceProductBom(tx, id, components)
+    })
+    res.json({ components: updated })
+  } catch (e) {
+    next(e)
+  }
+}
+
+/**
+ * GET /api/products/availability?ids=uuid1,uuid2
+ * Stock físico, reservado y disponible (stock − reservas ACTIVE).
+ */
+exports.availability = async (req, res, next) => {
+  try {
+    const raw = req.query.ids
+    const ids = String(raw || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+    if (ids.length === 0) {
+      return res.status(400).json({ message: 'Parámetro ids requerido (UUIDs separados por coma)' })
+    }
+    if (ids.length > 200) {
+      return res.status(400).json({ message: 'Máximo 200 productos por consulta' })
+    }
+    const availability = await getAvailabilityBatchWithKits(ids)
+    res.json({ availability })
+  } catch (e) {
+    next(e)
+  }
 }
 
 exports.update = async (req, res, next) => {
@@ -162,7 +334,145 @@ exports.update = async (req, res, next) => {
       return res.status(404).json({ message: 'Producto no encontrado' })
     }
 
-    const updated = await prisma.product.update({ where: { id }, data: payload })
+    // Preparar payload seguro: normalizar campos y validar
+    const safePayload = {}
+    
+    // Copiar solo los campos permitidos y necesarios
+    const allowedFields = [
+      'name',
+      'brand',
+      'size',
+      'stock',
+      'min_stock',
+      'price',
+      'cost',
+      'price_wholesale',
+      'price_promotion',
+      'promotion_valid_until',
+      'barcode',
+      'description',
+      'image_url',
+      'category_id',
+      'supplier_id',
+      'status_id',
+      'available_for_sale',
+      'kind',
+    ]
+    for (const field of allowedFields) {
+      if (payload[field] !== undefined) {
+        safePayload[field] = payload[field]
+      }
+    }
+
+    if (safePayload.kind !== undefined) {
+      safePayload.kind = parseKind(safePayload.kind)
+      if (safePayload.kind === 'KIT') {
+        safePayload.stock = 0
+        const bomCount = await prisma.productBomLine.count({ where: { kit_product_id: id } })
+        if (bomCount === 0) {
+          return res.status(400).json({
+            message: 'Un kit debe tener al menos un componente. Configúralos con PUT /api/products/:id/bom antes de marcar kind=KIT.',
+          })
+        }
+      }
+    }
+
+    if (current.kind === 'KIT' || safePayload.kind === 'KIT') {
+      safePayload.stock = 0
+    }
+
+    // Opcionales: mayoreo / promoción (null borra en BD)
+    for (const decField of ['price_wholesale', 'price_promotion']) {
+      if (safePayload[decField] === undefined) continue
+      if (safePayload[decField] === null || safePayload[decField] === '') {
+        safePayload[decField] = null
+        continue
+      }
+      const n = Number(safePayload[decField])
+      if (!Number.isFinite(n) || n < 0) {
+        return res.status(400).json({ message: `${decField} debe ser un número válido >= 0` })
+      }
+      safePayload[decField] = n
+    }
+
+    if (safePayload.promotion_valid_until !== undefined) {
+      if (safePayload.promotion_valid_until === null || safePayload.promotion_valid_until === '') {
+        safePayload.promotion_valid_until = null
+      } else {
+        const d = new Date(safePayload.promotion_valid_until)
+        if (Number.isNaN(d.getTime())) {
+          return res.status(400).json({ message: 'promotion_valid_until no es una fecha válida' })
+        }
+        safePayload.promotion_valid_until = d
+      }
+    }
+
+    // Remover image_url si está vacío
+    if (safePayload.image_url === '' || safePayload.image_url === null) {
+      delete safePayload.image_url
+    }
+
+    // Validar y normalizar category_id
+    if (safePayload.category_id !== undefined) {
+      safePayload.category_id = Number(safePayload.category_id)
+      if (Number.isNaN(safePayload.category_id)) {
+        return res.status(400).json({ message: 'category_id debe ser un número válido' })
+      }
+    }
+
+    // Validar y normalizar status_id
+    if (safePayload.status_id !== undefined) {
+      safePayload.status_id = Number(safePayload.status_id)
+      if (Number.isNaN(safePayload.status_id)) {
+        return res.status(400).json({ message: 'status_id debe ser un número válido' })
+      }
+    }
+
+    if (safePayload.available_for_sale !== undefined) {
+      safePayload.available_for_sale = Boolean(safePayload.available_for_sale)
+    }
+
+    // Validar y normalizar supplier_id: debe ser un UUID válido
+    if (safePayload.supplier_id !== undefined) {
+      const supplierId = String(safePayload.supplier_id).trim()
+      // Validar formato UUID básico (8-4-4-4-12 caracteres hex)
+      const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+      if (!uuidRegex.test(supplierId)) {
+        // Si no es un UUID válido, intentar buscar el proveedor por nombre
+        const supplier = await prisma.supplier.findFirst({
+          where: { 
+            name: { equals: supplierId, mode: 'insensitive' },
+            deleted: false
+          }
+        })
+        if (supplier) {
+          safePayload.supplier_id = supplier.id
+        } else {
+          return res.status(400).json({ message: `Proveedor no encontrado: ${supplierId}. Debe ser un UUID válido o el nombre de un proveedor existente.` })
+        }
+      } else {
+        safePayload.supplier_id = supplierId
+      }
+    }
+
+    let updated
+    try {
+      updated = await prisma.product.update({ where: { id }, data: safePayload })
+    } catch (prismaError) {
+      // Si el error es porque image_url no existe en la base de datos (migración no ejecutada)
+      // Remover image_url y reintentar
+      if (prismaError.message && (
+        prismaError.message.includes('image_url') || 
+        prismaError.message.includes('Unknown argument') ||
+        prismaError.message.includes('Unknown field')
+      )) {
+        delete safePayload.image_url
+        updated = await prisma.product.update({ where: { id }, data: safePayload })
+        console.warn('[products.update] image_url no disponible en la base de datos. Ejecuta la migración para habilitar imágenes de productos.')
+      } else {
+        throw prismaError
+      }
+    }
 
     // If stock or min_stock changed, trigger alert logic
     const stockChanged = payload.stock !== undefined && Number(payload.stock) !== Number(current.stock)
@@ -184,8 +494,8 @@ exports.update = async (req, res, next) => {
 
 exports.remove = async (req, res, next) => {
   try {
-    // Soft-delete: marcar como eliminado y poner timestamp
-    const nowGt = DateTime.now().setZone('America/Guatemala')
+    const tz = await getTimezone(prisma)
+    const nowGt = DateTime.now().setZone(tz)
     const dateAsUtcWithGtClock = new Date(Date.UTC(
       nowGt.year,
       nowGt.month - 1,
@@ -203,8 +513,19 @@ exports.remove = async (req, res, next) => {
 
 exports.reportPdf = async (req, res, next) => {
   try {
+    const branding = await getBrandingForPdf(prisma)
+    const companyName = branding.company_name
+    const currencyCode = (branding.currency_code && branding.currency_code.trim()) || 'GTQ'
+    const money = (v) => new Intl.NumberFormat('es-GT', { style: 'currency', currency: currencyCode }).format(Number(v || 0))
+    const where = { deleted: false }
+    const idsParam = req.query.ids
+    if (idsParam && typeof idsParam === 'string' && idsParam.trim()) {
+      const ids = idsParam.split(',').map((id) => id.trim()).filter(Boolean)
+      if (ids.length > 0) where.id = { in: ids }
+    }
+
     const products = await prisma.product.findMany({
-      where: { deleted: false },
+      where,
       include: { category: true, supplier: true, status: true },
       orderBy: { name: 'asc' },
     })
@@ -214,13 +535,83 @@ exports.reportPdf = async (req, res, next) => {
     res.setHeader('Content-Disposition', 'inline; filename="productos_reporte.pdf"')
     doc.pipe(res)
 
-    // Helper formatter
-    const money = (v) => new Intl.NumberFormat('es-GT', { style: 'currency', currency: 'GTQ' }).format(Number(v || 0))
+    // Optional columns from query (e.g. ?fields=name,category,price,stock for cotización)
+    const fieldsParam = req.query.fields
+    const allowedFields = ['name', 'category', 'brand', 'size', 'barcode', 'price', 'price_wholesale', 'price_promotion', 'cost', 'stock', 'min_stock', 'supplier', 'status', 'description']
+    const fields = fieldsParam
+      ? String(fieldsParam).split(',').map((f) => f.trim().toLowerCase()).filter((f) => allowedFields.includes(f))
+      : null
+
+    // Optional: include summary block (productos registrados, unidades, valor inventario). Default true.
+    const includeSummaryParam = req.query.includeSummary
+    const includeSummary = includeSummaryParam === undefined || includeSummaryParam === '' ||
+      (String(includeSummaryParam).toLowerCase() === 'true') || (String(includeSummaryParam) === '1')
+
+    const getCellValue = (p, key) => {
+      const now = new Date()
+      switch (key) {
+        case 'name': return p.name || '-'
+        case 'category': return p.category?.name || 'Sin categoría'
+        case 'brand': return p.brand || '-'
+        case 'size': return p.size || '-'
+        case 'barcode': return p.barcode || '-'
+        case 'price': return money(p.price)
+        case 'price_wholesale': {
+          const v = p.price_wholesale != null ? Number(p.price_wholesale) : NaN
+          return Number.isFinite(v) && v > 0 ? money(v) : '—'
+        }
+        case 'price_promotion': {
+          const v = p.price_promotion != null ? Number(p.price_promotion) : NaN
+          if (!Number.isFinite(v) || v <= 0) return '—'
+          const until = p.promotion_valid_until
+          if (!until) return money(v)
+          const d = new Date(until)
+          const ds = d.toLocaleDateString('es-GT', { day: '2-digit', month: 'short', year: 'numeric' })
+          if (Number.isNaN(d.getTime())) return money(v)
+          if (d < now) return `${money(v)} (vencida)`
+          return `${money(v)} (hasta ${ds})`
+        }
+        case 'cost': return money(p.cost)
+        case 'stock': return String(Number(p.stock || 0))
+        case 'min_stock': return String(Number(p.min_stock || 0))
+        case 'supplier': return p.supplier?.name || '-'
+        case 'status': return p.status?.name || '-'
+        case 'description': return (p.description || '').toString().slice(0, 80) + ((p.description || '').length > 80 ? '...' : '')
+        default: return '-'
+      }
+    }
+    const headers = {
+      name: 'Nombre',
+      category: 'Categoría',
+      brand: 'Marca',
+      size: 'Tamaño',
+      barcode: 'Código',
+      price: 'Precio lista',
+      price_wholesale: 'Mayoreo',
+      price_promotion: 'Promoción',
+      cost: 'Costo',
+      stock: 'Stock',
+      min_stock: 'Mín.',
+      supplier: 'Proveedor',
+      status: 'Estado',
+      description: 'Descripción',
+    }
 
     // Header block
-    doc.fillColor('#0b1220').fontSize(22).font('Helvetica-Bold').text('Depósito - Informe de Productos', { align: 'left' })
+    if (branding.logoBuffer) {
+      try {
+        doc.image(branding.logoBuffer, doc.page.margins.left, doc.y, { fit: [48, 28] })
+        doc.moveDown(2)
+      } catch {
+        /* sin logo */
+      }
+    }
+    doc.fillColor('#0b1220').fontSize(22).font('Helvetica-Bold').text(`${companyName} - Informe de Productos`, { align: 'left' })
     doc.moveDown(0.25)
     doc.fontSize(10).font('Helvetica').fillColor('#475569').text(`Generado: ${new Date().toLocaleString('es-GT')}`)
+    if (fields && fields.length > 0) {
+      doc.fontSize(9).fillColor('#64748b').text(`Columnas: ${fields.map((f) => headers[f] || f).join(', ')}`)
+    }
     doc.moveDown(0.6)
 
     // Decorative divider
@@ -228,34 +619,108 @@ exports.reportPdf = async (req, res, next) => {
     doc.save().moveTo(doc.x, doc.y).lineTo(doc.x + pageWidth, doc.y).lineWidth(1).stroke('#e6eef6')
     doc.moveDown(0.8)
 
-    // Summary cards
-    const totalProductos = products.length
-    const totalUnidades = products.reduce((s, p) => s + Number(p.stock || 0), 0)
-    const valorInventario = products.reduce((s, p) => s + Number(p.stock || 0) * Number(p.cost || 0), 0)
+    let gridTop
+    if (includeSummary) {
+      // Summary cards
+      const totalProductos = products.length
+      const totalUnidades = products.reduce((s, p) => s + Number(p.stock || 0), 0)
+      const valorInventario = products.reduce((s, p) => s + Number(p.stock || 0) * Number(p.cost || 0), 0)
 
-    const cardW = (pageWidth - 24) / 3
-    const cardH = 56
-    const startX = doc.x
-    const startY = doc.y
+      const cardW = (pageWidth - 24) / 3
+      const cardH = 56
+      const startX = doc.x
+      const startY = doc.y
 
-    const drawSummary = (x, y, title, value, color = '#0b1220') => {
-      doc.roundedRect(x, y, cardW, cardH, 8).fill('#ffffff').stroke('#e6eef6')
-      doc.fillColor('#0b1220').font('Helvetica').fontSize(9).text(title, x + 10, y + 8, { width: cardW - 20 })
-      doc.fillColor(color).font('Helvetica-Bold').fontSize(14).text(value, x + 10, y + 26, { width: cardW - 20 })
+      const drawSummary = (x, y, title, value, color = '#0b1220') => {
+        doc.roundedRect(x, y, cardW, cardH, 8).fill('#ffffff').stroke('#e6eef6')
+        doc.fillColor('#0b1220').font('Helvetica').fontSize(9).text(title, x + 10, y + 8, { width: cardW - 20 })
+        doc.fillColor(color).font('Helvetica-Bold').fontSize(14).text(value, x + 10, y + 26, { width: cardW - 20 })
+      }
+
+      drawSummary(startX, startY, 'Productos registrados', String(totalProductos), '#0b1220')
+      drawSummary(startX + cardW + 12, startY, 'Unidades en inventario', String(totalUnidades), '#0b1220')
+      drawSummary(startX + (cardW + 12) * 2, startY, `Valor del inventario (${currencyCode})`, money(valorInventario), '#0b1220')
+
+      gridTop = startY + cardH + 24
+    } else {
+      gridTop = doc.y
     }
 
-    drawSummary(startX, startY, 'Productos registrados', String(totalProductos), '#0b1220')
-    drawSummary(startX + cardW + 12, startY, 'Unidades en inventario', String(totalUnidades), '#0b1220')
-    drawSummary(startX + (cardW + 12) * 2, startY, 'Valor del inventario (GTQ)', money(valorInventario), '#0b1220')
+    if (fields && fields.length > 0) {
+      const colCount = fields.length
+      const fontSize = 8
+      const cellPadding = 8
+      const minRowHeight = 16
+      const colWidth = (pageWidth - 2) / colCount
+      const headerHeight = 22
+      const headerOrange = '#d97706'
+      const headerTextWhite = '#ffffff'
+      const borderColor = '#e2e8f0'
+      const rowBgEven = '#f8fafc'
+      const rowBgOdd = '#ffffff'
+      doc.fontSize(fontSize).font('Helvetica')
 
-    // leave space after the summary cards and start the grid just below them
-    const gridTop = startY + cardH + 24
+      const getCellTextHeight = (text, w) => {
+        if (!text) return minRowHeight - 4
+        const h = doc.heightOfString(String(text), { width: Math.max(20, w - cellPadding * 2) })
+        return Math.max(minRowHeight - 4, h)
+      }
 
+      let tableY = gridTop
+
+      // Header con color naranja de la plataforma
+      doc.rect(doc.page.margins.left, tableY, pageWidth, headerHeight).fill(headerOrange).stroke(borderColor)
+      doc.fillColor(headerTextWhite).font('Helvetica-Bold')
+      let headerX = doc.page.margins.left
+      for (let i = 0; i < fields.length; i++) {
+        const label = headers[fields[i]] || fields[i]
+        doc.text(String(label).slice(0, 25), headerX + cellPadding, tableY + 6, { width: colWidth - cellPadding * 2 })
+        headerX += colWidth
+      }
+      tableY += headerHeight
+
+      for (let rowIndex = 0; rowIndex < products.length; rowIndex++) {
+        const p = products[rowIndex]
+        const values = fields.map((f) => getCellValue(p, f))
+        const cellHeights = values.map((v, i) => getCellTextHeight(v, colWidth))
+        const rowHeight = Math.max(minRowHeight, ...cellHeights) + 10
+
+        if (tableY + rowHeight > doc.page.height - doc.page.margins.bottom - 25) {
+          doc.addPage()
+          tableY = doc.page.margins.top
+          doc.rect(doc.page.margins.left, tableY, pageWidth, headerHeight).fill(headerOrange).stroke(borderColor)
+          doc.fillColor(headerTextWhite).font('Helvetica-Bold')
+          headerX = doc.page.margins.left
+          for (let i = 0; i < fields.length; i++) {
+            doc.text(String(headers[fields[i]] || fields[i]).slice(0, 25), headerX + cellPadding, tableY + 6, { width: colWidth - cellPadding * 2 })
+            headerX += colWidth
+          }
+          tableY += headerHeight
+        }
+
+        const rowBg = rowIndex % 2 === 0 ? rowBgEven : rowBgOdd
+        doc.rect(doc.page.margins.left, tableY, pageWidth, rowHeight).fill(rowBg).stroke(borderColor)
+        doc.fillColor('#374151').font('Helvetica')
+        let cellX = doc.page.margins.left
+        const rightAlignKeys = ['price', 'cost', 'price_wholesale', 'stock', 'min_stock']
+        for (let c = 0; c < values.length; c++) {
+          const cellW = colWidth - cellPadding * 2
+          const val = String(values[c] ?? '-')
+          const align = rightAlignKeys.includes(fields[c]) ? 'right' : 'left'
+          doc.text(val, cellX + cellPadding, tableY + 4, { width: cellW, height: rowHeight - 8, align, ellipsis: true })
+          if (c < values.length - 1) {
+            doc.strokeColor(borderColor).lineWidth(0.3).moveTo(cellX + colWidth, tableY).lineTo(cellX + colWidth, tableY + rowHeight).stroke()
+          }
+          cellX += colWidth
+        }
+        tableY += rowHeight
+      }
+    } else {
     // Product cards grid (2 columns)
     const cols = 2
     const gap = 12
     const cardWidth = (pageWidth - gap) / cols
-    const cardHeight = 120
+    const cardHeight = 148
 
     // start x at left page margin
     let x = doc.page.margins.left
@@ -316,6 +781,25 @@ exports.reportPdf = async (req, res, next) => {
       // Cost small under price box
       doc.fillColor('#94a3b8').font('Helvetica').fontSize(9).text(`Costo: ${money(p.cost)}`, priceX + 8, priceY + 34, { width: priceBoxW - 16 })
 
+      let lineY = priceY + 50
+      const wholesale = p.price_wholesale != null ? Number(p.price_wholesale) : NaN
+      if (Number.isFinite(wholesale) && wholesale > 0) {
+        doc.fillColor('#64748b').font('Helvetica').fontSize(8).text(`Mayoreo: ${money(wholesale)}`, priceX + 6, lineY, { width: priceBoxW - 12 })
+        lineY += 11
+      }
+      const promo = p.price_promotion != null ? Number(p.price_promotion) : NaN
+      if (Number.isFinite(promo) && promo > 0) {
+        let promoText = `Promo: ${money(promo)}`
+        if (p.promotion_valid_until) {
+          const d = new Date(p.promotion_valid_until)
+          if (!Number.isNaN(d.getTime())) {
+            const ds = d.toLocaleDateString('es-GT', { day: '2-digit', month: 'short', year: 'numeric' })
+            promoText += d < new Date() ? ` · vencida (${ds})` : ` · hasta ${ds}`
+          }
+        }
+        doc.fillColor('#64748b').font('Helvetica').fontSize(8).text(promoText, priceX + 6, lineY, { width: priceBoxW - 12, lineGap: 1 })
+      }
+
       // Stock
       const stockText = `Stock: ${Number(p.stock || 0)}`
       doc.fillColor('#0b1220').font('Helvetica-Bold').fontSize(10)
@@ -351,11 +835,12 @@ exports.reportPdf = async (req, res, next) => {
 
       x += cardWidth + gap
     }
+    }
 
     // Footer
     doc.addPage ? null : null
     doc.moveDown(2)
-    doc.fontSize(9).fillColor('#64748b').text('Reporte generado por Depósito GT', { align: 'right' })
+    doc.fontSize(9).fillColor('#64748b').text(`Reporte generado por ${companyName}`, { align: 'right' })
     doc.end()
   } catch (e) { next(e) }
 }
@@ -371,6 +856,7 @@ exports.critical = async (req, res, next) => {
 
     // filter server-side for products where stock < min_stock
     const critical = products.filter((p) => {
+      if (p.kind === 'KIT') return false
       const stock = Number(p.stock || 0)
       const min = Number(p.min_stock || 0)
       return stock < min
@@ -380,19 +866,36 @@ exports.critical = async (req, res, next) => {
   } catch (e) { next(e) }
 }
 
-// Adjust stock endpoint: body { type: 'add'|'remove', amount: number, reason: string, supplier_id?: string, cost?: number }
-exports.adjustStock = async (req, res, next) => {
+// Register incoming merchandise endpoint: body { supplier_id, items, notes?, payment_term_id?, payment_status?, paid_at?, payment_reference?, due_date? }
+exports.registerIncomingMerchandise = async (req, res, next) => {
   try {
-    const { type, amount, reason, supplier_id, cost } = req.body || {}
-    const id = req.params.id
+    const body = req.body || {}
+    const { supplier_id, items, notes } = body
+    const user = req.user
+    if (!user || !user.sub) {
+      return res.status(401).json({ message: 'Usuario no autenticado' })
+    }
+    const registered_by = user.sub // User ID from JWT
 
-    if (!['add', 'remove'].includes(type)) return res.status(400).json({ message: 'type must be add or remove' })
-    const qty = Number(amount || 0)
-    if (!Number.isFinite(qty) || qty <= 0) return res.status(400).json({ message: 'amount must be a positive number' })
-    if (!reason || typeof reason !== 'string') return res.status(400).json({ message: 'reason required' })
+    if (!supplier_id || typeof supplier_id !== 'string') {
+      return res.status(400).json({ message: 'supplier_id es requerido' })
+    }
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ message: 'items debe ser un array con al menos un producto' })
+    }
 
-    // prepare Guatemala local clock time (stored as UTC instant so DB shows GT clock)
-    const nowGt = DateTime.now().setZone('America/Guatemala')
+    // Validate items structure
+    for (const item of items) {
+      if (!item.product_id || !item.quantity || item.quantity <= 0) {
+        return res.status(400).json({ message: 'Cada item debe tener product_id y quantity > 0' })
+      }
+      if (item.unit_cost == null || Number(item.unit_cost) < 0) {
+        return res.status(400).json({ message: 'Cada item debe tener unit_cost >= 0' })
+      }
+    }
+
+    const tz = await getTimezone(prisma)
+    const nowGt = DateTime.now().setZone(tz)
     const dateAsUtcWithGtClock = new Date(Date.UTC(
       nowGt.year,
       nowGt.month - 1,
@@ -403,56 +906,207 @@ exports.adjustStock = async (req, res, next) => {
       nowGt.millisecond
     ))
 
-    // run in transaction: update product stock and optionally create purchase log when adding
-    const result = await prisma.$transaction(async (tx) => {
-      const prod = await tx.product.findUnique({ where: { id } })
-      if (!prod || prod.deleted) throw new Error('No encontrado')
+    const payment_status = body.payment_status === 'PAID' ? 'PAID' : 'PENDING'
+    let payment_term_id = null
+    if (body.payment_term_id != null && body.payment_term_id !== '') {
+      const pid = Number(body.payment_term_id)
+      if (!Number.isFinite(pid)) {
+        return res.status(400).json({ message: 'payment_term_id inválido' })
+      }
+      payment_term_id = pid
+    }
 
-      let newStock = prod.stock
-      if (type === 'add') {
-        newStock = prod.stock + qty
+    let payment_reference = body.payment_reference != null ? String(body.payment_reference).trim() : ''
+    if (payment_reference.length > 255) {
+      payment_reference = payment_reference.slice(0, 255)
+    }
+
+    let due_date = null
+    if (body.due_date != null && body.due_date !== '') {
+      const d = new Date(body.due_date)
+      if (Number.isNaN(d.getTime())) {
+        return res.status(400).json({ message: 'due_date inválida' })
+      }
+      due_date = d
+    }
+
+    let paid_at = null
+    if (payment_status === 'PAID') {
+      if (body.paid_at != null && body.paid_at !== '') {
+        const p = new Date(body.paid_at)
+        if (Number.isNaN(p.getTime())) {
+          return res.status(400).json({ message: 'paid_at inválido' })
+        }
+        paid_at = p
       } else {
-        newStock = prod.stock - qty
-        if (newStock < 0) newStock = 0
+        paid_at = dateAsUtcWithGtClock
+      }
+    }
+
+    const supplierWithTerms = await prisma.supplier.findUnique({
+      where: { id: supplier_id },
+      include: { supplier_payment_terms: true },
+    })
+    if (!supplierWithTerms || supplierWithTerms.deleted) {
+      return res.status(400).json({ message: 'Proveedor no encontrado' })
+    }
+
+    const allowedTermIds = new Set(
+      (supplierWithTerms.supplier_payment_terms || []).map((l) => l.payment_term_id)
+    )
+    if (allowedTermIds.size > 0) {
+      if (payment_term_id == null) {
+        return res.status(400).json({ message: 'Debe seleccionar un término de pago para este proveedor' })
+      }
+      if (!allowedTermIds.has(payment_term_id)) {
+        return res.status(400).json({ message: 'El término de pago no corresponde a este proveedor' })
+      }
+    } else if (payment_term_id != null) {
+      return res.status(400).json({
+        message: 'Este proveedor no tiene términos de pago configurados; no envíe payment_term_id',
+      })
+    }
+
+    if (!due_date && payment_term_id != null) {
+      const ptRow = await prisma.paymentTerm.findUnique({ where: { id: payment_term_id } })
+      const nd = ptRow?.net_days != null ? Number(ptRow.net_days) : null
+      if (nd != null && Number.isFinite(nd) && nd >= 0) {
+        const d = new Date(dateAsUtcWithGtClock)
+        d.setUTCDate(d.getUTCDate() + Math.floor(nd))
+        due_date = d
+      }
+    }
+
+    // Run in transaction: create audit record, update products, create purchase logs, update supplier
+    // Use prismaTransaction (DIRECT_URL) for transactions as pooled connections don't support them
+    const result = await prismaTransaction.$transaction(async (tx) => {
+      // Verify supplier still exists
+      const supplier = await tx.supplier.findUnique({ where: { id: supplier_id } })
+      if (!supplier || supplier.deleted) {
+        const err = new Error('Proveedor no encontrado')
+        err.status = 400
+        throw err
       }
 
-      const updated = await tx.product.update({ where: { id }, data: { stock: newStock } })
+      // Verify all products exist and belong to the supplier
+      const productIds = items.map(item => item.product_id)
+      const products = await tx.product.findMany({
+        where: {
+          id: { in: productIds },
+          deleted: false
+        }
+      })
 
-      let purchaseLog = null
-      // create a purchase log for additions and a negative log for removals
-      const supplierId = supplier_id || prod.supplier_id
-      const unitCost = cost != null ? Number(cost) : Number(prod.cost || 0)
-      if (supplierId) {
-        const signedQty = type === 'add' ? qty : -qty
-        purchaseLog = await tx.purchaseLog.create({
+      if (products.length !== productIds.length) {
+        throw new Error('Uno o más productos no encontrados')
+      }
+
+      // Verify all products belong to the supplier
+      for (const product of products) {
+        if (product.supplier_id !== supplier_id) {
+          const err = new Error(`El producto ${product.name} no pertenece al proveedor seleccionado`)
+          err.status = 400
+          throw err
+        }
+        if (product.kind === 'KIT') {
+          const err = new Error(
+            `No se puede registrar entrada de mercancía sobre el kit "${product.name}". Registra los componentes por separado.`
+          )
+          err.status = 400
+          throw err
+        }
+      }
+
+      // Create incoming merchandise audit record
+      const incomingMerchandise = await tx.incomingMerchandise.create({
+        data: {
+          supplier_id,
+          registered_by,
+          date: dateAsUtcWithGtClock,
+          notes: notes || null,
+          payment_term_id,
+          payment_status,
+          paid_at,
+          payment_reference: payment_reference || null,
+          due_date,
+          payment_updated_by: registered_by,
+          payment_updated_at: dateAsUtcWithGtClock,
+        },
+      })
+
+      // Process each item
+      const updatedProducts = []
+      const purchaseLogs = []
+      let totalPurchaseValue = 0
+
+      for (const item of items) {
+        const product = products.find(p => p.id === item.product_id)
+        if (!product) continue
+
+        const quantity = Number(item.quantity)
+        const unitCost = Number(item.unit_cost)
+        const newStock = product.stock + quantity
+
+        // Update product stock
+        const updated = await tx.product.update({
+          where: { id: product.id },
+          data: { stock: newStock },
+          select: { id: true, name: true, stock: true, min_stock: true }
+        })
+        updatedProducts.push(updated)
+
+        // Create purchase log
+        const purchaseLog = await tx.purchaseLog.create({
           data: {
-            product_id: id,
-            supplier_id: supplierId,
-            qty: signedQty,
+            product_id: product.id,
+            supplier_id,
+            qty: quantity,
             cost: unitCost,
             date: dateAsUtcWithGtClock,
           }
         })
-        // update supplier's total_purchases (increment by qty*cost; negative when removing)
-        const delta = signedQty * unitCost
-        await tx.supplier.update({
-          where: { id: supplierId },
+        purchaseLogs.push(purchaseLog)
+
+        // Create incoming merchandise item (audit)
+        await tx.incomingMerchandiseItem.create({
           data: {
-            total_purchases: { increment: delta },
-            ...(type === 'add' ? { last_order: dateAsUtcWithGtClock } : {}),
+            incoming_merchandise_id: incomingMerchandise.id,
+            product_id: product.id,
+            quantity,
+            unit_cost: unitCost,
           }
         })
+
+        // Update stock alerts
+        await ensureStockAlert(tx, product.id, newStock, product.min_stock)
+
+        totalPurchaseValue += quantity * unitCost
       }
 
-      // Stock alert logic SIEMPRE (aunque no haya supplier) para reflejar cualquier ajuste
-      await ensureStockAlert(tx, id, newStock, prod.min_stock)
+      // Update supplier: total_purchases and last_order
+      await tx.supplier.update({
+        where: { id: supplier_id },
+        data: {
+          total_purchases: { increment: totalPurchaseValue },
+          last_order: dateAsUtcWithGtClock,
+        }
+      })
 
-      // optionally create a generic product log table in future; for now return updated + purchaseLog
-      return { updated, purchaseLog }
+      return {
+        incomingMerchandise,
+        updatedProducts,
+        purchaseLogs,
+        totalPurchaseValue,
+      }
+    }, {
+      maxWait: 10000, // 10 seconds
+      timeout: 30000, // 30 seconds
     })
 
     res.json(result)
-  } catch (e) { next(e) }
+  } catch (e) {
+    next(e)
+  }
 }
 
 /**
@@ -644,14 +1298,13 @@ exports.bulkImport = async (req, res, next) => {
  */
 exports.bulkImportMapped = async (req, res, next) => {
   try {
-    const { products } = req.body || {}
+    const { products, importOptions } = req.body || {}
 
     if (!products || !Array.isArray(products) || products.length === 0) {
       return res.status(400).json({ message: 'No se proporcionaron productos para importar' })
     }
 
-    // Validate by calling the existing validation service
-    const validation = await validateBulkData(products)
+    const validation = await validateBulkData(products, importOptions)
 
     if (validation.invalidRows.length > 0) {
       return res.status(400).json({
@@ -703,26 +1356,177 @@ exports.bulkImportMapped = async (req, res, next) => {
  */
 exports.validateImportMapped = async (req, res, next) => {
   try {
-    const { products } = req.body || {}
+    const { products, importOptions } = req.body || {}
 
     if (!products || !Array.isArray(products) || products.length === 0) {
       return res.status(400).json({ message: 'No se proporcionaron productos para validar' })
     }
 
-    // Validate without importing
-    const validation = await validateBulkData(products)
+    const validation = await validateBulkData(products, importOptions)
 
     res.json({
-      ok: true,
-      totals: {
-        total: products.length,
-        valid: validation.validRows.length,
-        invalid: validation.invalidRows.length
-      },
+      ok: validation.invalidRows.length === 0,
+      totals: validation.totals,
       validRows: validation.validRows,
-      invalidRows: validation.invalidRows
+      invalidRows: validation.invalidRows.map((r) => ({
+        rowIndex: r.rowIndex,
+        errors: r.errors,
+        hints: r.hints,
+      })),
+      resolutionHints: validation.resolutionHints,
+      skippedRows: validation.skippedRows,
+      catalogs: validation.catalogs,
     })
   } catch (e) {
     next(e)
   }
+}
+
+/**
+ * POST /api/products/pricing-preview
+ * Precio unitario por producto según cliente/canal (misma lógica que al registrar la venta).
+ */
+exports.pricingPreview = async (req, res, next) => {
+  try {
+    const { customer_contact_id: customerContactIdRaw, sales_channel: salesChannelRaw, product_ids: productIdsRaw, price_tier: priceTierRaw } =
+      req.body || {}
+    const {
+      resolvePriceTierForContext,
+      resolveUnitPriceFromProduct,
+      productSupportsPriceTier,
+      parsePriceTier,
+      VALID_CHANNELS,
+    } = require('../services/priceResolution')
+
+    const schRaw = salesChannelRaw != null ? String(salesChannelRaw).toUpperCase() : 'POS'
+    const salesChannel = VALID_CHANNELS.has(schRaw) ? schRaw : 'POS'
+    let customerContactId = null
+    if (customerContactIdRaw != null && String(customerContactIdRaw).trim() !== '') {
+      customerContactId = String(customerContactIdRaw).trim()
+    }
+
+    const ids = Array.isArray(productIdsRaw)
+      ? [...new Set(productIdsRaw.map((x) => String(x)).filter(Boolean))]
+      : []
+
+    const explicitTier = parsePriceTier(priceTierRaw)
+    const tier = explicitTier
+      ? explicitTier
+      : await resolvePriceTierForContext(prisma, {
+          customerContactId,
+          salesChannel,
+        })
+
+    if (ids.length === 0) {
+      return res.json({
+        price_tier_used: tier,
+        sales_channel: salesChannel,
+        unit_prices: {},
+        tier_unavailable: [],
+      })
+    }
+
+    const products = await prisma.product.findMany({
+      where: { id: { in: ids }, deleted: false, available_for_sale: true },
+      select: {
+        id: true,
+        name: true,
+        price: true,
+        price_wholesale: true,
+        price_promotion: true,
+        promotion_valid_until: true,
+      },
+    })
+    const now = new Date()
+    const unit_prices = {}
+    const tier_unavailable = []
+
+    for (const p of products) {
+      if (explicitTier) {
+        const check = productSupportsPriceTier(p, tier, now)
+        if (!check.ok) {
+          tier_unavailable.push({
+            product_id: String(p.id),
+            name: p.name,
+            reason: check.reason,
+          })
+          continue
+        }
+      }
+      unit_prices[String(p.id)] = resolveUnitPriceFromProduct(p, tier, now)
+    }
+    res.json({ price_tier_used: tier, sales_channel: salesChannel, unit_prices, tier_unavailable })
+  } catch (e) {
+    next(e)
+  }
+}
+
+/**
+ * POST /api/products/upload-image
+ * Sube una imagen de producto a Supabase Storage (bucket: productos)
+ * Requiere: multipart/form-data con campo 'image'
+ * Retorna: { imageUrl: string }
+ */
+exports.uploadImage = async (req, res, next) => {
+  try {
+    const file = req.file
+
+    if (!supabase) {
+      return res.status(500).json({ message: 'Supabase no configurado. Verifica SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY en .env' })
+    }
+
+    if (!file) {
+      return res.status(400).json({ message: 'No se proporcionó ningún archivo' })
+    }
+
+    // Validar tipo de archivo
+    if (!file.mimetype.startsWith('image/')) {
+      return res.status(400).json({ message: 'Solo se permiten archivos de imagen' })
+    }
+
+    // Validar tamaño (máx 5MB)
+    if (file.size > 5 * 1024 * 1024) {
+      return res.status(400).json({ message: 'La imagen no debe exceder 5MB' })
+    }
+
+    // Generar nombre único para el archivo
+    const fileExt = file.originalname.split('.').pop() || 'jpg'
+    const fileName = `${Date.now()}-${Math.random().toString(36).slice(2)}.${fileExt}`
+    const filePath = fileName
+
+    // Validar que el buffer tenga contenido
+    if (!file.buffer || file.buffer.length === 0) {
+      return res.status(400).json({ message: 'El archivo está vacío o no se pudo leer correctamente' })
+    }
+
+    // Subir a Supabase Storage (bucket: productos)
+    const { data: uploadData, error: uploadError } = await supabase.storage
+      .from('productos')
+      .upload(filePath, file.buffer, {
+        cacheControl: '3600',
+        upsert: false,
+        contentType: file.mimetype
+      })
+
+    if (uploadError) {
+      return res.status(500).json({ message: 'Error al subir la imagen: ' + uploadError.message })
+    }
+
+    if (!uploadData) {
+      return res.status(500).json({ message: 'Error al subir la imagen: No se recibió confirmación' })
+    }
+
+    // Obtener URL pública
+    const { data: urlData } = supabase.storage
+      .from('productos')
+      .getPublicUrl(filePath)
+
+    if (!urlData || !urlData.publicUrl) {
+      return res.status(500).json({ message: 'Error al obtener la URL pública de la imagen' })
+    }
+
+    res.json({
+      imageUrl: urlData.publicUrl
+    })
+  } catch (e) { next(e) }
 }

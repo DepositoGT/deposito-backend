@@ -5,11 +5,11 @@
  * Unauthorized copying, modification, distribution, or use of this file,
  * via any medium, is strictly prohibited without express written permission.
  * 
- * For licensing inquiries: GitHub @dpatzan
+ * For licensing inquiries: GitHub @dpatzan2
  */
 
 const { Router } = require('express')
-const { Auth, hasAnyRole } = require('../middlewares/autenticacion')
+const { Auth, hasAnyRole, hasPermission } = require('../middlewares/autenticacion')
 const Alerts = require('../controllers/alerts.controller')
 
 const router = Router()
@@ -55,7 +55,7 @@ const router = Router()
  *               items:
  *                 $ref: '#/components/schemas/Alert'
  */
-router.get('/', Auth, Alerts.list)
+router.get('/', Auth, hasPermission('alerts.view', 'alerts.manage'), Alerts.list)
 
 /**
  * @openapi
@@ -74,7 +74,7 @@ router.get('/', Auth, Alerts.list)
  *     responses:
  *       201: { description: Creado }
  */
-router.post('/', Auth, hasAnyRole('admin'), Alerts.create)
+router.post('/', Auth, hasPermission('alerts.manage'), Alerts.create)
 
 /**
  * @openapi
@@ -100,7 +100,7 @@ router.post('/', Auth, hasAnyRole('admin'), Alerts.create)
  *     responses:
  *       200: { description: OK }
  */
-router.post('/:id/assign', Auth, hasAnyRole('admin'), Alerts.assign)
+router.post('/:id/assign', Auth, hasPermission('alerts.manage'), Alerts.assign)
 
 /**
  * @openapi
@@ -118,6 +118,6 @@ router.post('/:id/assign', Auth, hasAnyRole('admin'), Alerts.assign)
  *     responses:
  *       200: { description: OK }
  */
-router.patch('/:id/resolve', Auth, Alerts.resolve)
+router.patch('/:id/resolve', Auth, hasPermission('alerts.manage', 'alerts.view'), Alerts.resolve)
 
 module.exports = router

@@ -5,7 +5,8 @@
 // Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
 
 generator client {
-  provider = "prisma-client-js"
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "debian-openssl-1.0.x"]
 }
 
 datasource db {
@@ -19,21 +20,21 @@ datasource db {
 // ========================================
 
 model ProductCategory {
-  id        Int        @id @default(autoincrement())
-  name      String     @unique @db.VarChar(100)
-  deleted   Boolean    @default(false)
-  products  Product[]
-  suppliers Supplier[]
+  id                   Int                 @id @default(autoincrement())
+  name                 String              @unique @db.VarChar(100)
+  image_url            String?             @db.VarChar(500)
+  deleted              Boolean             @default(false)
+  products             Product[]
+  suppliers            SupplierCategory[]
   promotion_categories PromotionCategory[]
 
   @@map("product_categories")
 }
 
 model Status {
-  id        Int        @id @default(autoincrement())
-  name      String     @unique @db.VarChar(50)
-  suppliers Supplier[]
-  alerts    Alert[]
+  id     Int     @id @default(autoincrement())
+  name   String  @unique @db.VarChar(50)
+  alerts Alert[]
 
   @@map("statuses")
 }
@@ -46,11 +47,16 @@ model StockStatus {
   @@map("stock_statuses")
 }
 
+enum ProductKind {
+  STANDARD
+  KIT
+}
+
 model PaymentMethod {
-  id                     Int                    @id @default(autoincrement())
-  name                   String                 @unique @db.VarChar(50)
-  sales                  Sale[]
-  cash_closure_payments  CashClosurePayment[]  // Relación para saber qué método de pago se usó en cada línea del cierre
+  id                    Int                  @id @default(autoincrement())
+  name                  String               @unique @db.VarChar(50)
+  sales                 Sale[]
+  cash_closure_payments CashClosurePayment[] // Relación para saber qué método de pago se usó en cada línea del cierre
 
   @@map("payment_methods")
 }
@@ -74,10 +80,21 @@ model ReturnStatus {
 model PaymentTerm {
   id        Int        @id @default(autoincrement())
   name      String     @unique @db.VarChar(50)
+  /// Días naturales desde la fecha del ingreso hasta el vencimiento (opcional; sugiere due_date automática)
+  net_days  Int?
   deleted   Boolean    @default(false)
-  suppliers Supplier[]
+  supplier_payment_terms SupplierPaymentTerm[]
+  incoming_merchandise   IncomingMerchandise[]
 
   @@map("payment_terms")
+}
+
+/// Estado de pago del ingreso de mercancía (cuentas por pagar)
+enum MerchandisePaymentStatus {
+  PENDING
+  /// Hay abonos pero aún no cubren el total
+  PARTIAL
+  PAID
 }
 
 model AlertType {
@@ -100,84 +117,217 @@ model AlertPriority {
 // Entidades principales
 // ========================================
 
-model Supplier {
-  id               String          @id @default(uuid()) @db.Uuid
-  name             String          @db.VarChar(150)
-  contact          String          @db.VarChar(100)
-  phone            String?         @db.VarChar(50)
-  email            String?         @db.VarChar(150)
-  address          String?         @db.Text
-  category_id      Int
-  category         ProductCategory @relation(fields: [category_id], references: [id])
-  products         Int             @default(0)
-  last_order       DateTime?
-  total_purchases  Decimal         @default(0) @db.Decimal(12, 2)
-  rating           Decimal?        @db.Decimal(3, 2)
-  status_id        Int
-  status           Status          @relation(fields: [status_id], references: [id])
-  payment_terms_id Int
-  payment_term     PaymentTerm     @relation(fields: [payment_terms_id], references: [id])
-  productsList     Product[]
-  purchase_logs    PurchaseLog[]
-  deleted          Boolean         @default(false)
-  deleted_at       DateTime?
+enum SupplierPartyType {
+  SUPPLIER
+  CUSTOMER
+}
 
+/// Persona física vs empresa (razón social) para facturación y UI
+enum ContactEntityKind {
+  PERSON
+  ORGANIZATION
+}
+
+/// Lista = precio base (`products.price`); mayoreo y promoción son columnas opcionales del producto.
+enum PriceTier {
+  LIST
+  WHOLESALE
+  PROMOTION
+}
+
+/// Canal de venta para reglas de precio y auditoría en `sales`.
+enum SalesChannel {
+  POS
+  WHOLESALE
+  ONLINE
+}
+
+model Supplier {
+  id                   String                @id @default(uuid()) @db.Uuid
+  /// Proveedor (compras / productos) o cliente (maestro de ventas)
+  party_type           SupplierPartyType     @default(SUPPLIER)
+  /// Persona individual o empresa (nombre = razón social o nombre completo según tipo)
+  entity_kind          ContactEntityKind     @default(ORGANIZATION)
+  name                 String                @db.VarChar(150)
+  contact              String                @db.VarChar(100)
+  phone                String?               @db.VarChar(50)
+  email                String?               @db.VarChar(150)
+  address              String?               @db.Text
+  /// ID fiscal para facturación (NIT, VAT, RFC, EIN, etc.; formato según país)
+  tax_id               String?               @db.VarChar(100)
+  products             Int                   @default(0)
+  last_order           DateTime?
+  total_purchases      Decimal               @default(0) @db.Decimal(12, 2)
+  rating               Decimal?              @db.Decimal(3, 2)
+  estado               Int                   @default(1) // 0 = inactivo, 1 = activo
+  supplier_payment_terms SupplierPaymentTerm[]
+  categories           SupplierCategory[]
+  productsList         Product[]
+  purchase_logs        PurchaseLog[]
+  incoming_merchandise IncomingMerchandise[]
+  deleted              Boolean               @default(false)
+  deleted_at           DateTime?
+  /// Precio por defecto si no hay regla `CustomerPriceRule` que aplique (solo clientes).
+  default_price_tier   PriceTier             @default(LIST)
+  customer_price_rules CustomerPriceRule[]
+  linked_sales           Sale[]                @relation("SaleCustomerContact")
+  commercial_documents   CommercialDocument[]  @relation("CommercialDocCustomer")
+
+  /// Listado de contactos: party_type + orden por nombre (reemplaza índice solo party_type)
+  @@index([party_type, name], map: "idx_suppliers_party_type_name")
   @@map("suppliers")
 }
 
+/// Reglas de lista de precios por cliente: canal opcional (null = todos) y prioridad descendente.
+model CustomerPriceRule {
+  id          String         @id @default(uuid()) @db.Uuid
+  supplier_id String         @db.Uuid
+  supplier    Supplier       @relation(fields: [supplier_id], references: [id], onDelete: Cascade)
+  channel     SalesChannel?
+  price_tier  PriceTier
+  priority    Int            @default(0)
+  active      Boolean        @default(true)
+  created_at  DateTime       @default(now())
+
+  @@index([supplier_id, active])
+  @@map("customer_price_rules")
+}
+
+/// Varios términos de pago por contacto; exactamente uno con is_default = true (validado en API)
+model SupplierPaymentTerm {
+  supplier_id     String      @db.Uuid
+  supplier        Supplier    @relation(fields: [supplier_id], references: [id], onDelete: Cascade)
+  payment_term_id Int
+  payment_term    PaymentTerm @relation(fields: [payment_term_id], references: [id], onDelete: Restrict)
+  is_default      Boolean     @default(false)
+  sort_order      Int         @default(0)
+
+  @@id([supplier_id, payment_term_id])
+  @@index([payment_term_id])
+  @@map("supplier_payment_terms")
+}
+
 model Product {
-  id            String          @id @default(uuid()) @db.Uuid
-  name          String          @db.VarChar(150)
-  category_id   Int
-  category      ProductCategory @relation(fields: [category_id], references: [id])
-  brand         String?         @db.VarChar(100)
-  size          String?         @db.VarChar(50)
-  stock         Int             @default(0)
-  min_stock     Int             @default(0)
-  price         Decimal         @db.Decimal(12, 2)
-  cost          Decimal         @db.Decimal(12, 2)
-  supplier_id   String          @db.Uuid
-  supplier      Supplier        @relation(fields: [supplier_id], references: [id])
-  barcode       String?         @unique @db.VarChar(100)
-  description   String?         @db.Text
-  deleted       Boolean         @default(false)
-  deleted_at    DateTime?
-  status_id     Int
-  status        StockStatus     @relation(fields: [status_id], references: [id])
-  alerts        Alert[]
-  sale_items    SaleItem[]
-  purchase_logs PurchaseLog[]
-  return_items  ReturnItem[]
-  promotion_products PromotionProduct[]
+  id                         String                    @id @default(uuid()) @db.Uuid
+  name                       String                    @db.VarChar(150)
+  category_id                Int
+  category                   ProductCategory           @relation(fields: [category_id], references: [id])
+  brand                      String?                   @db.VarChar(100)
+  size                       String?                   @db.VarChar(50)
+  stock                      Int                       @default(0)
+  min_stock                  Int                       @default(0)
+  price                      Decimal                   @db.Decimal(12, 2)
+  price_wholesale            Decimal?                  @db.Decimal(12, 2)
+  price_promotion            Decimal?                  @db.Decimal(12, 2)
+  promotion_valid_until      DateTime?
+  cost                       Decimal                   @db.Decimal(12, 2)
+  image_url                  String?                   @db.VarChar(500)
+  supplier_id                String                    @db.Uuid
+  supplier                   Supplier                  @relation(fields: [supplier_id], references: [id])
+  barcode                    String?                   @unique @db.VarChar(100)
+  /// Si es false, el producto no aparece en el punto de venta ni puede venderse por la API.
+  available_for_sale         Boolean                   @default(true)
+  kind                       ProductKind               @default(STANDARD)
+  description                String?                   @db.Text
+  deleted                    Boolean                   @default(false)
+  deleted_at                 DateTime?
+  status_id                  Int
+  status                     StockStatus               @relation(fields: [status_id], references: [id])
+  kit_components             ProductBomLine[]          @relation("KitParent")
+  used_in_kits               ProductBomLine[]          @relation("KitComponent")
+  alerts                     Alert[]
+  sale_items                 SaleItem[]
+  purchase_logs              PurchaseLog[]
+  return_items               ReturnItem[]
+  promotion_products         PromotionProduct[]
+  incoming_merchandise_items IncomingMerchandiseItem[]
+  inventory_count_lines      InventoryCountLine[]
+  commercial_document_lines  CommercialDocumentLine[]
+  stock_reservations         StockReservation[]
 
   @@map("products")
 }
 
+model ProductBomLine {
+  id                   String  @id @default(uuid()) @db.Uuid
+  kit_product_id       String  @db.Uuid
+  kit_product          Product @relation("KitParent", fields: [kit_product_id], references: [id], onDelete: Cascade)
+  component_product_id String  @db.Uuid
+  component_product    Product @relation("KitComponent", fields: [component_product_id], references: [id], onDelete: Restrict)
+  qty_per_unit         Int     @default(1)
+  sort_order           Int     @default(0)
+
+  @@unique([kit_product_id, component_product_id])
+  @@index([kit_product_id], map: "idx_product_bom_lines_kit")
+  @@index([component_product_id], map: "idx_product_bom_lines_component")
+  @@map("product_bom_lines")
+}
+
 model Role {
-  id    Int    @id @default(autoincrement())
-  name  String @unique @db.VarChar(50)
-  users User[]
+  id          Int              @id @default(autoincrement())
+  name        String           @unique @db.VarChar(50)
+  users       User[]
+  permissions RolePermission[]
 
   @@map("roles")
 }
 
+/// Sistema de permisos granular por rol
+model Permission {
+  id          Int              @id @default(autoincrement())
+  code        String           @unique @db.VarChar(100)
+  name        String           @db.VarChar(150)
+  description String?          @db.Text
+  roles       RolePermission[]
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  role_id       Int
+  permission_id Int
+
+  role       Role       @relation(fields: [role_id], references: [id])
+  permission Permission @relation(fields: [permission_id], references: [id])
+
+  @@id([role_id, permission_id])
+  @@map("role_permissions")
+}
+
 model User {
-  id          String  @id @default(uuid()) @db.Uuid
-  name        String  @db.VarChar(150)
-  email       String  @unique @db.VarChar(150)
-  password    String  @db.VarChar(255)
-  role_id     Int
-  role        Role    @relation(fields: [role_id], references: [id])
-  alerts      Alert[] @relation("AlertAssignedTo")
-  
+  id                   String                @id @default(uuid()) @db.Uuid
+  name                 String                @db.VarChar(150)
+  email                String                @unique @db.VarChar(150)
+  password             String                @db.VarChar(255)
+  role_id              Int
+  role                 Role                  @relation(fields: [role_id], references: [id])
+  alerts               Alert[]               @relation("AlertAssignedTo")
+  incoming_merchandise IncomingMerchandise[] @relation("MerchandiseRegisteredBy")
+  /// Auditoría: última edición de datos de pago en un ingreso de mercancía
+  incoming_merchandise_payment_updates IncomingMerchandise[] @relation("MerchandisePaymentAudit")
+  /// Abonos parciales registrados en ingresos de mercancía
+  merchandise_payment_entries_registered IncomingMerchandisePaymentEntry[] @relation("MerchandisePaymentEntryRegisteredBy")
+  sales_created        Sale[]                @relation("SaleCreatedBy")
+  cash_closures_as_cashier    CashClosure[]  @relation("CashClosureCashier")
+  cash_closures_as_supervisor CashClosure[]  @relation("CashClosureSupervisor")
+  /// Sesiones de caja (apertura)
+  cash_sessions_opened        CashRegisterSession[] @relation("CashSessionOpenedBy")
+  cash_sessions_closed        CashRegisterSession[] @relation("CashSessionClosedBy")
+  inventory_counts_created              InventoryCountSession[] @relation("InventoryCountCreatedBy")
+  inventory_counts_approved             InventoryCountSession[] @relation("InventoryCountApprovedBy")
+  inventory_counts_first_approved       InventoryCountSession[] @relation("InventoryCountFirstApprovedBy")
+  inventory_count_lines_counted         InventoryCountLine[]    @relation("InventoryCountLineCountedBy")
+  inventory_count_lines_secondary_count InventoryCountLine[]    @relation("InventoryCountLineSecondaryCountedBy")
+  commercial_documents_created        CommercialDocument[]    @relation("CommercialDocCreatedBy")
+
   // Campos de empleado
-  is_employee Boolean @default(false)
-  photo_url   String? @db.VarChar(500)
-  phone       String? @db.VarChar(50)
-  address     String? @db.Text
+  is_employee Boolean   @default(false)
+  photo_url   String?   @db.VarChar(500)
+  phone       String?   @db.VarChar(50)
+  address     String?   @db.Text
   hire_date   DateTime? // Fecha de contratación
-  created_at  DateTime @default(now())
-  updated_at  DateTime @updatedAt
+  created_at  DateTime  @default(now())
+  updated_at  DateTime  @updatedAt
 
   @@map("users")
 }
@@ -205,29 +355,187 @@ model Alert {
 }
 
 model Sale {
-  id                String        @id @default(uuid()) @db.Uuid
-  date              DateTime      @default(now())
-  customer          String?       @db.VarChar(150)
-  customer_nit      String?       @db.VarChar(50)
-  is_final_consumer Boolean       @default(true)
-  subtotal          Decimal?      @db.Decimal(12, 2)  // Total antes de descuentos
-  discount_total    Decimal?      @db.Decimal(12, 2)  // Total de descuentos aplicados
-  total             Decimal       @db.Decimal(12, 2)
-  total_returned    Decimal       @default(0) @db.Decimal(12, 2)
-  adjusted_total    Decimal       @db.Decimal(12, 2)
+  id                String          @id @default(uuid()) @db.Uuid
+  reference         String?         @unique @db.VarChar(20)  // Referencia legible: V-000001 (generada al crear)
+  date              DateTime        @default(now())
+  customer          String?         @db.VarChar(150)
+  customer_nit      String?         @db.VarChar(50)
+  is_final_consumer Boolean         @default(true)
+  subtotal          Decimal?        @db.Decimal(12, 2) // Total antes de descuentos
+  discount_total    Decimal?        @db.Decimal(12, 2) // Total de descuentos aplicados
+  total             Decimal         @db.Decimal(12, 2)
+  total_returned    Decimal         @default(0) @db.Decimal(12, 2)
+  adjusted_total    Decimal         @db.Decimal(12, 2)
   items             Int
   payment_method_id Int
-  payment_method    PaymentMethod @relation(fields: [payment_method_id], references: [id])
+  payment_method    PaymentMethod   @relation(fields: [payment_method_id], references: [id])
   status_id         Int
-  status            SaleStatus    @relation(fields: [status_id], references: [id])
-  amount_received   Decimal?      @db.Decimal(12, 2)
-  change            Decimal?      @db.Decimal(12, 2)
+  status            SaleStatus      @relation(fields: [status_id], references: [id])
+  amount_received   Decimal?        @db.Decimal(12, 2)
+  change            Decimal?        @db.Decimal(12, 2)
   sale_items        SaleItem[]
+  sale_dtes         SaleDte[]       // Facturación DTE (InFile/SAT): autorización, serie, número
   returns           Return[]
   sale_promotions   SalePromotion[]
-  sold_at           DateTime      @default(now())
+  sold_at           DateTime        @default(now())
 
+  cash_register_session_id String?               @db.Uuid
+  cashRegisterSession      CashRegisterSession?  @relation(fields: [cash_register_session_id], references: [id], onDelete: SetNull)
+
+  // Usuario que registró la venta
+  created_by String? @db.Uuid
+  createdBy  User?   @relation("SaleCreatedBy", fields: [created_by], references: [id])
+
+  /// Cliente del maestro (Supplier party_type CUSTOMER), si se eligió en POS.
+  customer_contact_id String?   @db.Uuid
+  customerContact       Supplier? @relation("SaleCustomerContact", fields: [customer_contact_id], references: [id], onDelete: SetNull)
+  sales_channel         SalesChannel @default(POS)
+  orderLink             CommercialDocumentSale?
+
+  @@index([created_by])
+  @@index([cash_register_session_id])
+  /// Listados por estado y fecha (p. ej. resumen de cliente, ventas «Completada»)
+  @@index([status_id, date(sort: Desc)], map: "idx_sales_status_id_date_desc")
   @@map("sales")
+}
+
+// ========================================
+// Cotizaciones y pedidos (documentos comerciales)
+// ========================================
+
+enum CommercialDocType {
+  QUOTE
+  ORDER
+}
+
+enum CommercialDocStatus {
+  DRAFT
+  SENT
+  ACCEPTED
+  REJECTED
+  CONFIRMED
+  PARTIALLY_FULFILLED
+  FULFILLED
+  CANCELLED
+  EXPIRED
+}
+
+enum StockReservationStatus {
+  ACTIVE
+  RELEASED
+  CONSUMED
+  EXPIRED
+}
+
+enum StockReservationKind {
+  ORDER
+  QUOTE_SOFT
+}
+
+model CommercialDocument {
+  id                  String              @id @default(uuid()) @db.Uuid
+  reference           String?             @unique @db.VarChar(20)
+  doc_type            CommercialDocType
+  status              CommercialDocStatus @default(DRAFT)
+  valid_until         DateTime?
+  customer            String?             @db.VarChar(150)
+  customer_nit        String?             @db.VarChar(50)
+  is_final_consumer   Boolean             @default(true)
+  customer_contact_id String?             @db.Uuid
+  customerContact     Supplier?           @relation("CommercialDocCustomer", fields: [customer_contact_id], references: [id], onDelete: SetNull)
+  sales_channel       SalesChannel        @default(WHOLESALE)
+  subtotal            Decimal?            @db.Decimal(12, 2)
+  discount_total      Decimal?            @db.Decimal(12, 2)
+  total               Decimal             @db.Decimal(12, 2)
+  notes               String?             @db.Text
+  converted_from_id   String?             @db.Uuid
+  convertedFrom       CommercialDocument? @relation("CommercialDocConversion", fields: [converted_from_id], references: [id], onDelete: SetNull)
+  convertedChildren   CommercialDocument[] @relation("CommercialDocConversion")
+  public_token        String?             @unique @db.VarChar(64)
+  created_by          String?             @db.Uuid
+  createdBy           User?               @relation("CommercialDocCreatedBy", fields: [created_by], references: [id], onDelete: SetNull)
+  confirmed_at        DateTime?
+  created_at          DateTime            @default(now())
+  updated_at          DateTime            @updatedAt
+  lines               CommercialDocumentLine[]
+  stock_reservations  StockReservation[]
+  documentSales       CommercialDocumentSale[]
+
+  @@index([doc_type, status, created_at(sort: Desc)], map: "idx_commercial_docs_type_status_created")
+  @@index([customer_contact_id], map: "idx_commercial_docs_customer_contact")
+  @@map("commercial_documents")
+}
+
+model CommercialDocumentLine {
+  id           String             @id @default(uuid()) @db.Uuid
+  document_id  String             @db.Uuid
+  document     CommercialDocument @relation(fields: [document_id], references: [id], onDelete: Cascade)
+  product_id   String             @db.Uuid
+  product      Product            @relation(fields: [product_id], references: [id])
+  qty           Int
+  qty_fulfilled Int                @default(0)
+  unit_price    Decimal            @db.Decimal(12, 2)
+  line_total   Decimal            @db.Decimal(12, 2)
+  sort_order   Int                @default(0)
+  reservations StockReservation[]
+
+  @@index([document_id], map: "idx_commercial_doc_lines_document")
+  @@index([product_id], map: "idx_commercial_doc_lines_product")
+  @@map("commercial_document_lines")
+}
+
+model StockReservation {
+  id               String                 @id @default(uuid()) @db.Uuid
+  product_id       String                 @db.Uuid
+  product          Product                @relation(fields: [product_id], references: [id])
+  document_id      String                 @db.Uuid
+  document         CommercialDocument     @relation(fields: [document_id], references: [id], onDelete: Cascade)
+  document_line_id String                 @db.Uuid
+  document_line    CommercialDocumentLine @relation(fields: [document_line_id], references: [id], onDelete: Cascade)
+  qty              Int
+  status           StockReservationStatus @default(ACTIVE)
+  reservation_kind StockReservationKind   @default(ORDER)
+  expires_at       DateTime?
+  created_by       String?                @db.Uuid
+  created_at       DateTime               @default(now())
+  released_at      DateTime?
+  consumed_at      DateTime?
+
+  @@index([product_id, status], map: "idx_stock_reservations_product_status")
+  @@index([document_id, status], map: "idx_stock_reservations_document_status")
+  @@map("stock_reservations")
+}
+
+model CommercialDocumentSale {
+  id          String             @id @default(uuid()) @db.Uuid
+  document_id String             @db.Uuid
+  document    CommercialDocument @relation(fields: [document_id], references: [id], onDelete: Cascade)
+  sale_id     String             @unique @db.Uuid
+  sale        Sale               @relation(fields: [sale_id], references: [id], onDelete: Cascade)
+  created_at  DateTime           @default(now())
+
+  @@index([document_id], map: "idx_commercial_document_sales_document")
+  @@map("commercial_document_sales")
+}
+
+
+model SaleDte {
+  id             String    @id @default(uuid()) @db.Uuid
+  sale_id        String    @db.Uuid
+  sale           Sale      @relation(fields: [sale_id], references: [id], onDelete: Cascade)
+  document_type  String?   @db.VarChar(50)   // CFAC, CCRE, etc.
+  authorization  String?   @db.VarChar(100)  // Número de autorización SAT
+  series         String?   @db.VarChar(20)
+  number         String?   @db.VarChar(50)  // Número de factura
+  emission_date  DateTime? // Fecha de emisión
+  status         String?   @db.VarChar(50)  // autorizado, rechazado, etc.
+  provider       String?   @db.VarChar(50)   // InFile, etc.
+  xml_url        String?   @db.VarChar(500)
+  pdf_url        String?   @db.VarChar(500)
+  created_at     DateTime  @default(now())
+
+  @@index([sale_id])
+  @@map("sale_dtes")
 }
 
 model SaleItem {
@@ -254,8 +562,80 @@ model PurchaseLog {
   cost        Decimal  @db.Decimal(12, 2)
 
   @@index([product_id])
-  @@index([supplier_id])
+  @@index([supplier_id, date(sort: Desc)], map: "idx_purchase_logs_supplier_date")
   @@map("purchase_logs")
+}
+
+/// Relación many-to-many entre proveedores y categorías de producto
+model SupplierCategory {
+  supplier_id String @db.Uuid
+  category_id Int
+
+  supplier Supplier        @relation(fields: [supplier_id], references: [id], onDelete: Cascade)
+  category ProductCategory @relation(fields: [category_id], references: [id])
+
+  @@id([supplier_id, category_id])
+  @@map("supplier_categories")
+}
+
+/// Registro de auditoría para ingresos de mercancía
+model IncomingMerchandise {
+  id              String                    @id @default(uuid()) @db.Uuid
+  supplier_id     String                    @db.Uuid
+  supplier        Supplier                  @relation(fields: [supplier_id], references: [id])
+  registered_by   String                    @db.Uuid
+  registeredBy    User                      @relation("MerchandiseRegisteredBy", fields: [registered_by], references: [id])
+  date            DateTime                  @default(now())
+  notes           String?                   @db.Text
+  /// Término de pago acordado para esta compra (debe existir en los términos del proveedor al crear)
+  payment_term_id Int?
+  paymentTerm     PaymentTerm?              @relation(fields: [payment_term_id], references: [id], onDelete: SetNull)
+  payment_status  MerchandisePaymentStatus  @default(PENDING)
+  paid_at         DateTime?
+  payment_reference String?                 @db.VarChar(255)
+  due_date        DateTime?
+  payment_updated_by   String?   @db.Uuid
+  paymentUpdatedBy     User?     @relation("MerchandisePaymentAudit", fields: [payment_updated_by], references: [id], onDelete: SetNull)
+  payment_updated_at   DateTime?
+  items           IncomingMerchandiseItem[]
+  paymentEntries  IncomingMerchandisePaymentEntry[]
+
+  @@index([registered_by])
+  @@index([date])
+  @@index([payment_status])
+  /// Cubre también filtro por supplier_id (prefijo del compuesto)
+  @@index([supplier_id, date(sort: Desc)], map: "idx_incoming_merchandise_supplier_date")
+  @@map("incoming_merchandise")
+}
+
+model IncomingMerchandiseItem {
+  id                      String              @id @default(uuid()) @db.Uuid
+  incoming_merchandise_id String              @db.Uuid
+  incomingMerchandise     IncomingMerchandise @relation(fields: [incoming_merchandise_id], references: [id], onDelete: Cascade)
+  product_id              String              @db.Uuid
+  product                 Product             @relation(fields: [product_id], references: [id])
+  quantity                Int
+  unit_cost               Decimal             @db.Decimal(12, 2)
+
+  @@index([incoming_merchandise_id])
+  @@index([product_id])
+  @@map("incoming_merchandise_items")
+}
+
+/// Abono parcial hacia el total del ingreso (historial de pagos al proveedor)
+model IncomingMerchandisePaymentEntry {
+  id                      String              @id @default(uuid()) @db.Uuid
+  incoming_merchandise_id String              @db.Uuid
+  incomingMerchandise     IncomingMerchandise @relation(fields: [incoming_merchandise_id], references: [id], onDelete: Cascade)
+  amount                  Decimal             @db.Decimal(12, 2)
+  paid_at                 DateTime            @default(now())
+  reference               String?             @db.VarChar(255)
+  registered_by           String              @db.Uuid
+  registeredBy            User                @relation("MerchandisePaymentEntryRegisteredBy", fields: [registered_by], references: [id])
+  created_at              DateTime            @default(now())
+
+  @@index([incoming_merchandise_id])
+  @@map("incoming_merchandise_payment_entries")
 }
 
 model Return {
@@ -298,103 +678,170 @@ model ReturnItem {
 }
 
 // ========================================
+// Caja registradora y sesiones (apertura)
+// ========================================
+
+/// Punto de cobro físico o lógico (hoy: una caja «Principal» por defecto; preparado para multi-caja).
+model CashRegister {
+  id          String   @id @default(uuid()) @db.Uuid
+  name        String   @db.VarChar(120)
+  code        String   @unique @db.VarChar(40)
+  is_default  Boolean  @default(false)
+  active      Boolean  @default(true)
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+
+  sessions CashRegisterSession[]
+
+  @@map("cash_registers")
+}
+
+enum CashRegisterSessionStatus {
+  OPEN
+  CLOSED
+  VOID
+}
+
+/// Apertura de caja: una sesión OPEN por caja (índice único parcial en migración SQL).
+model CashRegisterSession {
+  id               String                    @id @default(uuid()) @db.Uuid
+  cash_register_id String                    @db.Uuid
+  cashRegister     CashRegister              @relation(fields: [cash_register_id], references: [id], onDelete: Restrict)
+
+  status       CashRegisterSessionStatus @default(OPEN)
+  opened_at    DateTime                  @default(now())
+  closed_at    DateTime?
+  opened_by_id String                    @db.Uuid
+  openedBy     User                      @relation("CashSessionOpenedBy", fields: [opened_by_id], references: [id], onDelete: Restrict)
+  closed_by_id String?                   @db.Uuid
+  closedBy     User?                     @relation("CashSessionClosedBy", fields: [closed_by_id], references: [id], onDelete: SetNull)
+
+  opening_float Decimal @db.Decimal(12, 2)
+  notes         String? @db.Text
+
+  cash_closure_id String?      @unique @db.Uuid
+  cashClosure     CashClosure? @relation(fields: [cash_closure_id], references: [id], onDelete: SetNull)
+
+  sales Sale[]
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  @@index([cash_register_id, status])
+  @@index([opened_by_id])
+  @@map("cash_register_sessions")
+}
+
+// ========================================
 // Cierre de Caja
 // ========================================
 
 model CashClosure {
-  id                    String                  @id @default(uuid()) @db.Uuid
-  closure_number        Int                     @unique @default(autoincrement())
-  date                  DateTime                @default(now())
-  start_date            DateTime // Fecha/hora de inicio del período
-  end_date              DateTime // Fecha/hora de fin del período
-  
+  id             String   @id @default(uuid()) @db.Uuid
+  closure_number Int      @unique @default(autoincrement())
+  date           DateTime @default(now())
+  start_date     DateTime // Fecha/hora de inicio del período
+  end_date       DateTime // Fecha/hora de fin del período
+
   // Usuario que genera el cierre
-  cashier_name          String                  @db.VarChar(100)
-  cashier_signature     String?                 @db.Text // Base64 de firma digital
-  
+  cashier_name      String  @db.VarChar(100)
+  cashier_signature String? @db.Text // Base64 de firma digital
+  cashier_id        String? @db.Uuid
+  cashier           User?   @relation("CashClosureCashier", fields: [cashier_id], references: [id], onDelete: SetNull)
+
   // Supervisor que valida
-  supervisor_name       String?                 @db.VarChar(100)
-  supervisor_signature  String?                 @db.Text // Base64 de firma digital
+  supervisor_name         String?   @db.VarChar(100)
+  supervisor_id           String?   @db.Uuid
+  supervisor              User?     @relation("CashClosureSupervisor", fields: [supervisor_id], references: [id], onDelete: SetNull)
+  supervisor_signature    String?   @db.Text // Base64 de firma digital
   supervisor_validated_at DateTime?
-  
+
+  /// Fondo inicial en caja al abrir el turno (solo arqueo por sesión)
+  opening_float Decimal? @db.Decimal(12, 2)
+
   // Totales teóricos (según BD)
-  theoretical_total     Decimal                 @db.Decimal(12, 2)
-  theoretical_sales     Decimal                 @db.Decimal(12, 2)
-  theoretical_returns   Decimal                 @db.Decimal(12, 2)
-  
+  theoretical_total   Decimal @db.Decimal(12, 2)
+  theoretical_sales   Decimal @db.Decimal(12, 2)
+  theoretical_returns Decimal @db.Decimal(12, 2)
+
   // Totales reales (conteo físico/validación)
-  actual_total          Decimal                 @db.Decimal(12, 2)
-  
+  actual_total Decimal @db.Decimal(12, 2)
+
   // Diferencia
-  difference            Decimal                 @db.Decimal(12, 2) // actual - theoretical
-  difference_percentage Decimal?                @db.Decimal(5, 2)
-  
+  difference            Decimal  @db.Decimal(12, 2) // actual - theoretical
+  difference_percentage Decimal? @db.Decimal(5, 2)
+
   // Desglose por método de pago
-  payment_breakdowns    CashClosurePayment[]
-  
+  payment_breakdowns CashClosurePayment[]
+
   // Conteo de denominaciones (billetes/monedas)
-  denominations         CashClosureDenomination[]
-  
+  denominations CashClosureDenomination[]
+
+  /// Sesión de apertura ligada a este cierre (si el cierre cerró una sesión abierta)
+  cash_register_session CashRegisterSession?
+
   // Métricas adicionales
-  total_transactions    Int // Total de ventas en el período
-  total_customers       Int // Total de clientes atendidos
-  average_ticket        Decimal                 @db.Decimal(12, 2)
-  
+  total_transactions Int // Total de ventas en el período
+  total_customers    Int // Total de clientes atendidos
+  average_ticket     Decimal @db.Decimal(12, 2)
+
   // Notas y observaciones
-  notes                 String?                 @db.Text
-  status                String                  @default("Pendiente") @db.VarChar(50) // Pendiente, Validado, Cerrado
-  
+  notes  String? @db.Text
+  status String  @default("Pendiente") @db.VarChar(50) // Pendiente, Validado, Cerrado
+
   // Timestamps
-  created_at            DateTime                @default(now())
-  updated_at            DateTime                @updatedAt
-  
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
   @@index([date])
   @@index([status])
+  @@index([cashier_id])
+  @@index([supervisor_id])
   @@map("cash_closures")
 }
 
 model CashClosurePayment {
-  id                    Int         @id @default(autoincrement())
-  cash_closure_id       String      @db.Uuid
-  cash_closure          CashClosure @relation(fields: [cash_closure_id], references: [id], onDelete: Cascade)
-  
-  payment_method_id     Int
-  payment_method        PaymentMethod @relation(fields: [payment_method_id], references: [id])
-  
+  id              Int         @id @default(autoincrement())
+  cash_closure_id String      @db.Uuid
+  cash_closure    CashClosure @relation(fields: [cash_closure_id], references: [id], onDelete: Cascade)
+
+  payment_method_id Int
+  payment_method    PaymentMethod @relation(fields: [payment_method_id], references: [id])
+
   // Teórico (según BD)
-  theoretical_amount    Decimal     @db.Decimal(12, 2)
-  theoretical_count     Int // Cantidad de transacciones
-  
+  theoretical_amount Decimal @db.Decimal(12, 2)
+  theoretical_count  Int // Cantidad de transacciones
+
   // Real (conteo/validación)
-  actual_amount         Decimal     @db.Decimal(12, 2)
-  actual_count          Int?
-  
+  actual_amount Decimal @db.Decimal(12, 2)
+  actual_count  Int?
+
   // Diferencia
-  difference            Decimal     @db.Decimal(12, 2)
-  
+  difference Decimal @db.Decimal(12, 2)
+
   // Notas específicas por método
-  notes                 String?     @db.Text
-  
+  notes String? @db.Text
+
   @@index([cash_closure_id])
   @@index([payment_method_id])
   @@map("cash_closure_payments")
 }
 
 model CashClosureDenomination {
-  id                Int         @id @default(autoincrement())
-  cash_closure_id   String      @db.Uuid
-  cash_closure      CashClosure @relation(fields: [cash_closure_id], references: [id], onDelete: Cascade)
-  
+  id              Int         @id @default(autoincrement())
+  cash_closure_id String      @db.Uuid
+  cash_closure    CashClosure @relation(fields: [cash_closure_id], references: [id], onDelete: Cascade)
+
   // Denominación (200, 100, 50, 20, 10, 5, 1, 0.50, 0.25, 0.10, 0.05, 0.01)
-  denomination      Decimal     @db.Decimal(10, 2)
-  type              String      @db.VarChar(20) // "Billete" o "Moneda"
-  
+  denomination Decimal @db.Decimal(10, 2)
+  type         String  @db.VarChar(20) // "Billete" o "Moneda"
+
   // Cantidad de unidades
-  quantity          Int
-  
+  quantity Int
+
   // Subtotal (denomination * quantity)
-  subtotal          Decimal     @db.Decimal(12, 2)
-  
+  subtotal Decimal @db.Decimal(12, 2)
+
   @@index([cash_closure_id])
   @@map("cash_closure_denominations")
 }
@@ -414,59 +861,59 @@ model PromotionType {
 }
 
 model Promotion {
-  id                  String    @id @default(uuid()) @db.Uuid
-  name                String    @db.VarChar(150)
-  description         String?   @db.Text
-  type_id             Int
-  type                PromotionType @relation(fields: [type_id], references: [id])
-  
+  id          String        @id @default(uuid()) @db.Uuid
+  name        String        @db.VarChar(150)
+  description String?       @db.Text
+  type_id     Int
+  type        PromotionType @relation(fields: [type_id], references: [id])
+
   // Códigos vinculados (uno o varios)
-  codes               PromotionCode[]
-  
+  codes PromotionCode[]
+
   // Valores de la promoción
-  discount_value      Decimal?  @db.Decimal(12, 2)   // Para FIXED_AMOUNT
-  discount_percentage Decimal?  @db.Decimal(5, 2)    // Porcentaje (0-100)
-  buy_quantity        Int?      // Cantidad a comprar (2x1 = 2)
-  get_quantity        Int?      // Cantidad gratis (2x1 = 1)
-  min_quantity        Int?      // Cantidad mínima para aplicar
-  
+  discount_value      Decimal? @db.Decimal(12, 2) // Para FIXED_AMOUNT
+  discount_percentage Decimal? @db.Decimal(5, 2) // Porcentaje (0-100)
+  buy_quantity        Int? // Cantidad a comprar (2x1 = 2)
+  get_quantity        Int? // Cantidad gratis (2x1 = 1)
+  min_quantity        Int? // Cantidad mínima para aplicar
+
   // Productos relacionados
-  applies_to_all      Boolean   @default(false)      // Aplica a todos los productos
-  trigger_product_id  String?   @db.Uuid             // Producto que activa la promo
-  target_product_id   String?   @db.Uuid             // Producto que recibe el descuento/regalo
-  applicable_products PromotionProduct[]
+  applies_to_all        Boolean             @default(false) // Aplica a todos los productos
+  trigger_product_id    String?             @db.Uuid // Producto que activa la promo
+  target_product_id     String?             @db.Uuid // Producto que recibe el descuento/regalo
+  applicable_products   PromotionProduct[]
   applicable_categories PromotionCategory[]
-  
+
   // Validez y límites
-  start_date          DateTime  @default(now())
-  end_date            DateTime?
-  max_uses            Int?      // Usos máximos totales (por código)
-  max_uses_per_customer Int?    // Usos máximos por cliente
-  min_purchase_amount Decimal?  @db.Decimal(12, 2)   // Compra mínima para aplicar
-  
+  start_date            DateTime  @default(now())
+  end_date              DateTime?
+  max_uses              Int? // Usos máximos totales (por código)
+  max_uses_per_customer Int? // Usos máximos por cliente
+  min_purchase_amount   Decimal?  @db.Decimal(12, 2) // Compra mínima para aplicar
+
   // Estado
-  active              Boolean   @default(true)
-  deleted             Boolean   @default(false)
-  created_at          DateTime  @default(now())
-  updated_at          DateTime  @updatedAt
-  
+  active     Boolean  @default(true)
+  deleted    Boolean  @default(false)
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
   // Relaciones
-  sale_promotions     SalePromotion[]
-  
+  sale_promotions SalePromotion[]
+
   @@index([active, start_date, end_date])
   @@map("promotions")
 }
 
 // Códigos de promoción (permite múltiples códigos por promoción)
 model PromotionCode {
-  id            Int       @id @default(autoincrement())
-  code          String    @unique @db.VarChar(50)
-  promotion_id  String    @db.Uuid
-  promotion     Promotion @relation(fields: [promotion_id], references: [id], onDelete: Cascade)
-  current_uses  Int       @default(0)
-  active        Boolean   @default(true)
-  created_at    DateTime  @default(now())
-  
+  id           Int       @id @default(autoincrement())
+  code         String    @unique @db.VarChar(50)
+  promotion_id String    @db.Uuid
+  promotion    Promotion @relation(fields: [promotion_id], references: [id], onDelete: Cascade)
+  current_uses Int       @default(0)
+  active       Boolean   @default(true)
+  created_at   DateTime  @default(now())
+
   @@index([code])
   @@index([promotion_id])
   @@map("promotion_codes")
@@ -478,7 +925,7 @@ model PromotionProduct {
   promotion    Promotion @relation(fields: [promotion_id], references: [id], onDelete: Cascade)
   product_id   String    @db.Uuid
   product      Product   @relation(fields: [product_id], references: [id])
-  
+
   @@unique([promotion_id, product_id])
   @@map("promotion_products")
 }
@@ -489,7 +936,7 @@ model PromotionCategory {
   promotion    Promotion       @relation(fields: [promotion_id], references: [id], onDelete: Cascade)
   category_id  Int
   category     ProductCategory @relation(fields: [category_id], references: [id])
-  
+
   @@unique([promotion_id, category_id])
   @@map("promotion_categories")
 }
@@ -500,11 +947,98 @@ model SalePromotion {
   sale             Sale      @relation(fields: [sale_id], references: [id], onDelete: Cascade)
   promotion_id     String    @db.Uuid
   promotion        Promotion @relation(fields: [promotion_id], references: [id])
-  discount_applied Decimal   @db.Decimal(12, 2)  // Monto efectivo descontado
-  code_used        String?   @db.VarChar(50)     // Código específico utilizado
-  
+  discount_applied Decimal   @db.Decimal(12, 2) // Monto efectivo descontado
+  code_used        String?   @db.VarChar(50) // Código específico utilizado
+
   @@index([sale_id])
   @@index([promotion_id])
   @@map("sale_promotions")
 }
 
+// ========================================
+// Inventariado (conteo físico vs stock teórico)
+// ========================================
+
+enum InventoryCountSessionStatus {
+  DRAFT
+  IN_PROGRESS
+  IN_REVIEW
+  PENDING_SECOND_APPROVAL
+  APPROVED
+  CANCELLED
+}
+
+model InventoryCountSession {
+  id             String                      @id @default(uuid()) @db.Uuid
+  name           String?                     @db.VarChar(200)
+  status         InventoryCountSessionStatus @default(DRAFT)
+  /// Alcance y opciones: categoryIds?, supplierIds?, abcClasses? (A|B|C por valor en bodega),
+  /// samplePercent? (1–99 muestreo aleatorio reproducible), doubleCount? (segunda lectura obligatoria)
+  scope_json     Json?
+  /// Si true: primera aprobación → PENDING_SECOND_APPROVAL; segunda aplica stock (otro usuario).
+  dual_approval  Boolean                     @default(false)
+  /// Motivo obligatorio al enviar a revisión
+  submit_reason  String?                     @db.Text
+  created_by_id  String                      @db.Uuid
+  createdBy      User                        @relation("InventoryCountCreatedBy", fields: [created_by_id], references: [id])
+  started_at     DateTime?
+  submitted_at   DateTime?
+  first_approved_at     DateTime?
+  first_approved_by_id  String?                     @db.Uuid
+  firstApprovedBy       User?                       @relation("InventoryCountFirstApprovedBy", fields: [first_approved_by_id], references: [id])
+  first_approval_reason String?                     @db.Text
+  final_approval_reason String?                     @db.Text
+  approved_at    DateTime?
+  approved_by_id String?                     @db.Uuid
+  approvedBy     User?                       @relation("InventoryCountApprovedBy", fields: [approved_by_id], references: [id])
+  cancelled_at   DateTime?
+  cancel_reason  String?                     @db.Text
+  notes          String?                     @db.Text
+  lines          InventoryCountLine[]
+  created_at     DateTime                    @default(now())
+  updated_at     DateTime                    @updatedAt
+
+  @@index([created_by_id])
+  @@index([created_at(sort: Desc)], map: "idx_inventory_count_sessions_created_at")
+  /// Cubre filtro por status (prefijo) + orden por fecha del listado
+  @@index([status, created_at(sort: Desc)], map: "idx_inventory_count_sessions_status_created")
+  @@map("inventory_count_sessions")
+}
+
+model InventoryCountLine {
+  id             String                @id @default(uuid()) @db.Uuid
+  session_id     String                @db.Uuid
+  session        InventoryCountSession @relation(fields: [session_id], references: [id], onDelete: Cascade)
+  product_id     String                @db.Uuid
+  product        Product               @relation(fields: [product_id], references: [id])
+  stock_snapshot Int
+  qty_counted    Int?
+  counted_at     DateTime?
+  counted_by_id  String?               @db.Uuid
+  countedBy      User?                 @relation("InventoryCountLineCountedBy", fields: [counted_by_id], references: [id])
+  qty_counted_secondary    Int?
+  counted_secondary_at     DateTime?
+  counted_secondary_by_id  String?               @db.Uuid
+  countedSecondaryBy       User?                 @relation("InventoryCountLineSecondaryCountedBy", fields: [counted_secondary_by_id], references: [id])
+  note           String?               @db.VarChar(500)
+
+  @@unique([session_id, product_id])
+  @@index([session_id])
+  @@index([product_id])
+  @@map("inventory_count_lines")
+}
+
+// ========================================
+// Configuración del sistema (módulo Configuración)
+// ========================================
+
+model SystemSetting {
+  id          Int      @id @default(autoincrement())
+  key         String   @unique @db.VarChar(100)
+  value       String   @db.Text
+  type        String?  @db.VarChar(50)   // string, json, number
+  description String?  @db.VarChar(255)
+  updated_at  DateTime @updatedAt
+
+  @@map("system_settings")
+}

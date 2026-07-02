@@ -5,17 +5,41 @@
  * Unauthorized copying, modification, distribution, or use of this file,
  * via any medium, is strictly prohibited without express written permission.
  * 
- * For licensing inquiries: GitHub @dpatzan
+ * For licensing inquiries: GitHub @dpatzan2
  */
 
 const { prisma } = require('../models/prisma')
 const { DateTime } = require('luxon')
 const { ensureStockAlertsBatch } = require('../services/stockAlerts')
+const { expandLinesToStockMap, restoreStockMap } = require('../services/bomStock')
+
+async function restoreReturnItemsStock(tx, returnItems) {
+  const stockMap = await expandLinesToStockMap(
+    tx,
+    returnItems.map((item) => ({ product_id: item.product_id, qty: item.qty_returned }))
+  )
+  const updatedProducts = await restoreStockMap(tx, stockMap)
+  await ensureStockAlertsBatch(tx, updatedProducts)
+  return updatedProducts
+}
+
+/** Resuelve sale_id (UUID o referencia ej. V-000001) al id interno de la venta */
+async function resolveSaleId(saleIdOrRef) {
+  if (!saleIdOrRef) return null
+  const s = String(saleIdOrRef).trim()
+  const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s)
+  if (isUuid) {
+    const sale = await prisma.sale.findUnique({ where: { id: s }, select: { id: true } })
+    return sale?.id ?? null
+  }
+  const sale = await prisma.sale.findFirst({ where: { reference: s }, select: { id: true } })
+  return sale?.id ?? null
+}
 
 /**
  * GET /api/returns
  * List all returns with optional filtering
- * Query params: status, page, pageSize, sale_id
+ * Query params: status, page, pageSize, sale_id (UUID o referencia)
  */
 exports.list = async (req, res, next) => {
   try {
@@ -30,7 +54,8 @@ exports.list = async (req, res, next) => {
     }
 
     if (sale_id) {
-      where.sale_id = String(sale_id)
+      const resolvedId = await resolveSaleId(sale_id)
+      if (resolvedId) where.sale_id = resolvedId
     }
 
     const totalItems = await prisma.return.count({ where })
@@ -131,12 +156,17 @@ exports.getById = async (req, res, next) => {
  */
 exports.create = async (req, res, next) => {
   try {
-    const { sale_id, reason, items, notes } = req.body
+    const { sale_id: saleIdOrRef, reason, items, notes } = req.body
 
-    if (!sale_id || !Array.isArray(items) || items.length === 0) {
+    if (!saleIdOrRef || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({
         message: 'sale_id e items son requeridos. items debe ser un array no vacío.'
       })
+    }
+
+    const sale_id = await resolveSaleId(saleIdOrRef)
+    if (!sale_id) {
+      return res.status(404).json({ message: 'Venta no encontrada' })
     }
 
     const created = await prisma.$transaction(async (tx) => {
@@ -473,64 +503,20 @@ exports.updateStatus = async (req, res, next) => {
 
         // 4c. Restaurar stock de productos (solo cuando se completa desde Pendiente)
         console.log(`[RETURN STOCK RESTORE] Return ${id}: ${prevStatusName} -> ${newStatusName}. Restaurando stock al completar...`)
-        
-        // Agrupar cantidades por producto
-        const productQtyMap = new Map()
-        currentReturn.return_items.forEach(item => {
-          const current = productQtyMap.get(item.product_id) || 0
-          productQtyMap.set(item.product_id, current + item.qty_returned)
-        })
-
-        // Restaurar stock en paralelo
-        const updatePromises = Array.from(productQtyMap.entries()).map(([productId, qty]) => {
-          console.log(`[RETURN STOCK RESTORE] Producto ${productId}: +${qty} unidades`)
-          return tx.product.update({
-            where: { id: productId },
-            data: { stock: { increment: qty } },
-            select: { id: true, name: true, stock: true, min_stock: true }
-          })
-        })
-
-        const updatedProducts = await Promise.all(updatePromises)
-
-        updatedProducts.forEach(p => {
+        const updatedProducts = await restoreReturnItemsStock(tx, currentReturn.return_items)
+        updatedProducts.forEach((p) => {
           console.log(`[RETURN STOCK RESTORE] ${p.name}: stock restaurado = ${p.stock}`)
         })
-
-        // Actualizar alertas de stock
-        await ensureStockAlertsBatch(tx, updatedProducts)
         console.log(`[RETURN STOCK RESTORE] Alertas de stock actualizadas`)
       }
 
       // CASO 3: Si se aprueba desde "Pendiente", restaurar stock solo si restore_stock es true
       if (isApproving && shouldRestoreStock) {
         console.log(`[RETURN STOCK RESTORE] Return ${id}: ${prevStatusName} -> ${newStatusName}. Restaurando stock solamente...`)
-
-        // Agrupar cantidades por producto
-        const productQtyMap = new Map()
-        currentReturn.return_items.forEach(item => {
-          const current = productQtyMap.get(item.product_id) || 0
-          productQtyMap.set(item.product_id, current + item.qty_returned)
-        })
-
-        // Restaurar stock en paralelo
-        const updatePromises = Array.from(productQtyMap.entries()).map(([productId, qty]) => {
-          console.log(`[RETURN STOCK RESTORE] Producto ${productId}: +${qty} unidades`)
-          return tx.product.update({
-            where: { id: productId },
-            data: { stock: { increment: qty } },
-            select: { id: true, name: true, stock: true, min_stock: true }
-          })
-        })
-
-        const updatedProducts = await Promise.all(updatePromises)
-
-        updatedProducts.forEach(p => {
+        const updatedProducts = await restoreReturnItemsStock(tx, currentReturn.return_items)
+        updatedProducts.forEach((p) => {
           console.log(`[RETURN STOCK RESTORE] ${p.name}: stock restaurado = ${p.stock}`)
         })
-
-        // Actualizar alertas de stock
-        await ensureStockAlertsBatch(tx, updatedProducts)
         console.log(`[RETURN STOCK RESTORE] Alertas de stock actualizadas`)
       } else if (isApproving && !shouldRestoreStock) {
         console.log(`[RETURN STATUS UPDATE] Return ${id}: ${prevStatusName} -> ${newStatusName}. Stock NO será restaurado (restore_stock=false)`)

@@ -5,12 +5,29 @@
  * Unauthorized copying, modification, distribution, or use of this file,
  * via any medium, is strictly prohibited without express written permission.
  * 
- * For licensing inquiries: GitHub @dpatzan
+ * For licensing inquiries: GitHub @dpatzan2
  */
 
 const { prisma } = require('../models/prisma')
 const { generateCatalogTemplate } = require('../services/catalogTemplate')
 const { bulkValidateCatalogs, bulkCreateCatalogs } = require('../services/catalogBulkImport')
+const {
+  uploadImageBuffer,
+  removePublicObject,
+  CATEGORY_IMAGES_BUCKET,
+} = require('../services/supabaseStorage')
+
+function parseOptionalImageUrl(raw) {
+  if (raw === undefined) return { provided: false, value: undefined }
+  if (raw === null || raw === '') return { provided: true, value: null }
+  if (typeof raw !== 'string') {
+    const err = new Error('image_url inválido')
+    err.status = 400
+    throw err
+  }
+  const trimmed = raw.trim()
+  return { provided: true, value: trimmed || null }
+}
 
 /**
  * @swagger
@@ -47,7 +64,13 @@ exports.list = async (req, res, next) => {
         _count: { 
           select: { 
             products: { where: { deleted: false } }, 
-            suppliers: { where: { deleted: false } } 
+            // suppliers ahora es una relación a SupplierCategory (tabla intermedia)
+            // contamos solo las relaciones cuyo proveedor no esté eliminado
+            suppliers: { 
+              where: { 
+                supplier: { deleted: false }
+              } 
+            } 
           } 
         } 
       },
@@ -99,15 +122,23 @@ exports.list = async (req, res, next) => {
  */
 exports.create = async (req, res, next) => {
   try {
-    const { name } = req.body
+    const { name, image_url: rawImageUrl } = req.body
     if (!name || !name.trim()) {
       return res.status(400).json({ message: 'El nombre es requerido' })
     }
-    const created = await prisma.productCategory.create({ 
-      data: { name: name.trim() }
-    })
+
+    const imageParsed = parseOptionalImageUrl(rawImageUrl)
+    const data = { name: name.trim() }
+    if (imageParsed.provided && imageParsed.value) {
+      data.image_url = imageParsed.value
+    }
+
+    const created = await prisma.productCategory.create({ data })
     res.status(201).json(created)
   } catch (e) {
+    if (e.status) {
+      return res.status(e.status).json({ message: e.message })
+    }
     if (e.code === 'P2002') {
       return res.status(409).json({ message: 'Ya existe una categoría con ese nombre' })
     }
@@ -150,16 +181,35 @@ exports.create = async (req, res, next) => {
 exports.update = async (req, res, next) => {
   try {
     const { id } = req.params
-    const { name } = req.body
+    const { name, image_url: rawImageUrl } = req.body
     if (!name || !name.trim()) {
       return res.status(400).json({ message: 'El nombre es requerido' })
     }
-    const updated = await prisma.productCategory.update({ 
-      where: { id: Number(id) }, 
-      data: { name: name.trim() }
+
+    const categoryId = Number(id)
+    const existing = await prisma.productCategory.findUnique({ where: { id: categoryId } })
+    if (!existing) {
+      return res.status(404).json({ message: 'Categoría no encontrada' })
+    }
+
+    const imageParsed = parseOptionalImageUrl(rawImageUrl)
+    const data = { name: name.trim() }
+    if (imageParsed.provided) {
+      data.image_url = imageParsed.value
+      if (existing.image_url && existing.image_url !== imageParsed.value) {
+        await removePublicObject(existing.image_url, CATEGORY_IMAGES_BUCKET)
+      }
+    }
+
+    const updated = await prisma.productCategory.update({
+      where: { id: categoryId },
+      data,
     })
     res.json(updated)
   } catch (e) {
+    if (e.status) {
+      return res.status(e.status).json({ message: e.message })
+    }
     if (e.code === 'P2025') {
       return res.status(404).json({ message: 'Categoría no encontrada' })
     }
@@ -199,8 +249,11 @@ exports.remove = async (req, res, next) => {
     const linkedProducts = await prisma.product.count({ 
       where: { category_id: Number(id), deleted: false }
     })
-    const linkedSuppliers = await prisma.supplier.count({ 
-      where: { category_id: Number(id), deleted: false }
+    const linkedSuppliers = await prisma.supplierCategory.count({ 
+      where: { 
+        category_id: Number(id),
+        supplier: { deleted: false }
+      }
     })
     
     if (linkedProducts > 0 || linkedSuppliers > 0) {
@@ -360,6 +413,31 @@ exports.bulkImportMapped = async (req, res, next) => {
         : `Se importaron ${result.created} categorías exitosamente`
     })
   } catch (e) {
+    next(e)
+  }
+}
+
+/**
+ * POST /api/catalogs/product-categories/upload-image
+ * Sube imagen representativa al bucket Supabase "categorias".
+ * multipart/form-data, campo "image". Retorna { imageUrl }.
+ */
+exports.uploadImage = async (req, res, next) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: 'No se proporcionó ningún archivo' })
+    }
+
+    const imageUrl = await uploadImageBuffer({
+      bucket: CATEGORY_IMAGES_BUCKET,
+      file: req.file,
+    })
+
+    res.json({ imageUrl })
+  } catch (e) {
+    if (e.status) {
+      return res.status(e.status).json({ message: e.message })
+    }
     next(e)
   }
 }

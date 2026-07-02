@@ -5,11 +5,11 @@
  * Unauthorized copying, modification, distribution, or use of this file,
  * via any medium, is strictly prohibited without express written permission.
  * 
- * For licensing inquiries: GitHub @dpatzan
+ * For licensing inquiries: GitHub @dpatzan2
  */
 
 const { Router } = require('express')
-const { Auth, hasAnyRole } = require('../middlewares/autenticacion')
+const { Auth, hasAnyRole, hasPermission } = require('../middlewares/autenticacion')
 const Suppliers = require('../controllers/suppliers.controller')
 
 const router = Router()
@@ -75,7 +75,7 @@ const router = Router()
  *               type: string
  *               format: binary
  */
-router.get('/template', Suppliers.downloadTemplate)
+router.get('/template', Auth, hasPermission('contacts.suppliers.import'), Suppliers.downloadTemplate)
 
 /**
  * @openapi
@@ -100,7 +100,7 @@ router.get('/template', Suppliers.downloadTemplate)
  *       200:
  *         description: Resultado de importación
  */
-router.post('/bulk-import-mapped', Auth, hasAnyRole('admin'), Suppliers.bulkImportMapped)
+router.post('/bulk-import-mapped', Auth, hasPermission('contacts.suppliers.import'), Suppliers.bulkImportMapped)
 
 /**
  * @openapi
@@ -125,7 +125,7 @@ router.post('/bulk-import-mapped', Auth, hasAnyRole('admin'), Suppliers.bulkImpo
  *       200:
  *         description: Resultado de validación
  */
-router.post('/validate-import-mapped', Auth, hasAnyRole('admin'), Suppliers.validateImportMapped)
+router.post('/validate-import-mapped', Auth, hasPermission('contacts.suppliers.import'), Suppliers.validateImportMapped)
 
 // ========== STANDARD CRUD ROUTES ==========
 
@@ -145,7 +145,7 @@ router.post('/validate-import-mapped', Auth, hasAnyRole('admin'), Suppliers.vali
  *               items:
  *                 $ref: '#/components/schemas/Supplier'
  */
-router.get('/', Suppliers.list)
+router.get('/', Auth, hasPermission('contacts.suppliers.view', 'contacts.clients.view'), Suppliers.list)
 
 /**
  * @openapi
@@ -165,7 +165,20 @@ router.get('/', Suppliers.list)
  *     responses:
  *       201: { description: Creado }
  */
-router.post('/', Auth, hasAnyRole('admin'), Suppliers.create)
+router.post('/', Auth, hasPermission('contacts.suppliers.create', 'contacts.clients.create'), Suppliers.create)
+
+router.get(
+  '/:id/price-rules',
+  Auth,
+  hasPermission('contacts.clients.view', 'contacts.suppliers.view'),
+  Suppliers.listCustomerPriceRules
+)
+router.put(
+  '/:id/price-rules',
+  Auth,
+  hasPermission('contacts.clients.edit', 'contacts.suppliers.edit'),
+  Suppliers.replaceCustomerPriceRules
+)
 
 /**
  * @openapi
@@ -187,7 +200,7 @@ router.post('/', Auth, hasAnyRole('admin'), Suppliers.create)
  *               $ref: '#/components/schemas/Supplier'
  *       404: { description: No encontrado }
  */
-router.get('/:id', Suppliers.getOne)
+router.get('/:id', Auth, Suppliers.getOne)
 
 /**
  * @openapi
@@ -211,7 +224,7 @@ router.get('/:id', Suppliers.getOne)
  *     responses:
  *       200: { description: OK }
  */
-router.put('/:id', Auth, hasAnyRole('admin'), Suppliers.update)
+router.put('/:id', Auth, hasPermission('contacts.suppliers.edit', 'contacts.clients.edit'), Suppliers.update)
 
 /**
  * @openapi
@@ -229,6 +242,6 @@ router.put('/:id', Auth, hasAnyRole('admin'), Suppliers.update)
  *     responses:
  *       200: { description: OK }
  */
-router.delete('/:id', Auth, hasAnyRole('admin'), Suppliers.remove)
+router.delete('/:id', Auth, hasPermission('contacts.suppliers.delete', 'contacts.clients.delete'), Suppliers.remove)
 
 module.exports = router
