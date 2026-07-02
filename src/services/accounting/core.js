@@ -18,7 +18,7 @@ const SETTING_KEY = 'accounting.defaultAccounts'
 const ENTRY_LOCK_KEY = 910004
 
 const DEFAULT_ACCOUNT_KEYS = [
-  'cash', 'bank', 'sales', 'salesReturns', 'cogs', 'inventory',
+  'cash', 'bank', 'receivables', 'sales', 'salesReturns', 'cogs', 'inventory',
   'payables', 'ivaDebit', 'ivaCredit', 'pequenoTax', 'pequenoTaxExpense',
   'currentEarnings', 'retainedEarnings',
 ]
@@ -31,9 +31,20 @@ class AccountingError extends Error {
   }
 }
 
+/**
+ * Fecha de asiento: un 'yyyy-mm-dd' plano se interpreta en zona Guatemala
+ * (mediodía), no como medianoche UTC — evita que caiga al día/período anterior.
+ */
+function toEntryDate(value) {
+  if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value.trim())) {
+    return new Date(`${value.trim()}T12:00:00-06:00`)
+  }
+  return new Date(value)
+}
+
 /** Año/mes contable de una fecha, en zona Guatemala. */
 function periodKeyForDate(date) {
-  const dt = DateTime.fromJSDate(new Date(date), { zone: GT_ZONE })
+  const dt = DateTime.fromJSDate(toEntryDate(date), { zone: GT_ZONE })
   return { year: dt.year, month: dt.month }
 }
 
@@ -87,7 +98,7 @@ async function createEntry(tx, { date, description, source_type = 'MANUAL', sour
   return tx.journalEntry.create({
     data: {
       entry_number,
-      date: new Date(date),
+      date: toEntryDate(date),
       description: String(description || '').slice(0, 255),
       source_type,
       source_id,
@@ -152,6 +163,7 @@ module.exports = {
   GT_ZONE,
   SETTING_KEY,
   DEFAULT_ACCOUNT_KEYS,
+  toEntryDate,
   periodKeyForDate,
   assertPeriodOpen,
   nextEntryNumber,

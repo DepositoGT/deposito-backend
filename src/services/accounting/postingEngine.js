@@ -26,9 +26,12 @@ async function postedIds(prisma, sourceType) {
   return new Set(rows.map((r) => r.source_id))
 }
 
+/** Cuenta de cargo según método de pago: efectivo→Caja, crédito→Clientes, resto→Bancos. */
 function cashOrBank(defaults, paymentMethodName) {
-  const name = String(paymentMethodName || '').toLowerCase()
-  return name.includes('efectivo') ? defaults.cash : defaults.bank
+  const name = String(paymentMethodName || '').toLowerCase().normalize('NFD').replace(/\p{M}/gu, '')
+  if (name.includes('efectivo')) return defaults.cash
+  if (name.includes('credito')) return defaults.receivables
+  return defaults.bank
 }
 
 /** Postea una operación en su propia transacción; devuelve null si ok, o razón si se omite. */

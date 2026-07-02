@@ -413,7 +413,7 @@ async function main() {
 
   // Merge: agrega llaves nuevas sin pisar cuentas ya remapeadas por el usuario.
   const defaultAccountCodes = {
-    cash: '1101', bank: '1102', sales: '4101', salesReturns: '4102',
+    cash: '1101', bank: '1102', receivables: '1103', sales: '4101', salesReturns: '4102',
     cogs: '5101', inventory: '1105', payables: '2101',
     ivaDebit: '2102', ivaCredit: '1104',
     pequenoTax: '2103', pequenoTaxExpense: '6105',
