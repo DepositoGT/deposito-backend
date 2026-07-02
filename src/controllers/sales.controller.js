@@ -8,7 +8,7 @@
  * For licensing inquiries: GitHub @dpatzan2
  */
 
-const { prisma } = require('../models/prisma')
+const { prisma, prismaTransaction } = require('../models/prisma')
 const { Prisma } = require('@prisma/client')
 const { DateTime } = require('luxon')
 const { getTimezone } = require('../utils/getTimezone')
@@ -342,7 +342,7 @@ exports.create = async (req, res, next) => {
     // Convertir admin_authorized_products a Set para búsqueda rápida
     const adminAuthorizedSet = new Set(admin_authorized_products || [])
 
-    const created = await prisma.$transaction(async (tx) => {
+    const created = await prismaTransaction.$transaction(async (tx) => {
       let cashSessionIdForSale = null
       const isAdmin = String(user.role?.name || user.role_name || '').toLowerCase() === 'admin'
       if (!isAdmin) {
@@ -741,7 +741,7 @@ exports.updateStatus = async (req, res, next) => {
 
     // Usar limitador de concurrencia para evitar sobrecarga
     const result = await salesOperationLimiter.run(async () => {
-      return await prisma.$transaction(async (tx) => {
+      return await prismaTransaction.$transaction(async (tx) => {
         // Cargar venta actual con su status e items (por id o por reference)
         const current = await tx.sale.findFirst({
           where,

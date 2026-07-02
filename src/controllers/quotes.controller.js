@@ -4,7 +4,7 @@
  * Cotizaciones comerciales (CommercialDocument doc_type QUOTE).
  */
 
-const { prisma } = require('../models/prisma')
+const { prisma, prismaTransaction } = require('../models/prisma')
 const { Prisma } = require('@prisma/client')
 const crypto = require('crypto')
 const {
@@ -404,7 +404,7 @@ exports.create = async (req, res, next) => {
       customerContactId = String(customerContactIdRaw).trim()
     }
 
-    const created = await prisma.$transaction(async (tx) => {
+    const created = await prismaTransaction.$transaction(async (tx) => {
       await validateCustomerContact(tx, customerContactId)
       const { lines, subtotal, total } = await resolveQuoteLines(tx, items, {
         customerContactId,
@@ -494,7 +494,7 @@ exports.update = async (req, res, next) => {
           : null
     }
 
-    const updated = await prisma.$transaction(async (tx) => {
+    const updated = await prismaTransaction.$transaction(async (tx) => {
       await validateCustomerContact(tx, customerContactId)
       const { lines, subtotal, total } = await resolveQuoteLines(tx, items, {
         customerContactId,
@@ -583,7 +583,7 @@ exports.updateStatus = async (req, res, next) => {
     const user = req.user
     const userId = user?.sub || null
 
-    const updated = await prisma.$transaction(async (tx) => {
+    const updated = await prismaTransaction.$transaction(async (tx) => {
       if (newStatus === 'SENT') {
         await ensurePublicToken(tx, existing.id)
         await applyQuoteSoftHold(tx, existing, userId)
@@ -633,7 +633,7 @@ exports.convertToOrder = async (req, res, next) => {
       })
     }
 
-    const order = await prisma.$transaction(async (tx) => {
+    const order = await prismaTransaction.$transaction(async (tx) => {
       await releaseByDocument(tx, quote.id, { status: 'RELEASED' })
       const reference = await nextDocumentReference(tx, 'P')
       const lines = quote.lines.map((l, idx) => ({
