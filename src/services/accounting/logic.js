@@ -21,9 +21,9 @@ function toCents(n) {
 }
 
 /** Desglosa un total con IVA incluido. base + iva === round2(total). */
-function splitIva(total) {
+function splitIva(total, rate = IVA_RATE) {
   const t = round2(total)
-  const base = round2(t / (1 + IVA_RATE))
+  const base = round2(t / (1 + rate))
   return { base, iva: round2(t - base) }
 }
 

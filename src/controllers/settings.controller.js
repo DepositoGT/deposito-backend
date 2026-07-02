@@ -51,7 +51,7 @@ exports.getAll = async (req, res, next) => {
  */
 exports.getPublic = async (req, res, next) => {
   try {
-    const keys = ['timezone', 'currency_code', 'currency_name', 'company_name', 'company_logo_url', 'date_format', 'locale', 'cash_closure_max_diff_pct']
+    const keys = ['timezone', 'currency_code', 'currency_name', 'company_name', 'company_logo_url', 'date_format', 'locale', 'cash_closure_max_diff_pct', 'vat_affiliation', 'iva_rate']
     const rows = await prisma.systemSetting.findMany({
       where: { key: { in: keys } }
     })
@@ -63,7 +63,9 @@ exports.getPublic = async (req, res, next) => {
       company_logo_url: '',
       date_format: 'dd/MM/yyyy',
       locale: 'es-GT',
-      cash_closure_max_diff_pct: '5'
+      cash_closure_max_diff_pct: '5',
+      vat_affiliation: '',
+      iva_rate: '12'
     }
     for (const row of rows) {
       if (out.hasOwnProperty(row.key)) out[row.key] = (row.value != null && String(row.value).trim() !== '') ? String(row.value).trim() : out[row.key]
@@ -284,6 +286,14 @@ exports.update = async (req, res, next) => {
         }
       }
     }
+    for (const rateKey of ['iva_rate', 'pequeno_rate']) {
+      if (payload[rateKey] !== undefined) {
+        const n = Number(payload[rateKey])
+        if (!Number.isFinite(n) || n < 0 || n >= 100) {
+          return res.status(400).json({ message: `${rateKey} debe ser un número entre 0 y 99` })
+        }
+      }
+    }
 
     const allowedKeys = new Set([
       'currency_code',
@@ -300,6 +310,8 @@ exports.update = async (req, res, next) => {
       'company_postal_code',
       'establishment_code',
       'vat_affiliation',
+      'iva_rate',
+      'pequeno_rate',
       'date_format',
       'locale',
       'cash_closure_max_diff_pct',

@@ -19,7 +19,8 @@ const ENTRY_LOCK_KEY = 910004
 
 const DEFAULT_ACCOUNT_KEYS = [
   'cash', 'bank', 'sales', 'salesReturns', 'cogs', 'inventory',
-  'payables', 'ivaDebit', 'ivaCredit', 'currentEarnings', 'retainedEarnings',
+  'payables', 'ivaDebit', 'ivaCredit', 'pequenoTax', 'pequenoTaxExpense',
+  'currentEarnings', 'retainedEarnings',
 ]
 
 class AccountingError extends Error {
@@ -106,13 +107,25 @@ async function createEntry(tx, { date, description, source_type = 'MANUAL', sour
 }
 
 /**
- * Régimen de IVA ante la SAT (SystemSetting `vat_affiliation`).
- * GENERAL: desglosa IVA débito/crédito. PEQUENO (pequeño contribuyente):
- * sin desglose; ventas y compras se contabilizan por el total.
+ * Configuración de impuestos (SystemSettings, editable desde la UI):
+ * - `vat_affiliation`: régimen SAT. GENERAL desglosa IVA débito/crédito;
+ *   PEQUENO no acredita IVA y paga una tarifa fija sobre ingresos brutos.
+ * - `iva_rate` / `pequeno_rate`: tasas en % (defaults legales GT: 12 y 5).
  */
-async function getVatRegime(tx) {
-  const setting = await tx.systemSetting.findUnique({ where: { key: 'vat_affiliation' } })
-  return /peque/i.test(setting?.value || '') ? 'PEQUENO' : 'GENERAL'
+async function getTaxConfig(tx) {
+  const rows = await tx.systemSetting.findMany({
+    where: { key: { in: ['vat_affiliation', 'iva_rate', 'pequeno_rate'] } },
+  })
+  const map = Object.fromEntries(rows.map((r) => [r.key, r.value]))
+  const pct = (v, fallback) => {
+    const n = Number(v)
+    return Number.isFinite(n) && n >= 0 && n < 100 ? n : fallback
+  }
+  return {
+    regime: /peque/i.test(map.vat_affiliation || '') ? 'PEQUENO' : 'GENERAL',
+    ivaRate: pct(map.iva_rate, 12) / 100,
+    pequenoRate: pct(map.pequeno_rate, 5) / 100,
+  }
 }
 
 /** Mapeo de cuentas por defecto (SystemSetting JSON { key: code }) resuelto a cuentas. */
@@ -144,5 +157,5 @@ module.exports = {
   nextEntryNumber,
   createEntry,
   getDefaultAccounts,
-  getVatRegime,
+  getTaxConfig,
 }

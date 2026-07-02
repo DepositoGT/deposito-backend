@@ -376,6 +376,7 @@ async function main() {
     { code: '2', name: 'PASIVO', type: 'LIABILITY', is_group: true },
     { code: '2101', name: 'Proveedores', type: 'LIABILITY', parent: '2', system: true },
     { code: '2102', name: 'IVA Débito Fiscal', type: 'LIABILITY', parent: '2', system: true },
+    { code: '2103', name: 'IVA Pequeño Contribuyente por Pagar', type: 'LIABILITY', parent: '2', system: true },
     { code: '3', name: 'CAPITAL', type: 'EQUITY', is_group: true },
     { code: '3101', name: 'Capital', type: 'EQUITY', parent: '3' },
     { code: '3201', name: 'Utilidades Acumuladas', type: 'EQUITY', parent: '3', system: true },
@@ -390,6 +391,7 @@ async function main() {
     { code: '6102', name: 'Alquileres', type: 'EXPENSE', parent: '6' },
     { code: '6103', name: 'Servicios (agua, luz, internet)', type: 'EXPENSE', parent: '6' },
     { code: '6104', name: 'Otros Gastos', type: 'EXPENSE', parent: '6' },
+    { code: '6105', name: 'IVA Pequeño Contribuyente (5%)', type: 'EXPENSE', parent: '6', system: true },
   ]
   const accountIdByCode = {}
   for (const acc of accountsSeed) {
@@ -409,19 +411,27 @@ async function main() {
   }
   console.log(`  ${accountsSeed.length} cuentas contables`)
 
+  // Merge: agrega llaves nuevas sin pisar cuentas ya remapeadas por el usuario.
+  const defaultAccountCodes = {
+    cash: '1101', bank: '1102', sales: '4101', salesReturns: '4102',
+    cogs: '5101', inventory: '1105', payables: '2101',
+    ivaDebit: '2102', ivaCredit: '1104',
+    pequenoTax: '2103', pequenoTaxExpense: '6105',
+    currentEarnings: '3202', retainedEarnings: '3201',
+  }
+  const existingDefaults = await prisma.systemSetting.findUnique({ where: { key: 'accounting.defaultAccounts' } })
+  let mergedDefaults = defaultAccountCodes
+  if (existingDefaults) {
+    try { mergedDefaults = { ...defaultAccountCodes, ...JSON.parse(existingDefaults.value) } } catch { /* JSON corrupto: se restaura el default */ }
+  }
   await prisma.systemSetting.upsert({
     where: { key: 'accounting.defaultAccounts' },
-    update: {},
+    update: { value: JSON.stringify(mergedDefaults) },
     create: {
       key: 'accounting.defaultAccounts',
       type: 'json',
       description: 'Mapeo de cuentas por defecto para asientos automáticos',
-      value: JSON.stringify({
-        cash: '1101', bank: '1102', sales: '4101', salesReturns: '4102',
-        cogs: '5101', inventory: '1105', payables: '2101',
-        ivaDebit: '2102', ivaCredit: '1104',
-        currentEarnings: '3202', retainedEarnings: '3201',
-      }),
+      value: JSON.stringify(mergedDefaults),
     },
   })
   console.log('  Mapeo de cuentas por defecto listo')

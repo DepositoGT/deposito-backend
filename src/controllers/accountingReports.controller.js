@@ -8,10 +8,12 @@
  * For licensing inquiries: GitHub @dpatzan2
  */
 
-/** Reportes contables: Libro Mayor, Balanza, Estado de Resultados y Balance General. */
+/** Reportes contables: Libro Mayor, Balanza, Estado de Resultados, Balance General e Impuestos. */
 
+const { DateTime } = require('luxon')
 const { prisma } = require('../models/prisma')
 const { accountBalance, isDebitNature, round2 } = require('../services/accounting/logic')
+const { getDefaultAccounts, getTaxConfig, GT_ZONE } = require('../services/accounting/core')
 
 function parseDate(value, endOfDay = false) {
   if (!value) return null
@@ -194,4 +196,55 @@ exports.balanceSheet = async (req, res, next) => {
       balanced: Math.abs(round2(totalAssets - (totalLiabilities + totalEquity))) < 0.01,
     })
   } catch (e) { next(e) }
+}
+
+/**
+ * Reporte de impuestos por mes (estilo declaración SAT): IVA débito de ventas,
+ * IVA crédito de compras y tarifa de pequeño contribuyente sobre ventas netas.
+ * ponytail: se calcula sobre asientos automáticos (excluye MANUAL/CLOSING);
+ * si el contador ajusta impuestos a mano, agregar etiquetas fiscales por línea.
+ */
+exports.taxesReport = async (req, res, next) => {
+  try {
+    const year = Number(req.query.year) || DateTime.now().setZone(GT_ZONE).year
+    const defaults = await getDefaultAccounts(prisma)
+    const { regime, ivaRate, pequenoRate } = await getTaxConfig(prisma)
+
+    const salesIds = new Set([defaults.sales.id, defaults.salesReturns.id])
+    const lines = await prisma.journalLine.findMany({
+      where: {
+        account_id: { in: [defaults.ivaDebit.id, defaults.ivaCredit.id, defaults.pequenoTax.id, ...salesIds] },
+        entry: {
+          date: {
+            gte: new Date(`${year}-01-01T00:00:00-06:00`),
+            lte: new Date(`${year}-12-31T23:59:59.999-06:00`),
+          },
+          source_type: { notIn: ['MANUAL', 'CLOSING'] },
+        },
+      },
+      select: { account_id: true, debit: true, credit: true, entry: { select: { date: true } } },
+    })
+
+    const months = Array.from({ length: 12 }, (_, i) => (
+      { month: i + 1, netSales: 0, ivaDebit: 0, ivaCredit: 0, pequenoTax: 0, toPay: 0 }
+    ))
+    for (const l of lines) {
+      const m = months[DateTime.fromJSDate(l.entry.date, { zone: GT_ZONE }).month - 1]
+      const debit = Number(l.debit)
+      const credit = Number(l.credit)
+      if (l.account_id === defaults.ivaDebit.id) m.ivaDebit = round2(m.ivaDebit + credit - debit)
+      else if (l.account_id === defaults.ivaCredit.id) m.ivaCredit = round2(m.ivaCredit + debit - credit)
+      else if (l.account_id === defaults.pequenoTax.id) m.pequenoTax = round2(m.pequenoTax + credit - debit)
+      else m.netSales = round2(m.netSales + credit - debit)
+    }
+    const totals = { netSales: 0, ivaDebit: 0, ivaCredit: 0, pequenoTax: 0, toPay: 0 }
+    for (const m of months) {
+      m.toPay = round2(m.ivaDebit - m.ivaCredit + m.pequenoTax)
+      for (const key of Object.keys(totals)) totals[key] = round2(totals[key] + m[key])
+    }
+    res.json({ year, regime, ivaRate, pequenoRate, months, totals })
+  } catch (e) {
+    if (e && e.name === 'AccountingError') return res.status(400).json({ error: e.message })
+    next(e)
+  }
 }

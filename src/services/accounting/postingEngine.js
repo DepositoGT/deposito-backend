@@ -14,8 +14,8 @@
  * (source_type, source_id). No modifica ningún flujo operativo.
  */
 
-const { splitIva, round2, IVA_RATE } = require('./logic')
-const { createEntry, getDefaultAccounts, getVatRegime, AccountingError } = require('./core')
+const { splitIva, round2 } = require('./logic')
+const { createEntry, getDefaultAccounts, getTaxConfig, AccountingError } = require('./core')
 
 /** ids ya contabilizados para un source_type. */
 async function postedIds(prisma, sourceType) {
@@ -48,11 +48,14 @@ async function tryPost(prisma, build) {
 
 async function postPendingOperations(prisma, userId) {
   const defaults = await getDefaultAccounts(prisma)
-  // GENERAL: desglosa IVA débito/crédito. PEQUENO: contabiliza por totales, sin IVA.
-  const splitVat = (await getVatRegime(prisma)) === 'GENERAL'
+  // GENERAL: desglosa IVA débito/crédito. PEQUENO: registra por totales (sin
+  // crédito fiscal) y acumula la tarifa fija sobre ventas (gasto vs. pasivo).
+  const { regime, ivaRate, pequenoRate } = await getTaxConfig(prisma)
+  const splitVat = regime === 'GENERAL'
   // Los costos (product.cost, unit_cost) se capturan a precio de factura (con IVA);
   // en régimen general el costo contable es la base para cuadrar con el inventario.
-  const costBase = (c) => (splitVat ? round2(c / (1 + IVA_RATE)) : c)
+  const costBase = (c) => (splitVat ? round2(c / (1 + ivaRate)) : c)
+  const pequenoTaxOf = (amount) => (splitVat ? 0 : round2(amount * pequenoRate))
   let posted = 0
   const skipped = []
   const track = (source, reason) => {
@@ -76,7 +79,7 @@ async function postPendingOperations(prisma, userId) {
     const label = `Venta ${sale.reference || sale.id.slice(0, 8)}`
     const total = round2(sale.total)
     if (total <= 0) { track(label, 'total 0'); continue }
-    const { base, iva } = splitIva(total)
+    const { base, iva } = splitIva(total, ivaRate)
     const cost = costBase(round2(sale.sale_items.reduce((s, i) => s + i.qty * Number(i.product.cost || 0), 0)))
     const chargeAccount = cashOrBank(defaults, sale.payment_method?.name)
     const lines = splitVat
@@ -89,6 +92,11 @@ async function postPendingOperations(prisma, userId) {
           { account_id: chargeAccount.id, debit: total, credit: 0 },
           { account_id: defaults.sales.id, debit: 0, credit: total },
         ]
+    const saleTax = pequenoTaxOf(total)
+    if (saleTax > 0) {
+      lines.push({ account_id: defaults.pequenoTaxExpense.id, debit: saleTax, credit: 0 })
+      lines.push({ account_id: defaults.pequenoTax.id, debit: 0, credit: saleTax })
+    }
     if (cost > 0) {
       lines.push({ account_id: defaults.cogs.id, debit: cost, credit: 0 })
       lines.push({ account_id: defaults.inventory.id, debit: 0, credit: cost })
@@ -120,7 +128,7 @@ async function postPendingOperations(prisma, userId) {
     const label = `Devolución venta ${ret.sale?.reference || ret.id.slice(0, 8)}`
     const refund = round2(ret.total_refund)
     if (refund <= 0) { track(label, 'monto 0'); continue }
-    const { base, iva } = splitIva(refund)
+    const { base, iva } = splitIva(refund, ivaRate)
     const cost = costBase(round2(ret.return_items.reduce((s, i) => s + i.qty_returned * Number(i.product.cost || 0), 0)))
     const refundAccount = cashOrBank(defaults, ret.sale?.payment_method?.name)
     const lines = splitVat
@@ -133,6 +141,11 @@ async function postPendingOperations(prisma, userId) {
           { account_id: defaults.salesReturns.id, debit: refund, credit: 0 },
           { account_id: refundAccount.id, debit: 0, credit: refund },
         ]
+    const refundTax = pequenoTaxOf(refund)
+    if (refundTax > 0) {
+      lines.push({ account_id: defaults.pequenoTax.id, debit: refundTax, credit: 0 })
+      lines.push({ account_id: defaults.pequenoTaxExpense.id, debit: 0, credit: refundTax })
+    }
     if (cost > 0) {
       lines.push({ account_id: defaults.inventory.id, debit: cost, credit: 0 })
       lines.push({ account_id: defaults.cogs.id, debit: 0, credit: cost })
@@ -164,7 +177,7 @@ async function postPendingOperations(prisma, userId) {
     const label = `Compra a ${purchase.supplier?.name || 'proveedor'} (${purchase.id.slice(0, 8)})`
     const total = round2(purchase.items.reduce((s, i) => s + i.quantity * Number(i.unit_cost), 0))
     if (total <= 0) { track(label, 'total 0'); continue }
-    const { base, iva } = splitIva(total)
+    const { base, iva } = splitIva(total, ivaRate)
     const reason = await tryPost(prisma, () => ({
       date: purchase.date,
       description: `Compra a ${purchase.supplier?.name || 'proveedor'}`,

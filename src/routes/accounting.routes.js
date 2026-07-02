@@ -43,5 +43,6 @@ router.get('/ledger/:accountId', Auth, hasPermission('accounting.view'), reports
 router.get('/trial-balance', Auth, hasPermission('accounting.view'), reports.trialBalance)
 router.get('/income-statement', Auth, hasPermission('accounting.view'), reports.incomeStatement)
 router.get('/balance-sheet', Auth, hasPermission('accounting.view'), reports.balanceSheet)
+router.get('/taxes-report', Auth, hasPermission('accounting.view'), reports.taxesReport)
 
 module.exports = router
