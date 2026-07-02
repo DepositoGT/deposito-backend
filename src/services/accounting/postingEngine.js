@@ -71,7 +71,8 @@ async function postPendingOperations(prisma, userId) {
   const sales = await prisma.sale.findMany({
     where: { status: { name: 'Completada' } },
     select: {
-      id: true, reference: true, date: true, total: true,
+      id: true, reference: true, date: true, total: true, customer: true,
+      customerContact: { select: { name: true } },
       payment_method: { select: { name: true } },
       sale_items: { select: { qty: true, product: { select: { cost: true } } } },
     },
@@ -95,6 +96,11 @@ async function postPendingOperations(prisma, userId) {
           { account_id: chargeAccount.id, debit: total, credit: 0 },
           { account_id: defaults.sales.id, debit: 0, credit: total },
         ]
+    // Ventas al crédito: la línea de Clientes identifica al contacto que debe.
+    if (chargeAccount.id === defaults.receivables.id) {
+      const customerName = sale.customerContact?.name || sale.customer
+      if (customerName) lines[0].description = `Cliente: ${customerName}`
+    }
     const saleTax = pequenoTaxOf(total)
     if (saleTax > 0) {
       lines.push({ account_id: defaults.pequenoTaxExpense.id, debit: saleTax, credit: 0 })
@@ -121,7 +127,13 @@ async function postPendingOperations(prisma, userId) {
     where: { status: { name: { in: ['Aprobada', 'Completada'] } } },
     select: {
       id: true, return_date: true, total_refund: true,
-      sale: { select: { reference: true, payment_method: { select: { name: true } } } },
+      sale: {
+        select: {
+          reference: true, customer: true,
+          customerContact: { select: { name: true } },
+          payment_method: { select: { name: true } },
+        },
+      },
       return_items: { select: { qty_returned: true, product: { select: { cost: true } } } },
     },
     orderBy: { return_date: 'asc' },
@@ -144,6 +156,13 @@ async function postPendingOperations(prisma, userId) {
           { account_id: defaults.salesReturns.id, debit: refund, credit: 0 },
           { account_id: refundAccount.id, debit: 0, credit: refund },
         ]
+    if (refundAccount.id === defaults.receivables.id) {
+      const customerName = ret.sale?.customerContact?.name || ret.sale?.customer
+      if (customerName) {
+        const refundLine = lines.find((l) => l.account_id === refundAccount.id)
+        if (refundLine) refundLine.description = `Cliente: ${customerName}`
+      }
+    }
     const refundTax = pequenoTaxOf(refund)
     if (refundTax > 0) {
       lines.push({ account_id: defaults.pequenoTax.id, debit: refundTax, credit: 0 })
