@@ -14,8 +14,8 @@
  * (source_type, source_id). No modifica ningún flujo operativo.
  */
 
-const { splitIva, round2 } = require('./logic')
-const { createEntry, getDefaultAccounts, AccountingError } = require('./core')
+const { splitIva, round2, IVA_RATE } = require('./logic')
+const { createEntry, getDefaultAccounts, getVatRegime, AccountingError } = require('./core')
 
 /** ids ya contabilizados para un source_type. */
 async function postedIds(prisma, sourceType) {
@@ -37,7 +37,7 @@ async function tryPost(prisma, build) {
     await prisma.$transaction(async (tx) => {
       const payload = await build(tx)
       if (payload) await createEntry(tx, payload)
-    })
+    }, { timeout: 30000, maxWait: 10000 }) // Supabase pooler puede exceder los 5s por defecto
     return null
   } catch (e) {
     if (e instanceof AccountingError) return e.message
@@ -48,6 +48,11 @@ async function tryPost(prisma, build) {
 
 async function postPendingOperations(prisma, userId) {
   const defaults = await getDefaultAccounts(prisma)
+  // GENERAL: desglosa IVA débito/crédito. PEQUENO: contabiliza por totales, sin IVA.
+  const splitVat = (await getVatRegime(prisma)) === 'GENERAL'
+  // Los costos (product.cost, unit_cost) se capturan a precio de factura (con IVA);
+  // en régimen general el costo contable es la base para cuadrar con el inventario.
+  const costBase = (c) => (splitVat ? round2(c / (1 + IVA_RATE)) : c)
   let posted = 0
   const skipped = []
   const track = (source, reason) => {
@@ -72,13 +77,18 @@ async function postPendingOperations(prisma, userId) {
     const total = round2(sale.total)
     if (total <= 0) { track(label, 'total 0'); continue }
     const { base, iva } = splitIva(total)
-    const cost = round2(sale.sale_items.reduce((s, i) => s + i.qty * Number(i.product.cost || 0), 0))
+    const cost = costBase(round2(sale.sale_items.reduce((s, i) => s + i.qty * Number(i.product.cost || 0), 0)))
     const chargeAccount = cashOrBank(defaults, sale.payment_method?.name)
-    const lines = [
-      { account_id: chargeAccount.id, debit: total, credit: 0 },
-      { account_id: defaults.sales.id, debit: 0, credit: base },
-      { account_id: defaults.ivaDebit.id, debit: 0, credit: iva },
-    ]
+    const lines = splitVat
+      ? [
+          { account_id: chargeAccount.id, debit: total, credit: 0 },
+          { account_id: defaults.sales.id, debit: 0, credit: base },
+          { account_id: defaults.ivaDebit.id, debit: 0, credit: iva },
+        ]
+      : [
+          { account_id: chargeAccount.id, debit: total, credit: 0 },
+          { account_id: defaults.sales.id, debit: 0, credit: total },
+        ]
     if (cost > 0) {
       lines.push({ account_id: defaults.cogs.id, debit: cost, credit: 0 })
       lines.push({ account_id: defaults.inventory.id, debit: 0, credit: cost })
@@ -111,13 +121,18 @@ async function postPendingOperations(prisma, userId) {
     const refund = round2(ret.total_refund)
     if (refund <= 0) { track(label, 'monto 0'); continue }
     const { base, iva } = splitIva(refund)
-    const cost = round2(ret.return_items.reduce((s, i) => s + i.qty_returned * Number(i.product.cost || 0), 0))
+    const cost = costBase(round2(ret.return_items.reduce((s, i) => s + i.qty_returned * Number(i.product.cost || 0), 0)))
     const refundAccount = cashOrBank(defaults, ret.sale?.payment_method?.name)
-    const lines = [
-      { account_id: defaults.salesReturns.id, debit: base, credit: 0 },
-      { account_id: defaults.ivaDebit.id, debit: iva, credit: 0 },
-      { account_id: refundAccount.id, debit: 0, credit: refund },
-    ]
+    const lines = splitVat
+      ? [
+          { account_id: defaults.salesReturns.id, debit: base, credit: 0 },
+          { account_id: defaults.ivaDebit.id, debit: iva, credit: 0 },
+          { account_id: refundAccount.id, debit: 0, credit: refund },
+        ]
+      : [
+          { account_id: defaults.salesReturns.id, debit: refund, credit: 0 },
+          { account_id: refundAccount.id, debit: 0, credit: refund },
+        ]
     if (cost > 0) {
       lines.push({ account_id: defaults.inventory.id, debit: cost, credit: 0 })
       lines.push({ account_id: defaults.cogs.id, debit: 0, credit: cost })
@@ -156,11 +171,16 @@ async function postPendingOperations(prisma, userId) {
       source_type: 'PURCHASE',
       source_id: purchase.id,
       created_by: userId,
-      lines: [
-        { account_id: defaults.inventory.id, debit: base, credit: 0 },
-        { account_id: defaults.ivaCredit.id, debit: iva, credit: 0 },
-        { account_id: defaults.payables.id, debit: 0, credit: total },
-      ],
+      lines: splitVat
+        ? [
+            { account_id: defaults.inventory.id, debit: base, credit: 0 },
+            { account_id: defaults.ivaCredit.id, debit: iva, credit: 0 },
+            { account_id: defaults.payables.id, debit: 0, credit: total },
+          ]
+        : [
+            { account_id: defaults.inventory.id, debit: total, credit: 0 },
+            { account_id: defaults.payables.id, debit: 0, credit: total },
+          ],
     }))
     track(label, reason)
   }

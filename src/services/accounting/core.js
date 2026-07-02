@@ -105,6 +105,16 @@ async function createEntry(tx, { date, description, source_type = 'MANUAL', sour
   })
 }
 
+/**
+ * Régimen de IVA ante la SAT (SystemSetting `vat_affiliation`).
+ * GENERAL: desglosa IVA débito/crédito. PEQUENO (pequeño contribuyente):
+ * sin desglose; ventas y compras se contabilizan por el total.
+ */
+async function getVatRegime(tx) {
+  const setting = await tx.systemSetting.findUnique({ where: { key: 'vat_affiliation' } })
+  return /peque/i.test(setting?.value || '') ? 'PEQUENO' : 'GENERAL'
+}
+
 /** Mapeo de cuentas por defecto (SystemSetting JSON { key: code }) resuelto a cuentas. */
 async function getDefaultAccounts(tx) {
   const setting = await tx.systemSetting.findUnique({ where: { key: SETTING_KEY } })
@@ -134,4 +144,5 @@ module.exports = {
   nextEntryNumber,
   createEntry,
   getDefaultAccounts,
+  getVatRegime,
 }
