@@ -12,10 +12,14 @@ const { Router } = require('express')
 const { Auth, hasPermission } = require('../middlewares/autenticacion')
 const ctrl = require('../controllers/accounting.controller')
 const reports = require('../controllers/accountingReports.controller')
+const imp = require('../controllers/accountingImport.controller')
 const router = Router()
 
 // Catálogo de cuentas
 router.get('/accounts', Auth, hasPermission('accounting.view'), ctrl.listAccounts)
+router.get('/accounts/template', Auth, hasPermission('accounting.view'), imp.accountsTemplate)
+router.post('/accounts/validate-import', Auth, hasPermission('accounting.manage'), imp.validateAccountsImport)
+router.post('/accounts/bulk-import', Auth, hasPermission('accounting.manage'), imp.bulkImportAccounts)
 router.post('/accounts', Auth, hasPermission('accounting.manage'), ctrl.createAccount)
 router.put('/accounts/:id', Auth, hasPermission('accounting.manage'), ctrl.updateAccount)
 
@@ -30,6 +34,9 @@ router.put('/config', Auth, hasPermission('accounting.manage'), ctrl.updateConfi
 
 // Diario
 router.get('/journal', Auth, hasPermission('accounting.view'), ctrl.listJournal)
+router.get('/journal/template', Auth, hasPermission('accounting.view'), imp.journalTemplate)
+router.post('/journal/validate-import', Auth, hasPermission('accounting.create'), imp.validateJournalImport)
+router.post('/journal/bulk-import', Auth, hasPermission('accounting.create'), imp.bulkImportJournal)
 router.get('/journal/:id', Auth, hasPermission('accounting.view'), ctrl.getJournalEntry)
 router.post('/journal', Auth, hasPermission('accounting.create'), ctrl.createManualEntry)
 router.post('/journal/:id/reverse', Auth, hasPermission('accounting.create'), ctrl.reverseEntry)
