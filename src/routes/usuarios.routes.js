@@ -10,10 +10,20 @@
 
 const { Router } = require('express')
 const multer = require('multer')
+const rateLimit = require('express-rate-limit')
 const controller = require('../controllers/usuarios.controller')
 const { Auth, hasAnyRole, hasPermission } = require('../middlewares/autenticacion')
 
 const router = Router()
+
+// Frena fuerza bruta en las rutas que verifican contraseña. 10 intentos / 15 min por IP.
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Demasiados intentos, probá de nuevo en unos minutos' },
+})
 
 // Configurar multer para almacenar en memoria
 const upload = multer({
@@ -100,7 +110,9 @@ router.post('/register', Auth, hasPermission('users.create'), controller.registe
  *             schema:
  *               $ref: '#/components/schemas/AuthResponse'
  */
-router.post('/login', controller.login)
+router.post('/login', loginLimiter, controller.login)
+router.post('/refresh', controller.refresh)
+router.post('/logout', controller.logout)
 
 /**
  * @openapi
@@ -126,7 +138,7 @@ router.post('/login', controller.login)
  *       403:
  *         description: Usuario no es administrador
  */
-router.post('/validate-admin', controller.validateAdmin)
+router.post('/validate-admin', loginLimiter, controller.validateAdmin)
 
 /**
  * @openapi
@@ -147,7 +159,7 @@ router.post('/validate-admin', controller.validateAdmin)
  *                 user:
  *                   $ref: '#/components/schemas/User'
  */
-router.get('/me', Auth, (req, res) => res.json({ user: req.user }))
+router.get('/me', Auth, controller.me)
 
 /**
  * @openapi

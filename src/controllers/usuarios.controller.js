@@ -12,8 +12,51 @@ const bcrypt = require('bcryptjs')
 const { createClient } = require('@supabase/supabase-js')
 const { prisma } = require('../models/prisma')
 const { crearToken } = require('../services/jwt')
+const refreshTokens = require('../services/refreshTokens')
+const {
+  ACCESS_COOKIE,
+  REFRESH_COOKIE,
+  accessCookieOptions,
+  refreshCookieOptions,
+} = require('../config/security')
 const { generateUserTemplate } = require('../services/userTemplate')
 const { bulkValidateUsers, bulkCreateUsers } = require('../services/userBulkImport')
+
+// Consulta reutilizable de usuario con rol + permisos para el login/refresh/me.
+const userWithPerms = {
+  role: { include: { permissions: { include: { permission: true } } } },
+}
+
+function serializeUser(user) {
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    role_id: user.role_id,
+    role: user.role || null,
+    is_employee: user.is_employee || false,
+    photo_url: user.photo_url,
+    phone: user.phone,
+    address: user.address,
+    hire_date: user.hire_date,
+    permissions: Array.isArray(user.role?.permissions)
+      ? user.role.permissions.map((rp) => rp.permission?.code).filter(Boolean)
+      : [],
+  }
+}
+
+// Setea las cookies de sesión (access + refresh) en la respuesta.
+async function setSessionCookies(res, user) {
+  const accessToken = crearToken(user)
+  const refreshToken = await refreshTokens.issue(user.id)
+  res.cookie(ACCESS_COOKIE, accessToken, accessCookieOptions())
+  res.cookie(REFRESH_COOKIE, refreshToken, refreshCookieOptions())
+}
+
+function clearSessionCookies(res) {
+  res.clearCookie(ACCESS_COOKIE, { ...accessCookieOptions(), maxAge: undefined })
+  res.clearCookie(REFRESH_COOKIE, { ...refreshCookieOptions(), maxAge: undefined })
+}
 
 // Inicializar cliente de Supabase con service role key (solo para backend)
 const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL
@@ -141,45 +184,57 @@ exports.register = async (req, res, next) => {
 
 exports.login = async (req, res, next) => {
   try {
-  const { email, password } = req.body || {}
-  console.log('Login payload received:', { email })
-    // Fetch user including role so we can return role properties to the client
-    const user = await prisma.user.findUnique({
-      where: { email },
-      include: {
-        role: {
-          include: {
-            permissions: {
-              include: { permission: true }
-            }
-          }
-        }
-      }
-    })
+    const { email, password } = req.body || {}
+    const user = await prisma.user.findUnique({ where: { email }, include: userWithPerms })
     if (!user) return res.status(401).json({ message: 'Credenciales inválidas' })
 
     const ok = await bcrypt.compare(password, user.password)
     if (!ok) return res.status(401).json({ message: 'Credenciales inválidas' })
 
-    const token = crearToken(user)
-    res.json({
-      user: {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        role_id: user.role_id,
-        role: user.role || null,
-        is_employee: user.is_employee || false,
-        photo_url: user.photo_url,
-        phone: user.phone,
-        address: user.address,
-        hire_date: user.hire_date,
-        permissions: Array.isArray(user.role?.permissions)
-          ? user.role.permissions.map((rp) => rp.permission?.code).filter(Boolean)
-          : [],
-      },
-      token,
-    })
+    await setSessionCookies(res, user)
+    res.json({ user: serializeUser(user) })
+  } catch (e) { next(e) }
+}
+
+// POST /api/auth/refresh - rota el refresh token y renueva el access token
+exports.refresh = async (req, res, next) => {
+  try {
+    const current = req.cookies && req.cookies[REFRESH_COOKIE]
+    if (!current) return res.status(401).json({ message: 'No autenticado' })
+
+    const result = await refreshTokens.rotate(current)
+    if (!result || result.reuse) {
+      clearSessionCookies(res)
+      return res.status(401).json({ message: 'Sesión inválida' })
+    }
+
+    const user = await prisma.user.findUnique({ where: { id: result.userId }, include: userWithPerms })
+    if (!user) {
+      clearSessionCookies(res)
+      return res.status(401).json({ message: 'Sesión inválida' })
+    }
+
+    res.cookie(ACCESS_COOKIE, crearToken(user), accessCookieOptions())
+    res.cookie(REFRESH_COOKIE, result.token, refreshCookieOptions())
+    res.json({ user: serializeUser(user) })
+  } catch (e) { next(e) }
+}
+
+// GET /api/auth/me - usuario actual (fresco desde DB) para restaurar sesión al recargar
+exports.me = async (req, res, next) => {
+  try {
+    const user = await prisma.user.findUnique({ where: { id: req.user.sub }, include: userWithPerms })
+    if (!user) return res.status(401).json({ message: 'No autenticado' })
+    res.json({ user: serializeUser(user) })
+  } catch (e) { next(e) }
+}
+
+// POST /api/auth/logout - revoca el refresh token y limpia las cookies
+exports.logout = async (req, res, next) => {
+  try {
+    await refreshTokens.revoke(req.cookies && req.cookies[REFRESH_COOKIE])
+    clearSessionCookies(res)
+    res.json({ ok: true })
   } catch (e) { next(e) }
 }
 

@@ -338,7 +338,24 @@ model User {
   created_at  DateTime  @default(now())
   updated_at  DateTime  @updatedAt
 
+  refresh_tokens RefreshToken[]
+
   @@map("users")
+}
+
+/// Refresh tokens rotatorios (uno por sesión). Se guarda sólo el hash SHA-256.
+model RefreshToken {
+  id          String    @id @default(uuid()) @db.Uuid
+  user_id     String    @db.Uuid
+  user        User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  token_hash  String    @unique @db.VarChar(64)
+  expires_at  DateTime
+  revoked_at  DateTime?
+  replaced_by String?   @db.VarChar(64)
+  created_at  DateTime  @default(now())
+
+  @@index([user_id])
+  @@map("refresh_tokens")
 }
 
 model Alert {
