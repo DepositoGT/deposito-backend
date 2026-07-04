@@ -10,6 +10,7 @@
 
 const { Router } = require('express')
 const Catalogs = require('../controllers/catalogs.controller')
+const { Auth } = require('../middlewares/autenticacion')
 const router = Router()
 
 /**
@@ -25,7 +26,7 @@ const router = Router()
  *       200:
  *         description: OK
  */
-router.get('/', Catalogs.all)
+router.get('/', Auth, Catalogs.all)
 
 /**
  * @openapi
@@ -37,7 +38,7 @@ router.get('/', Catalogs.all)
  *       200:
  *         description: OK
  */
-router.get('/statuses', Catalogs.statuses)
+router.get('/statuses', Auth, Catalogs.statuses)
 
 // Mount product categories management
 router.use('/product-categories', require('./productCategories.routes'))
