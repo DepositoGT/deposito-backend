@@ -43,7 +43,7 @@ const uploadImage = multer({
  *       200:
  *         description: Lista de categorías
  */
-router.get('/', ctrl.list)
+router.get('/', Auth, ctrl.list)
 
 /**
  * @openapi
@@ -61,7 +61,7 @@ router.get('/', ctrl.list)
  *               type: string
  *               format: binary
  */
-router.get('/template', ctrl.downloadTemplate)
+router.get('/template', Auth, hasPermission('catalogs.manage'), ctrl.downloadTemplate)
 
 /**
  * @openapi
@@ -162,7 +162,7 @@ router.post(
  *       201:
  *         description: Creada
  */
-router.post('/', ctrl.create)
+router.post('/', Auth, hasPermission('catalogs.manage'), ctrl.create)
 
 /**
  * @openapi
@@ -189,7 +189,7 @@ router.post('/', ctrl.create)
  *       200:
  *         description: Actualizada
  */
-router.put('/:id', ctrl.update)
+router.put('/:id', Auth, hasPermission('catalogs.manage'), ctrl.update)
 
 /**
  * @openapi
@@ -207,7 +207,7 @@ router.put('/:id', ctrl.update)
  *       200:
  *         description: Eliminada
  */
-router.delete('/:id', ctrl.remove)
+router.delete('/:id', Auth, hasPermission('catalogs.manage'), ctrl.remove)
 
 /**
  * @openapi
@@ -225,6 +225,6 @@ router.delete('/:id', ctrl.remove)
  *       200:
  *         description: Restaurada
  */
-router.patch('/:id/restore', ctrl.restore)
+router.patch('/:id/restore', Auth, hasPermission('catalogs.manage'), ctrl.restore)
 
 module.exports = router

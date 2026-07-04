@@ -74,7 +74,7 @@ const upload = multer({
  *             schema:
  *               $ref: '#/components/schemas/AuthResponse'
  */
-router.post('/register', controller.register)
+router.post('/register', Auth, hasPermission('users.create'), controller.register)
 
 /**
  * @openapi

@@ -16,6 +16,12 @@
 const express = require('express')
 const router = express.Router()
 const controller = require('../controllers/promotions.controller')
+const { Auth, hasPermission } = require('../middlewares/autenticacion')
+
+// Lecturas y validación de códigos: cualquier usuario autenticado (el POS las necesita).
+// Mutaciones: solo quien gestiona promociones.
+router.use(Auth)
+const canManage = hasPermission('promotions.manage')
 
 /**
  * @swagger
@@ -53,7 +59,7 @@ router.get('/types', controller.getTypes)
  *     summary: Seed initial promotion types
  *     tags: [Promotions]
  */
-router.post('/types/seed', controller.seedTypes)
+router.post('/types/seed', canManage, controller.seedTypes)
 
 /**
  * @swagger
@@ -109,7 +115,7 @@ router.get('/:id', controller.getById)
  *     summary: Create a new promotion
  *     tags: [Promotions]
  */
-router.post('/', controller.create)
+router.post('/', canManage, controller.create)
 
 /**
  * @swagger
@@ -118,7 +124,7 @@ router.post('/', controller.create)
  *     summary: Update a promotion
  *     tags: [Promotions]
  */
-router.put('/:id', controller.update)
+router.put('/:id', canManage, controller.update)
 
 /**
  * @swagger
@@ -127,7 +133,7 @@ router.put('/:id', controller.update)
  *     summary: Delete a promotion
  *     tags: [Promotions]
  */
-router.delete('/:id', controller.delete)
+router.delete('/:id', canManage, controller.delete)
 
 /**
  * @swagger
@@ -136,7 +142,7 @@ router.delete('/:id', controller.delete)
  *     summary: Generate random promotion codes
  *     tags: [Promotions]
  */
-router.post('/generate-codes', controller.generateCodes)
+router.post('/generate-codes', canManage, controller.generateCodes)
 
 /**
  * @swagger
@@ -145,7 +151,7 @@ router.post('/generate-codes', controller.generateCodes)
  *     summary: Add codes to an existing promotion
  *     tags: [Promotions]
  */
-router.post('/:id/codes', controller.addCodes)
+router.post('/:id/codes', canManage, controller.addCodes)
 
 /**
  * @swagger
@@ -154,7 +160,7 @@ router.post('/:id/codes', controller.addCodes)
  *     summary: Delete a code from a promotion
  *     tags: [Promotions]
  */
-router.delete('/:id/codes/:codeId', controller.deleteCode)
+router.delete('/:id/codes/:codeId', canManage, controller.deleteCode)
 
 module.exports = router
 
