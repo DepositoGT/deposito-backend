@@ -10,7 +10,10 @@
 
 const { Router } = require('express')
 const ctrl = require('../controllers/analytics.controller')
+const { Auth, hasPermission } = require('../middlewares/autenticacion')
 const router = Router()
+
+router.use(Auth, hasPermission('analytics.view'))
 
 /**
  * @openapi

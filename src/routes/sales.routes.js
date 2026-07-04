@@ -104,7 +104,7 @@ router.get('/', Auth, hasPermission('sales.view'), Sales.list)
  *       404:
  *         description: Venta no encontrada
  */
-router.get('/:id', Sales.getById)
+router.get('/:id', Auth, hasPermission('sales.view', 'sales.view_detail', 'sales.view_invoice', 'returns.manage'), Sales.getById)
 
 /**
  * @openapi

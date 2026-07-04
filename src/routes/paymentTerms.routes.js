@@ -13,11 +13,13 @@ const { Auth, hasAnyRole, hasPermission } = require('../middlewares/autenticacio
 const ctrl = require('../controllers/paymentTerms.controller')
 const router = Router()
 
-// GET /catalogs/payment-terms
-router.get('/', ctrl.list)
+const canManage = hasPermission('catalogs.manage')
+
+// GET /catalogs/payment-terms (lectura: cualquier usuario autenticado, alimenta selects)
+router.get('/', Auth, ctrl.list)
 
 // GET /catalogs/payment-terms/template
-router.get('/template', ctrl.downloadTemplate)
+router.get('/template', Auth, canManage, ctrl.downloadTemplate)
 
 // POST /catalogs/payment-terms/validate-import-mapped
 router.post('/validate-import-mapped', Auth, hasPermission('catalogs.manage'), ctrl.validateImportMapped)
@@ -26,15 +28,15 @@ router.post('/validate-import-mapped', Auth, hasPermission('catalogs.manage'), c
 router.post('/bulk-import-mapped', Auth, hasPermission('catalogs.manage'), ctrl.bulkImportMapped)
 
 // POST /catalogs/payment-terms
-router.post('/', ctrl.create)
+router.post('/', Auth, canManage, ctrl.create)
 
 // PUT /catalogs/payment-terms/:id
-router.put('/:id', ctrl.update)
+router.put('/:id', Auth, canManage, ctrl.update)
 
 // DELETE /catalogs/payment-terms/:id (soft delete)
-router.delete('/:id', ctrl.remove)
+router.delete('/:id', Auth, canManage, ctrl.remove)
 
 // PATCH /catalogs/payment-terms/:id/restore
-router.patch('/:id/restore', ctrl.restore)
+router.patch('/:id/restore', Auth, canManage, ctrl.restore)
 
 module.exports = router

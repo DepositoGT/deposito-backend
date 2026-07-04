@@ -87,7 +87,7 @@ const router = Router()
  *               items:
  *                 $ref: '#/components/schemas/Product'
  */
-router.get('/', Products.list)
+router.get('/', Auth, Products.list)
 
 /**
  * @openapi
@@ -125,7 +125,7 @@ router.get('/critical', Auth, hasPermission('products.view', 'alerts.view'), Pro
  *               type: string
  *               format: binary
  */
-router.get('/report.pdf', Products.reportPdf)
+router.get('/report.pdf', Auth, hasPermission('products.export', 'reports.view'), Products.reportPdf)
 
 router.get('/availability', Auth, hasPermission('products.view', 'sales.create', 'orders.view', 'quotes.view'), Products.availability)
 
@@ -145,7 +145,7 @@ router.get('/availability', Auth, hasPermission('products.view', 'sales.create',
  *               type: string
  *               format: binary
  */
-router.get('/import-template', Products.getImportTemplate)
+router.get('/import-template', Auth, hasPermission('products.import'), Products.getImportTemplate)
 
 /**
  * @openapi
@@ -295,9 +295,9 @@ router.post(
  *               $ref: '#/components/schemas/Product'
  *       404: { description: No encontrado }
  */
-router.get('/:id/bom', Products.getBom)
+router.get('/:id/bom', Auth, Products.getBom)
 router.put('/:id/bom', Auth, hasPermission('products.edit'), Products.updateBom)
-router.get('/:id', Products.getOne)
+router.get('/:id', Auth, Products.getOne)
 
 /**
  * @openapi

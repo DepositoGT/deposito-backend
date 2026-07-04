@@ -24,12 +24,14 @@ const {
 
 const router = Router()
 
-router.get('/sales', salesReport)
-router.get('/inventory', inventoryReport)
-router.get('/suppliers', suppliersReport)
-router.get('/financial', financialReport)
-router.get('/alerts', alertsReport)
-router.get('/products', productsReport)
+const canViewReports = hasPermission('reports.view')
+
+router.get('/sales', Auth, canViewReports, salesReport)
+router.get('/inventory', Auth, canViewReports, inventoryReport)
+router.get('/suppliers', Auth, canViewReports, suppliersReport)
+router.get('/financial', Auth, canViewReports, financialReport)
+router.get('/alerts', Auth, canViewReports, alertsReport)
+router.get('/products', Auth, canViewReports, productsReport)
 router.get(
   '/merchandise',
   Auth,
