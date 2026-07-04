@@ -1,5 +1,6 @@
 const express = require('express')
 const cors = require('cors')
+const helmet = require('helmet')
 const cookieParser = require('cookie-parser')
 const path = require('path')
 const swaggerUi = require('swagger-ui-express')
@@ -11,6 +12,12 @@ const usuariosRoutes = require('./src/routes/usuarios.routes')
 const apiRoutes = require('./src/routes')
 
 var app = express()
+
+// Detrás del proxy de Vercel: necesario para que express-rate-limit lea la IP real (X-Forwarded-For).
+app.set('trust proxy', 1)
+
+// Cabeceras de seguridad. crossOriginResourcePolicy relajado porque servimos imágenes/PDFs a otro origen.
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }))
 
 // CORS: explicitly allow local dev frontends and production
 const allowedOrigins = new Set([
