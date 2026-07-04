@@ -11,7 +11,12 @@
 const { prisma, prismaTransaction } = require('../models/prisma')
 const { DateTime } = require('luxon')
 const { ensureStockAlertsBatch } = require('../services/stockAlerts')
-const { expandLinesToStockMap, restoreStockMap } = require('../services/bomStock')
+const {
+  expandLinesToStockMap,
+  restoreStockMap,
+  deductStockMap,
+  getAvailabilityBatchWithKits,
+} = require('../services/bomStock')
 
 async function restoreReturnItemsStock(tx, returnItems) {
   const stockMap = await expandLinesToStockMap(
@@ -21,6 +26,43 @@ async function restoreReturnItemsStock(tx, returnItems) {
   const updatedProducts = await restoreStockMap(tx, stockMap)
   await ensureStockAlertsBatch(tx, updatedProducts)
   return updatedProducts
+}
+
+/** Descuenta stock de los productos que el cliente se lleva en un cambio (EXCHANGE). */
+async function deductReplacementStock(tx, replacementItems) {
+  const stockMap = await expandLinesToStockMap(
+    tx,
+    replacementItems.map((item) => ({ product_id: item.product_id, qty: item.qty }))
+  )
+  const updatedProducts = await deductStockMap(tx, stockMap)
+  await ensureStockAlertsBatch(tx, updatedProducts)
+  return updatedProducts
+}
+
+/**
+ * Aplica el efecto de una devolución (REFUND) a la venta original: reduce las
+ * cantidades vendidas y recalcula total_returned / adjusted_total. En un cambio
+ * (EXCHANGE) la venta NO se toca (el cliente cambió mercadería por valor equivalente).
+ */
+async function applyRefundToSale(tx, currentReturn) {
+  for (const returnItem of currentReturn.return_items) {
+    const saleItem = await tx.saleItem.findUnique({ where: { id: returnItem.sale_item_id } })
+    if (!saleItem) {
+      console.warn(`[RETURN PROCESS] SaleItem ${returnItem.sale_item_id} no encontrado`)
+      continue
+    }
+    const newQty = Math.max(0, saleItem.qty - returnItem.qty_returned)
+    await tx.saleItem.update({ where: { id: returnItem.sale_item_id }, data: { qty: newQty } })
+  }
+  const sale = await tx.sale.findUnique({ where: { id: currentReturn.sale_id } })
+  if (sale) {
+    const newTotalReturned = Number(sale.total_returned || 0) + Number(currentReturn.total_refund)
+    const newAdjustedTotal = Number(sale.total) - newTotalReturned
+    await tx.sale.update({
+      where: { id: currentReturn.sale_id },
+      data: { total_returned: newTotalReturned, adjusted_total: newAdjustedTotal },
+    })
+  }
 }
 
 /** Resuelve sale_id (UUID o referencia ej. V-000001) al id interno de la venta */
@@ -83,6 +125,17 @@ exports.list = async (req, res, next) => {
             },
             sale_item: true
           }
+        },
+        replacement_items: {
+          include: {
+            product: {
+              select: {
+                id: true,
+                name: true,
+                barcode: true
+              }
+            }
+          }
         }
       },
       orderBy: { return_date: 'desc' },
@@ -135,6 +188,11 @@ exports.getById = async (req, res, next) => {
             product: true,
             sale_item: true
           }
+        },
+        replacement_items: {
+          include: {
+            product: true
+          }
         }
       }
     })
@@ -156,11 +214,18 @@ exports.getById = async (req, res, next) => {
  */
 exports.create = async (req, res, next) => {
   try {
-    const { sale_id: saleIdOrRef, reason, items, notes } = req.body
+    const { sale_id: saleIdOrRef, reason, items, notes, type, replacements } = req.body
+    const returnType = type === 'EXCHANGE' ? 'EXCHANGE' : 'REFUND'
 
     if (!saleIdOrRef || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({
         message: 'sale_id e items son requeridos. items debe ser un array no vacío.'
+      })
+    }
+
+    if (returnType === 'EXCHANGE' && (!Array.isArray(replacements) || replacements.length === 0)) {
+      return res.status(400).json({
+        message: 'Un cambio requiere al menos un producto de reemplazo (replacements).'
       })
     }
 
@@ -259,6 +324,56 @@ exports.create = async (req, res, next) => {
         })
       }
 
+      // 2b. Validar productos de reemplazo (solo cambios) y calcular la diferencia
+      const validatedReplacements = []
+      let replacementTotal = 0
+      if (returnType === 'EXCHANGE') {
+        const ids = replacements.map((r) => String(r.product_id))
+        const products = await tx.product.findMany({
+          where: { id: { in: ids } },
+          select: { id: true, name: true }
+        })
+        const productById = new Map(products.map((p) => [p.id, p]))
+        const availability = await getAvailabilityBatchWithKits(ids, tx)
+
+        for (const rep of replacements) {
+          const product_id = String(rep.product_id || '')
+          const qty = Number(rep.qty)
+          const unit_price = Number(rep.unit_price)
+
+          if (!product_id || !Number.isFinite(qty) || qty <= 0) {
+            const err = new Error('Cada reemplazo debe tener product_id y qty > 0')
+            err.status = 400
+            throw err
+          }
+          if (!Number.isFinite(unit_price) || unit_price < 0) {
+            const err = new Error('Cada reemplazo debe tener un precio unitario válido')
+            err.status = 400
+            throw err
+          }
+          const product = productById.get(product_id)
+          if (!product) {
+            const err = new Error(`Producto de reemplazo ${product_id} no encontrado`)
+            err.status = 400
+            throw err
+          }
+          const available = Number(availability[product_id]?.available ?? 0)
+          if (qty > available) {
+            const err = new Error(
+              `${product.name}: stock insuficiente para el cambio (disponible: ${available}, solicitado: ${qty})`
+            )
+            err.status = 400
+            throw err
+          }
+
+          const line_total = unit_price * qty
+          replacementTotal += line_total
+          validatedReplacements.push({ product_id, qty, unit_price, line_total })
+        }
+      }
+      // + = el cliente paga la diferencia; − = el depósito se la devuelve.
+      const priceDifference = returnType === 'EXCHANGE' ? replacementTotal - totalRefund : 0
+
       // 3. Obtener estado "Pendiente" para devoluciones
       const pendingStatus = await tx.returnStatus.findFirst({
         where: { name: 'Pendiente' }
@@ -288,9 +403,11 @@ exports.create = async (req, res, next) => {
       const returnRecord = await tx.return.create({
         data: {
           sale_id,
+          type: returnType,
           reason: reason || null,
           notes: notes || null,
           total_refund: totalRefund,
+          price_difference: priceDifference,
           items_count: validatedItems.length,
           status_id: pendingStatus.id,
           return_date: returnDate
@@ -303,6 +420,16 @@ exports.create = async (req, res, next) => {
           data: {
             return_id: returnRecord.id,
             ...item
+          }
+        })
+      }
+
+      // 5b. Crear los productos de reemplazo (cambios)
+      for (const rep of validatedReplacements) {
+        await tx.returnReplacementItem.create({
+          data: {
+            return_id: returnRecord.id,
+            ...rep
           }
         })
       }
@@ -330,6 +457,11 @@ exports.create = async (req, res, next) => {
           include: {
             product: true,
             sale_item: true
+          }
+        },
+        replacement_items: {
+          include: {
+            product: true
           }
         }
       }
@@ -371,6 +503,11 @@ exports.updateStatus = async (req, res, next) => {
             include: {
               product: true
             }
+          },
+          replacement_items: {
+            include: {
+              product: true
+            }
           }
         }
       })
@@ -408,106 +545,37 @@ exports.updateStatus = async (req, res, next) => {
       const isApproving = (newStatusName === 'Aprobada') && prevStatusName === 'Pendiente'
 
 
-      // CASO 1: Si viene de "Aprobada" a "Completada", actualizar venta pero NO restaurar stock (ya se restauró al aprobar)
+      const isExchange = currentReturn.type === 'EXCHANGE'
+
+      // CASO 1: "Aprobada" -> "Completada". REFUND actualiza la venta (el stock de
+      // devueltos ya se restauró al aprobar). EXCHANGE no toca la venta.
       if (isCompletingFromApproved) {
-        console.log(`[RETURN PROCESS] Return ${id}: ${prevStatusName} -> ${newStatusName}. Actualizando venta (sin restaurar stock, ya restaurado al aprobar)...`)
-
-        // 4a. Actualizar sale_items: reducir cantidades vendidas
-        for (const returnItem of currentReturn.return_items) {
-          const saleItem = await tx.saleItem.findUnique({
-            where: { id: returnItem.sale_item_id }
-          })
-
-          if (!saleItem) {
-            console.warn(`[RETURN PROCESS] SaleItem ${returnItem.sale_item_id} no encontrado`)
-            continue
-          }
-
-          const newQty = Math.max(0, saleItem.qty - returnItem.qty_returned)
-
-          await tx.saleItem.update({
-            where: { id: returnItem.sale_item_id },
-            data: { qty: newQty }
-          })
-
-          console.log(`[RETURN PROCESS] SaleItem ${returnItem.sale_item_id}: ${saleItem.qty} -> ${newQty} unidades`)
+        if (isExchange) {
+          console.log(`[EXCHANGE PROCESS] Return ${id}: ${prevStatusName} -> ${newStatusName}. Descontando stock de reemplazos (venta sin cambios)...`)
+        } else {
+          console.log(`[RETURN PROCESS] Return ${id}: ${prevStatusName} -> ${newStatusName}. Actualizando venta (sin restaurar stock, ya restaurado al aprobar)...`)
+          await applyRefundToSale(tx, currentReturn)
         }
-
-        // 4b. Actualizar sale: incrementar total_returned y recalcular adjusted_total
-        const sale = await tx.sale.findUnique({
-          where: { id: currentReturn.sale_id }
-        })
-
-        if (sale) {
-          const newTotalReturned = Number(sale.total_returned || 0) + Number(currentReturn.total_refund)
-          const newAdjustedTotal = Number(sale.total) - newTotalReturned
-
-          await tx.sale.update({
-            where: { id: currentReturn.sale_id },
-            data: {
-              total_returned: newTotalReturned,
-              adjusted_total: newAdjustedTotal
-            }
-          })
-
-          console.log(`[RETURN PROCESS] Sale ${currentReturn.sale_id}: total_returned ${sale.total_returned} -> ${newTotalReturned}, adjusted_total ${sale.adjusted_total} -> ${newAdjustedTotal}`)
-        }
-
-        // NO restaurar stock porque ya se restauró al aprobar
-        console.log(`[RETURN PROCESS] Stock NO restaurado (ya se restauró al aprobar)`)
       }
-      // CASO 2: Si se completa directamente desde "Pendiente", procesar venta y restaurar stock
+      // CASO 2: "Pendiente" -> "Completada" directo. REFUND ajusta la venta;
+      // ambos tipos restauran el stock de los productos devueltos.
       else if (isCompletingFromPending) {
-        console.log(`[RETURN PROCESS] Return ${id}: ${prevStatusName} -> ${newStatusName}. Procesando devolución...`)
-
-        // 4a. Actualizar sale_items: reducir cantidades vendidas
-        for (const returnItem of currentReturn.return_items) {
-          const saleItem = await tx.saleItem.findUnique({
-            where: { id: returnItem.sale_item_id }
-          })
-
-          if (!saleItem) {
-            console.warn(`[RETURN PROCESS] SaleItem ${returnItem.sale_item_id} no encontrado`)
-            continue
-          }
-
-          const newQty = Math.max(0, saleItem.qty - returnItem.qty_returned)
-
-          await tx.saleItem.update({
-            where: { id: returnItem.sale_item_id },
-            data: { qty: newQty }
-          })
-
-          console.log(`[RETURN PROCESS] SaleItem ${returnItem.sale_item_id}: ${saleItem.qty} -> ${newQty} unidades`)
+        if (isExchange) {
+          console.log(`[EXCHANGE PROCESS] Return ${id}: ${prevStatusName} -> ${newStatusName}. Cambio directo (venta sin cambios)...`)
+        } else {
+          console.log(`[RETURN PROCESS] Return ${id}: ${prevStatusName} -> ${newStatusName}. Procesando devolución...`)
+          await applyRefundToSale(tx, currentReturn)
         }
 
-        // 4b. Actualizar sale: incrementar total_returned y recalcular adjusted_total
-        const sale = await tx.sale.findUnique({
-          where: { id: currentReturn.sale_id }
-        })
+        console.log(`[RETURN STOCK RESTORE] Return ${id}: restaurando stock de devueltos al completar...`)
+        const restored = await restoreReturnItemsStock(tx, currentReturn.return_items)
+        restored.forEach((p) => console.log(`[RETURN STOCK RESTORE] ${p.name}: stock = ${p.stock}`))
+      }
 
-        if (sale) {
-          const newTotalReturned = Number(sale.total_returned || 0) + Number(currentReturn.total_refund)
-          const newAdjustedTotal = Number(sale.total) - newTotalReturned
-
-          await tx.sale.update({
-            where: { id: currentReturn.sale_id },
-            data: {
-              total_returned: newTotalReturned,
-              adjusted_total: newAdjustedTotal
-            }
-          })
-
-          console.log(`[RETURN PROCESS] Sale ${currentReturn.sale_id}: total_returned ${sale.total_returned} -> ${newTotalReturned}, adjusted_total ${sale.adjusted_total} -> ${newAdjustedTotal}`)
-        }
-
-        // 4c. Restaurar stock de productos (solo cuando se completa desde Pendiente)
-        console.log(`[RETURN STOCK RESTORE] Return ${id}: ${prevStatusName} -> ${newStatusName}. Restaurando stock al completar...`)
-        const updatedProducts = await restoreReturnItemsStock(tx, currentReturn.return_items)
-        updatedProducts.forEach((p) => {
-          console.log(`[RETURN STOCK RESTORE] ${p.name}: stock restaurado = ${p.stock}`)
-        })
-        console.log(`[RETURN STOCK RESTORE] Alertas de stock actualizadas`)
+      // Cambios: al completar, descontar el stock de los productos de reemplazo.
+      if (isExchange && (isCompletingFromApproved || isCompletingFromPending)) {
+        const deducted = await deductReplacementStock(tx, currentReturn.replacement_items)
+        deducted.forEach((p) => console.log(`[EXCHANGE STOCK] ${p.name}: stock = ${p.stock}`))
       }
 
       // CASO 3: Si se aprueba desde "Pendiente", restaurar stock solo si restore_stock es true
@@ -551,14 +619,20 @@ exports.updateStatus = async (req, res, next) => {
             include: {
               product: true
             }
+          },
+          replacement_items: {
+            include: {
+              product: true
+            }
           }
         }
       })
 
       return {
         ...updated,
-        _saleAdjustment: (isCompletingFromPending || isCompletingFromApproved) ? 'sale_updated' : 'none',
+        _saleAdjustment: (!isExchange && (isCompletingFromPending || isCompletingFromApproved)) ? 'sale_updated' : 'none',
         _stockAdjustment: (isCompletingFromPending || (isApproving && shouldRestoreStock)) ? 'stock_restored' : 'none',
+        _replacementStock: (isExchange && (isCompletingFromPending || isCompletingFromApproved)) ? 'stock_deducted' : 'none',
         _transition: `${prevStatusName} -> ${newStatusName}`
       }
     }, {
