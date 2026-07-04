@@ -30,22 +30,10 @@ router.get('/report/pdf', Auth, hasPermission('merchandise.reports'), IncomingMe
  * PATCH /api/incoming-merchandise/:id/payment
  * Actualizar datos de pago del registro
  */
-router.patch(
-  '/:id/payment',
-  Auth,
-  hasPermission(
-    'merchandise.mark_paid',
-    'merchandise.details',
-    'products.register_incoming'
-  ),
-  IncomingMerchandise.updatePayment
-)
+// Solo el permiso dedicado autoriza tocar pagos: ver detalles NO implica poder abonar.
+const paymentEditors = hasPermission('merchandise.mark_paid')
 
-const paymentEditors = hasPermission(
-  'merchandise.mark_paid',
-  'merchandise.details',
-  'products.register_incoming'
-)
+router.patch('/:id/payment', Auth, paymentEditors, IncomingMerchandise.updatePayment)
 
 /**
  * POST /api/incoming-merchandise/:id/payments

@@ -152,6 +152,7 @@ async function main() {
     { code: 'alerts.manage', name: 'Gestionar alertas', description: 'Puede resolver y reasignar alertas' },
     { code: 'analytics.view', name: 'Ver analítica', description: 'Puede ver paneles de analítica' },
     { code: 'reports.view', name: 'Ver reportes', description: 'Puede ver y generar reportes' },
+    { code: 'scanner.view', name: 'Usar escáner', description: 'Puede usar el escáner de códigos de barras' },
 
     // Promociones
     { code: 'promotions.view', name: 'Ver promociones', description: 'Puede ver promociones' },
@@ -159,7 +160,6 @@ async function main() {
 
     // Mercancía (Registro de ingresos)
     { code: 'merchandise.view', name: 'Ver registros de mercancía', description: 'Puede ver el historial de ingresos de mercancía' },
-    { code: 'merchandise.register', name: 'Registrar mercancía', description: 'Puede registrar nuevos ingresos de mercancía' },
     { code: 'merchandise.details', name: 'Ver detalles de mercancía', description: 'Puede ver detalles completos de registros de mercancía' },
     { code: 'merchandise.reports', name: 'Generar reportes de mercancía', description: 'Puede generar reportes de ingresos de mercancía' },
     {
@@ -187,15 +187,17 @@ async function main() {
   }
   console.log('Permisos creados')
 
-  // Migrar permisos legacy suppliers.* → contacts.suppliers.* (roles que ya los tenían)
-  const suppliersToContactsSuppliers = [
+  // Migrar permisos legacy a su código vigente (roles que ya los tenían)
+  const legacyPermissionMigrations = [
     ['suppliers.view', 'contacts.suppliers.view'],
     ['suppliers.create', 'contacts.suppliers.create'],
     ['suppliers.edit', 'contacts.suppliers.edit'],
     ['suppliers.delete', 'contacts.suppliers.delete'],
     ['suppliers.import', 'contacts.suppliers.import'],
+    // merchandise.register era un duplicado muerto: la UI y las rutas usan products.register_incoming
+    ['merchandise.register', 'products.register_incoming'],
   ]
-  for (const [oldCode, newCode] of suppliersToContactsSuppliers) {
+  for (const [oldCode, newCode] of legacyPermissionMigrations) {
     const oldP = await prisma.permission.findUnique({ where: { code: oldCode } })
     const newP = await prisma.permission.findUnique({ where: { code: newCode } })
     if (!oldP || !newP) continue
@@ -248,20 +250,6 @@ async function main() {
       skipDuplicates: true,
     })
     console.log(`  ${adminPermissions.length} permisos asignados al rol 'admin'`)
-  }
-
-  // Quién tenía merchandise.details recibe también merchandise.mark_paid (misma capacidad operativa)
-  const detailsPerm = await prisma.permission.findUnique({ where: { code: 'merchandise.details' } })
-  const markPaidPerm = await prisma.permission.findUnique({ where: { code: 'merchandise.mark_paid' } })
-  if (detailsPerm && markPaidPerm) {
-    const withDetails = await prisma.rolePermission.findMany({ where: { permission_id: detailsPerm.id } })
-    if (withDetails.length) {
-      await prisma.rolePermission.createMany({
-        data: withDetails.map((rp) => ({ role_id: rp.role_id, permission_id: markPaidPerm.id })),
-        skipDuplicates: true,
-      })
-      console.log(`  merchandise.mark_paid replicado a roles que tenían merchandise.details (${withDetails.length} filas)`)
-    }
   }
 
   // ========================================
