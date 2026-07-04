@@ -10,14 +10,19 @@
 
 const jwt_simple = require('jwt-simple')
 const moment = require('moment')
-const secret = process.env.JWT_SECRET || 'clave_secreta'
+const { secret, ACCESS_COOKIE } = require('../config/security')
 
 exports.Auth = function (req, res, next) {
-  if (!req.headers.authorization) {
-    return res.status(401).send({ message: 'La petición no posee la cabecera de Autenticación' })
-  }
+  // Cookie httpOnly primero; fallback al header Bearer (curl/tests/herramientas).
+  const cookieToken = req.cookies && req.cookies[ACCESS_COOKIE]
+  const headerToken = req.headers.authorization
+    ? req.headers.authorization.replace(/['"]+/g, '').replace('Bearer ', '')
+    : null
+  const token = cookieToken || headerToken
 
-  const token = req.headers.authorization.replace(/['"]+/g, '').replace('Bearer ', '')
+  if (!token) {
+    return res.status(401).send({ message: 'No autenticado' })
+  }
 
   try {
     const payload = jwt_simple.decode(token, secret)

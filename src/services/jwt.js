@@ -10,7 +10,7 @@
 
 const jwt_simple = require('jwt-simple')
 const moment = require('moment')
-const secret = process.env.JWT_SECRET || 'clave_secreta'
+const { secret, ACCESS_TOKEN_MINUTES } = require('../config/security')
 
 exports.crearToken = function (usuario) {
   // prefer a full role object when available, otherwise fallback to role_id/role_name
@@ -39,7 +39,7 @@ exports.crearToken = function (usuario) {
     role: roleObj,
     permissions,
     iat: moment().unix(),
-    exp: moment().add(7, 'days').unix(),
+    exp: moment().add(ACCESS_TOKEN_MINUTES, 'minutes').unix(),
   }
   return jwt_simple.encode(payload, secret)
 }
