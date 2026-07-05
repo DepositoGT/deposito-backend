@@ -36,6 +36,18 @@ function normalizeImportOptions(raw) {
     }
 }
 
+const TRUE_CELL_VALUES = new Set(['si', 'sí', 'true', '1', 'yes', 'x'])
+const FALSE_CELL_VALUES = new Set(['no', 'false', '0'])
+
+/** Celda booleana en español/inglés; vacía → default. */
+function parseBooleanCell(raw, defaultValue) {
+    if (raw === undefined || raw === null || raw === '') return defaultValue
+    const v = String(raw).trim().toLowerCase()
+    if (TRUE_CELL_VALUES.has(v)) return true
+    if (FALSE_CELL_VALUES.has(v)) return false
+    return defaultValue
+}
+
 function mergeResolutionHints(invalidRows) {
     const catMap = new Map()
     const supMap = new Map()
@@ -107,7 +119,9 @@ function validateRow(row, i, categoriesMap, suppliersMap, existingBarcodes, batc
         'brand': ['marca', 'brand'],
         'size': ['tamaño', 'size', 'tamano'],
         'barcode': ['codigo_barras', 'barcode', 'codigo'],
-        'description': ['descripcion', 'description']
+        'description': ['descripcion', 'description'],
+        'available_for_sale': ['disponible_venta', 'disponible_para_venta', 'available_for_sale'],
+        'tracks_expiry': ['controla_caducidad', 'controla_lotes', 'tracks_expiry'],
     }
 
     // Normalize row keys (lowercase, trim) and resolve aliases
@@ -251,6 +265,12 @@ function validateRow(row, i, categoriesMap, suppliersMap, existingBarcodes, batc
     if (descripcion) {
         data.description = descripcion
     }
+
+    // Optional: disponible_venta (default true; acepta si/no, true/false, 1/0)
+    data.available_for_sale = parseBooleanCell(normalizedRow.available_for_sale, true)
+
+    // Optional: controla_caducidad (default false; exige fecha de caducidad en ingresos futuros)
+    data.tracks_expiry = parseBooleanCell(normalizedRow.tracks_expiry, false)
 
     // Default status_id to 1 (active)
     data.status_id = 1
@@ -453,7 +473,9 @@ function generateTemplate() {
         'marca',
         'tamaño',
         'codigo_barras',
-        'descripcion'
+        'descripcion',
+        'disponible_venta',
+        'controla_caducidad'
     ]
 
     const example = [
@@ -467,7 +489,9 @@ function generateTemplate() {
         'Marca Ejemplo',
         '500ml',
         '7891234567890',
-        'Descripción del producto'
+        'Descripción del producto',
+        'si',
+        'no'
     ]
 
     const ws = XLSX.utils.aoa_to_sheet([headers, example])
@@ -511,7 +535,9 @@ async function generateTemplateWithCatalogs() {
         'marca',
         'tamaño',
         'codigo_barras',
-        'descripcion'
+        'descripcion',
+        'disponible_venta',
+        'controla_caducidad'
     ]
 
     const example = [
@@ -525,7 +551,9 @@ async function generateTemplateWithCatalogs() {
         'Marca Ejemplo',
         '500ml',
         '7891234567890',
-        'Descripción del producto'
+        'Descripción del producto',
+        'si',
+        'no'
     ]
 
     const ws = XLSX.utils.aoa_to_sheet([headers, example])

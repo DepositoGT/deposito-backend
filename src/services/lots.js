@@ -13,7 +13,17 @@
 // de lotes nunca debe abortar una venta, por eso las funciones de escritura
 // atrapan y solo loguean. // ponytail: lotes advisory, se reconcilian por reporte
 
+const crypto = require('crypto')
 const { prisma } = require('../models/prisma')
+
+/** Código de lote legible cuando el usuario no ingresa uno: L-YYMMDD-XXXX (sufijo aleatorio). */
+function generateLotCode(date = new Date()) {
+  const y = String(date.getFullYear()).slice(2)
+  const m = String(date.getMonth() + 1).padStart(2, '0')
+  const d = String(date.getDate()).padStart(2, '0')
+  const suffix = crypto.randomBytes(2).toString('hex').toUpperCase()
+  return `L-${y}${m}${d}-${suffix}`
+}
 
 /**
  * Reparte una cantidad a consumir entre lotes ya ordenados FEFO.
@@ -130,4 +140,4 @@ async function restoreLotsFEFO(tx, stockMap) {
   }
 }
 
-module.exports = { planConsume, planRestore, fefoSort, consumeLotsFEFO, restoreLotsFEFO }
+module.exports = { planConsume, planRestore, fefoSort, consumeLotsFEFO, restoreLotsFEFO, generateLotCode }

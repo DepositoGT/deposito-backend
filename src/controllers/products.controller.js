@@ -27,6 +27,7 @@ const {
   BOM_INCLUDE,
   getAvailabilityBatchWithKits,
 } = require('../services/bomStock')
+const { generateLotCode } = require('../services/lots')
 
 // Inicializar cliente de Supabase con service role key (solo para backend)
 const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL
@@ -1185,13 +1186,15 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
         })
 
         // Lote con caducidad (trazabilidad). Solo si el item trae datos de lote.
-        const lotCode = item.lot_code != null ? String(item.lot_code).trim().slice(0, 60) : ''
+        const lotCodeInput = item.lot_code != null ? String(item.lot_code).trim().slice(0, 60) : ''
         const hasExpiry = item.expiry_date != null && item.expiry_date !== ''
-        if (hasExpiry || lotCode) {
+        if (hasExpiry || lotCodeInput) {
+          // Sin código de lote ingresado: se genera uno legible automáticamente.
+          const lotCode = lotCodeInput || generateLotCode(dateAsUtcWithGtClock)
           await tx.productLot.create({
             data: {
               product_id: product.id,
-              lot_code: lotCode || null,
+              lot_code: lotCode,
               expiry_date: hasExpiry ? new Date(item.expiry_date) : null,
               qty_received: quantity,
               qty_remaining: quantity,
