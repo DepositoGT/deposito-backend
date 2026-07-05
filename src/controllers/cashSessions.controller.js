@@ -71,6 +71,24 @@ function checkCanCloseThisSession (req, session) {
   }
 }
 
+/**
+ * Resuelve la caja a usar: 1) la indicada explícitamente, 2) la asignada al
+ * usuario (si está activa), 3) la default.
+ */
+async function resolveRegister (client, explicitId, userId) {
+  if (explicitId) {
+    return client.cashRegister.findFirst({ where: { id: String(explicitId), active: true } })
+  }
+  if (userId) {
+    const user = await client.user.findUnique({
+      where: { id: String(userId) },
+      select: { cashRegister: { select: { id: true, name: true, code: true, is_default: true, active: true } } }
+    })
+    if (user?.cashRegister?.active) return user.cashRegister
+  }
+  return client.cashRegister.findFirst({ where: { is_default: true, active: true } })
+}
+
 const sessionInclude = {
   openedBy: { select: { id: true, name: true, email: true } },
   closedBy: { select: { id: true, name: true, email: true } },
@@ -78,8 +96,20 @@ const sessionInclude = {
   cashClosure: { select: { id: true, closure_number: true, status: true } }
 }
 
+/** Gestionar cajas (crear/editar): admin o settings.manage. */
+function checkCanManageRegisters (req) {
+  const user = req.user
+  if (!user) return { allowed: false, status: 401, message: 'No autenticado' }
+  if (isAdminUser(user)) return { allowed: true }
+  const perms = getPerms(req)
+  return perms.includes('settings.manage')
+    ? { allowed: true }
+    : { allowed: false, status: 403, message: 'No tiene permiso para gestionar cajas' }
+}
+
 /**
  * GET /api/cash-sessions/registers
+ * Query: include_inactive=1 (solo gestores) para el panel de administración.
  */
 exports.listRegisters = async (req, res, next) => {
   try {
@@ -87,12 +117,190 @@ exports.listRegisters = async (req, res, next) => {
     if (!perm.allowed) {
       return res.status(perm.status || 403).json({ message: perm.message || 'No autorizado' })
     }
+    const wantsAll = String(req.query.include_inactive || '') === '1'
+    const includeInactive = wantsAll && checkCanManageRegisters(req).allowed
     const rows = await prisma.cashRegister.findMany({
-      where: { active: true },
-      orderBy: [{ is_default: 'desc' }, { name: 'asc' }]
+      where: includeInactive ? {} : { active: true },
+      orderBy: [{ is_default: 'desc' }, { name: 'asc' }],
+      include: {
+        assigned_users: { select: { id: true, name: true } },
+        sessions: {
+          where: { status: 'OPEN' },
+          take: 1,
+          select: {
+            id: true,
+            opened_at: true,
+            opening_float: true,
+            opened_by_id: true,
+            openedBy: { select: { id: true, name: true } },
+          },
+        },
+      }
     })
-    res.json(rows)
+    res.json(rows.map(({ sessions, ...r }) => ({
+      ...r,
+      has_open_session: sessions.length > 0,
+      open_session: sessions[0]
+        ? {
+            id: sessions[0].id,
+            opened_at: sessions[0].opened_at,
+            opening_float: sessions[0].opening_float,
+            opened_by_id: sessions[0].opened_by_id,
+            opened_by_name: sessions[0].openedBy?.name ?? null,
+          }
+        : null,
+    })))
   } catch (e) {
+    next(e)
+  }
+}
+
+/**
+ * POST /api/cash-sessions/registers
+ * Body: { name, code? } — code se genera del nombre si no viene.
+ */
+exports.createRegister = async (req, res, next) => {
+  try {
+    const perm = checkCanManageRegisters(req)
+    if (!perm.allowed) {
+      return res.status(perm.status || 403).json({ message: perm.message || 'No autorizado' })
+    }
+
+    const name = String(req.body.name || '').trim().slice(0, 120)
+    if (!name) return res.status(400).json({ message: 'El nombre es requerido' })
+
+    let code = String(req.body.code || '').trim().slice(0, 40)
+    if (!code) {
+      code = name.normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+        .toUpperCase().replace(/[^A-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'CAJA'
+    }
+
+    const existing = await prisma.cashRegister.findUnique({ where: { code } })
+    if (existing) {
+      return res.status(409).json({ message: `Ya existe una caja con el código "${code}"` })
+    }
+
+    const created = await prisma.cashRegister.create({
+      data: { name, code, is_default: false, active: true }
+    })
+    res.status(201).json(created)
+  } catch (e) {
+    next(e)
+  }
+}
+
+/**
+ * PUT /api/cash-sessions/registers/:id/users
+ * Body: { user_ids: string[] } — deja asignados a esta caja exactamente esos
+ * usuarios (quita a los que ya no estén en la lista).
+ */
+exports.setRegisterUsers = async (req, res, next) => {
+  try {
+    const perm = checkCanManageRegisters(req)
+    if (!perm.allowed) {
+      return res.status(perm.status || 403).json({ message: perm.message || 'No autorizado' })
+    }
+
+    const { id } = req.params
+    const register = await prisma.cashRegister.findUnique({ where: { id } })
+    if (!register) return res.status(404).json({ message: 'Caja no encontrada' })
+    if (!register.active) {
+      return res.status(400).json({ message: 'No se pueden asignar usuarios a una caja inactiva' })
+    }
+
+    const rawIds = Array.isArray(req.body.user_ids) ? req.body.user_ids : null
+    if (!rawIds) return res.status(400).json({ message: 'user_ids debe ser un arreglo' })
+    const userIds = [...new Set(rawIds.map(String))]
+
+    if (userIds.length > 0) {
+      const found = await prisma.user.count({ where: { id: { in: userIds } } })
+      if (found !== userIds.length) {
+        return res.status(400).json({ message: 'Uno o más usuarios no existen' })
+      }
+    }
+
+    await prisma.$transaction([
+      // Quitar la caja a quienes la tenían y ya no están en la lista
+      prisma.user.updateMany({
+        where: {
+          cash_register_id: id,
+          ...(userIds.length > 0 ? { id: { notIn: userIds } } : {})
+        },
+        data: { cash_register_id: null }
+      }),
+      ...(userIds.length > 0
+        ? [prisma.user.updateMany({
+            where: { id: { in: userIds } },
+            data: { cash_register_id: id }
+          })]
+        : [])
+    ])
+
+    const assigned = await prisma.user.findMany({
+      where: { cash_register_id: id },
+      select: { id: true, name: true },
+      orderBy: { name: 'asc' }
+    })
+    res.json({ ...register, assigned_users: assigned })
+  } catch (e) {
+    next(e)
+  }
+}
+
+/**
+ * PATCH /api/cash-sessions/registers/:id
+ * Body: { name?, active?, is_default? } — is_default:true desmarca las demás.
+ */
+exports.updateRegister = async (req, res, next) => {
+  try {
+    const perm = checkCanManageRegisters(req)
+    if (!perm.allowed) {
+      return res.status(perm.status || 403).json({ message: perm.message || 'No autorizado' })
+    }
+
+    const { id } = req.params
+    const register = await prisma.cashRegister.findUnique({ where: { id } })
+    if (!register) return res.status(404).json({ message: 'Caja no encontrada' })
+
+    const data = {}
+    if (req.body.name !== undefined) {
+      const name = String(req.body.name || '').trim().slice(0, 120)
+      if (!name) return res.status(400).json({ message: 'El nombre no puede estar vacío' })
+      data.name = name
+    }
+    if (req.body.active !== undefined) {
+      const active = Boolean(req.body.active)
+      if (!active) {
+        if (register.is_default) {
+          return res.status(400).json({ message: 'No se puede desactivar la caja predeterminada. Marque otra como predeterminada primero.' })
+        }
+        const openSession = await prisma.cashRegisterSession.findFirst({
+          where: { cash_register_id: id, status: 'OPEN' }
+        })
+        if (openSession) {
+          return res.status(409).json({ message: 'La caja tiene un turno abierto. Ciérrelo antes de desactivarla.' })
+        }
+      }
+      data.active = active
+    }
+
+    const wantsDefault = req.body.is_default === true && !register.is_default
+    const updated = await prisma.$transaction(async (tx) => {
+      if (wantsDefault) {
+        if (data.active === false) throw Object.assign(new Error('BAD_DEFAULT'), { status: 400 })
+        if (!register.active && data.active !== true) {
+          throw Object.assign(new Error('BAD_DEFAULT'), { status: 400 })
+        }
+        await tx.cashRegister.updateMany({ where: { is_default: true }, data: { is_default: false } })
+        data.is_default = true
+      }
+      return tx.cashRegister.update({ where: { id }, data })
+    })
+    res.json(updated)
+  } catch (e) {
+    if (e.message === 'BAD_DEFAULT') {
+      return res.status(400).json({ message: 'La caja predeterminada debe estar activa' })
+    }
     next(e)
   }
 }
@@ -109,16 +317,7 @@ exports.getCurrent = async (req, res, next) => {
     }
 
     const registerId = req.query.cash_register_id || req.query.cashRegisterId || null
-    let register
-    if (registerId) {
-      register = await prisma.cashRegister.findFirst({
-        where: { id: String(registerId), active: true }
-      })
-    } else {
-      register = await prisma.cashRegister.findFirst({
-        where: { is_default: true, active: true }
-      })
-    }
+    const register = await resolveRegister(prisma, registerId, req.user?.sub)
 
     if (!register) {
       return res.status(503).json({ message: 'No hay caja configurada. Ejecute migraciones y seed.' })
@@ -176,16 +375,7 @@ exports.openSession = async (req, res, next) => {
     const bodyRegisterId = req.body.cash_register_id || req.body.cashRegisterId || null
 
     const created = await prisma.$transaction(async (tx) => {
-      let register
-      if (bodyRegisterId) {
-        register = await tx.cashRegister.findFirst({
-          where: { id: String(bodyRegisterId), active: true }
-        })
-      } else {
-        register = await tx.cashRegister.findFirst({
-          where: { is_default: true, active: true }
-        })
-      }
+      const register = await resolveRegister(tx, bodyRegisterId, uid)
       if (!register) {
         throw new Error('NO_REGISTER')
       }
@@ -244,16 +434,7 @@ exports.closeSession = async (req, res, next) => {
     const bodyRegisterId = req.body.cash_register_id || req.body.cashRegisterId || null
 
     const closed = await prisma.$transaction(async (tx) => {
-      let register
-      if (bodyRegisterId) {
-        register = await tx.cashRegister.findFirst({
-          where: { id: String(bodyRegisterId), active: true }
-        })
-      } else {
-        register = await tx.cashRegister.findFirst({
-          where: { is_default: true, active: true }
-        })
-      }
+      const register = await resolveRegister(tx, bodyRegisterId, uid)
       if (!register) {
         throw new Error('NO_REGISTER')
       }

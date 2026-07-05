@@ -13,6 +13,7 @@ const { Prisma } = require('@prisma/client')
 const { DateTime } = require('luxon')
 const { getTimezone } = require('../utils/getTimezone')
 const { ensureStockAlertsBatch } = require('../services/stockAlerts')
+const { consumeLotsFEFO, restoreLotsFEFO } = require('../services/lots')
 const { salesOperationLimiter } = require('../utils/concurrencyLimiter')
 const {
   assertPartyAction,
@@ -664,6 +665,7 @@ exports.create = async (req, res, next) => {
         resolvedItems.map((it) => ({ product_id: it.product_id, qty: it.qty }))
       )
       const updatedProducts = await deductStockMap(tx, stockMap)
+      await consumeLotsFEFO(tx, stockMap) // advisory: descuenta lotes por caducidad
       await ensureStockAlertsBatch(tx, updatedProducts)
 
       // 3) Guardar promociones con descuento efectivo e incrementar solo esos códigos
@@ -768,6 +770,7 @@ exports.updateStatus = async (req, res, next) => {
             current.sale_items.map((si) => ({ product_id: si.product_id, qty: si.qty }))
           )
           const updatedProducts = await deductStockMap(tx, stockMap)
+          await consumeLotsFEFO(tx, stockMap) // advisory: descuenta lotes por caducidad
 
           updatedProducts.forEach(p => {
             console.log(`[STOCK ADJUSTMENT] ${p.name}: nuevo stock = ${p.stock}`)
@@ -787,6 +790,7 @@ exports.updateStatus = async (req, res, next) => {
             current.sale_items.map((si) => ({ product_id: si.product_id, qty: si.qty }))
           )
           const updatedProducts = await restoreStockMap(tx, stockMap)
+          await restoreLotsFEFO(tx, stockMap) // advisory: devuelve cantidad a los lotes
 
           updatedProducts.forEach(p => {
             console.log(`[STOCK REVERT] ${p.name}: stock restaurado = ${p.stock}`)
