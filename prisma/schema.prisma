@@ -347,6 +347,9 @@ model User {
   /// Sesiones de caja (apertura)
   cash_sessions_opened        CashRegisterSession[] @relation("CashSessionOpenedBy")
   cash_sessions_closed        CashRegisterSession[] @relation("CashSessionClosedBy")
+  /// Caja asignada para POS (opcional; si es null usa la caja default)
+  cash_register_id            String?               @db.Uuid
+  cashRegister                CashRegister?         @relation("UserAssignedRegister", fields: [cash_register_id], references: [id], onDelete: SetNull)
   inventory_counts_created              InventoryCountSession[] @relation("InventoryCountCreatedBy")
   inventory_counts_approved             InventoryCountSession[] @relation("InventoryCountApprovedBy")
   inventory_counts_first_approved       InventoryCountSession[] @relation("InventoryCountFirstApprovedBy")
@@ -765,6 +768,8 @@ model CashRegister {
   updated_at  DateTime @updatedAt
 
   sessions CashRegisterSession[]
+  /// Usuarios con esta caja asignada para POS
+  assigned_users User[] @relation("UserAssignedRegister")
 
   @@map("cash_registers")
 }

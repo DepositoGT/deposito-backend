@@ -10,7 +10,7 @@
 
 const { Router } = require('express')
 const { Auth, hasPermission } = require('../middlewares/autenticacion')
-const { listRegisters, getCurrent, openSession, closeSession } = require('../controllers/cashSessions.controller')
+const { listRegisters, getCurrent, openSession, closeSession, createRegister, updateRegister } = require('../controllers/cashSessions.controller')
 
 const router = Router()
 
@@ -23,6 +23,8 @@ const canCashSessionsApi = hasPermission(
 )
 
 router.get('/registers', Auth, canCashSessionsApi, listRegisters)
+router.post('/registers', Auth, hasPermission('settings.manage'), createRegister)
+router.patch('/registers/:id', Auth, hasPermission('settings.manage'), updateRegister)
 router.get('/current', Auth, canCashSessionsApi, getCurrent)
 router.post('/open', Auth, canCashSessionsApi, openSession)
 router.post('/close', Auth, canCashSessionsApi, closeSession)

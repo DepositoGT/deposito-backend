@@ -150,11 +150,12 @@ let lastLotAlertSyncAt = 0
  * si el producto deja de calificar. Advisory: nunca lanza, y se auto-throttlea
  * porque puede dispararse en cada GET /alerts (no hay cron en serverless).
  * @param {object} tx cliente Prisma
+ * @param {{ force?: boolean }} [opts] force ignora el throttle (ej. al registrar mercancía con lotes)
  */
-async function syncLotExpiryAlerts(tx) {
+async function syncLotExpiryAlerts(tx, opts = {}) {
   const client = tx || prisma
   const now = Date.now()
-  if (now - lastLotAlertSyncAt < LOT_ALERT_SYNC_THROTTLE_MS) return
+  if (!opts.force && now - lastLotAlertSyncAt < LOT_ALERT_SYNC_THROTTLE_MS) return
   lastLotAlertSyncAt = now
 
   try {

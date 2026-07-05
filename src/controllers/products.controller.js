@@ -27,7 +27,7 @@ const {
   BOM_INCLUDE,
   getAvailabilityBatchWithKits,
 } = require('../services/bomStock')
-const { generateLotCode } = require('../services/lots')
+const { generateLotCode, syncLotExpiryAlerts } = require('../services/lots')
 
 // Inicializar cliente de Supabase con service role key (solo para backend)
 const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL
@@ -1146,6 +1146,10 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
       const updatedProducts = []
       const purchaseLogs = []
       let totalPurchaseValue = 0
+      // Código compartido para todos los productos de esta entrada que no traigan su propio lot_code
+      // (llegaron en la misma entrega/factura). ponytail: un solo código por llamada, no por item.
+      const autoLotCode = generateLotCode(dateAsUtcWithGtClock)
+      let lotsCreated = 0
 
       for (const item of items) {
         const product = products.find(p => p.id === item.product_id)
@@ -1189,8 +1193,8 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
         const lotCodeInput = item.lot_code != null ? String(item.lot_code).trim().slice(0, 60) : ''
         const hasExpiry = item.expiry_date != null && item.expiry_date !== ''
         if (hasExpiry || lotCodeInput) {
-          // Sin código de lote ingresado: se genera uno legible automáticamente.
-          const lotCode = lotCodeInput || generateLotCode(dateAsUtcWithGtClock)
+          // Sin código de lote ingresado: comparte el auto-generado de esta entrada.
+          const lotCode = lotCodeInput || autoLotCode
           await tx.productLot.create({
             data: {
               product_id: product.id,
@@ -1204,6 +1208,7 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
               received_at: dateAsUtcWithGtClock,
             }
           })
+          lotsCreated++
         }
 
         // Update stock alerts
@@ -1226,11 +1231,18 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
         updatedProducts,
         purchaseLogs,
         totalPurchaseValue,
+        lotsCreated,
       }
     }, {
       maxWait: 10000, // 10 seconds
       timeout: 30000, // 30 seconds
     })
+
+    // Si la entrada creó lotes, sincronizar alertas de vencimiento de inmediato
+    // (sin esperar el throttle de 10 min del GET /alerts). Advisory: no bloquea la respuesta.
+    if (result.lotsCreated > 0) {
+      await syncLotExpiryAlerts(prisma, { force: true })
+    }
 
     res.json(result)
   } catch (e) {
