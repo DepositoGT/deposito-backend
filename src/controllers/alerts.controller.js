@@ -9,13 +9,15 @@
  */
 
 const { prisma } = require('../models/prisma')
+const { syncLotExpiryAlerts } = require('../services/lots')
 
 exports.list = async (req, res, next) => {
   try {
     const { DateTime } = require('luxon')
+    await syncLotExpiryAlerts(prisma) // advisory, autothrottled; no hay cron en serverless
     // By default only show unresolved alerts (resolved = 0), unless ?all=true
     const showAll = req.query.all === 'true'
-    
+
     const alerts = await prisma.alert.findMany({
       where: showAll ? {} : { resolved: 0 },
       include: { 

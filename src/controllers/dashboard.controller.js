@@ -10,6 +10,7 @@
 
 const { DateTime } = require('luxon');
 const { prisma } = require('../models/prisma');
+const { syncLotExpiryAlerts } = require('../services/lots');
 
 /**
  * GET /api/dashboard/stats
@@ -64,6 +65,7 @@ exports.getStats = async (req, res) => {
     }, 0);
 
     // 4. Alertas críticas (alertas activas no resueltas con prioridad "Crítica")
+    await syncLotExpiryAlerts(prisma); // advisory, autothrottled; no hay cron en serverless
     const priorityCritica = await prisma.alertPriority.findFirst({
       where: { name: { in: ['Crítica', 'Critica'] } }
     });
