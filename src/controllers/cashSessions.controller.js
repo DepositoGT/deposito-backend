@@ -168,6 +168,64 @@ exports.createRegister = async (req, res, next) => {
 }
 
 /**
+ * PUT /api/cash-sessions/registers/:id/users
+ * Body: { user_ids: string[] } — deja asignados a esta caja exactamente esos
+ * usuarios (quita a los que ya no estén en la lista).
+ */
+exports.setRegisterUsers = async (req, res, next) => {
+  try {
+    const perm = checkCanManageRegisters(req)
+    if (!perm.allowed) {
+      return res.status(perm.status || 403).json({ message: perm.message || 'No autorizado' })
+    }
+
+    const { id } = req.params
+    const register = await prisma.cashRegister.findUnique({ where: { id } })
+    if (!register) return res.status(404).json({ message: 'Caja no encontrada' })
+    if (!register.active) {
+      return res.status(400).json({ message: 'No se pueden asignar usuarios a una caja inactiva' })
+    }
+
+    const rawIds = Array.isArray(req.body.user_ids) ? req.body.user_ids : null
+    if (!rawIds) return res.status(400).json({ message: 'user_ids debe ser un arreglo' })
+    const userIds = [...new Set(rawIds.map(String))]
+
+    if (userIds.length > 0) {
+      const found = await prisma.user.count({ where: { id: { in: userIds } } })
+      if (found !== userIds.length) {
+        return res.status(400).json({ message: 'Uno o más usuarios no existen' })
+      }
+    }
+
+    await prisma.$transaction([
+      // Quitar la caja a quienes la tenían y ya no están en la lista
+      prisma.user.updateMany({
+        where: {
+          cash_register_id: id,
+          ...(userIds.length > 0 ? { id: { notIn: userIds } } : {})
+        },
+        data: { cash_register_id: null }
+      }),
+      ...(userIds.length > 0
+        ? [prisma.user.updateMany({
+            where: { id: { in: userIds } },
+            data: { cash_register_id: id }
+          })]
+        : [])
+    ])
+
+    const assigned = await prisma.user.findMany({
+      where: { cash_register_id: id },
+      select: { id: true, name: true },
+      orderBy: { name: 'asc' }
+    })
+    res.json({ ...register, assigned_users: assigned })
+  } catch (e) {
+    next(e)
+  }
+}
+
+/**
  * PATCH /api/cash-sessions/registers/:id
  * Body: { name?, active?, is_default? } — is_default:true desmarca las demás.
  */
