@@ -27,6 +27,7 @@ const {
   BOM_INCLUDE,
   getAvailabilityBatchWithKits,
 } = require('../services/bomStock')
+const { generateLotCode, syncLotExpiryAlerts } = require('../services/lots')
 
 // Inicializar cliente de Supabase con service role key (solo para backend)
 const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL
@@ -110,6 +111,11 @@ exports.create = async (req, res, next) => {
     // Remover image_url si está vacío
     if (safePayload.image_url === '' || safePayload.image_url === null) {
       delete safePayload.image_url
+    }
+
+    // Normalizar tracks_expiry a boolean (checkboxes/formularios pueden mandar string)
+    if (safePayload.tracks_expiry !== undefined) {
+      safePayload.tracks_expiry = safePayload.tracks_expiry === true || safePayload.tracks_expiry === 'true'
     }
 
     // Validar y normalizar supplier_id: debe ser un UUID válido
@@ -356,12 +362,17 @@ exports.update = async (req, res, next) => {
       'supplier_id',
       'status_id',
       'available_for_sale',
+      'tracks_expiry',
       'kind',
     ]
     for (const field of allowedFields) {
       if (payload[field] !== undefined) {
         safePayload[field] = payload[field]
       }
+    }
+
+    if (safePayload.tracks_expiry !== undefined) {
+      safePayload.tracks_expiry = safePayload.tracks_expiry === true || safePayload.tracks_expiry === 'true'
     }
 
     if (safePayload.kind !== undefined) {
@@ -867,6 +878,85 @@ exports.critical = async (req, res, next) => {
 }
 
 // Register incoming merchandise endpoint: body { supplier_id, items, notes?, payment_term_id?, payment_status?, paid_at?, payment_reference?, due_date? }
+/**
+ * GET /api/products/:id/lots
+ * Lotes con existencia del producto, ordenados por caducidad (FEFO).
+ */
+exports.getLots = async (req, res, next) => {
+  try {
+    const { id } = req.params
+    const lots = await prisma.productLot.findMany({
+      where: { product_id: id, qty_remaining: { gt: 0 } },
+      orderBy: [{ expiry_date: { sort: 'asc', nulls: 'last' } }, { received_at: 'asc' }],
+    })
+    res.json({ lots })
+  } catch (e) { next(e) }
+}
+
+/**
+ * GET /api/products/lots/expiring?days=30&status=expiring|expired|all
+ * Reporte transversal de lotes por vencer / vencidos.
+ */
+exports.lotsExpiring = async (req, res, next) => {
+  try {
+    const days = Math.min(365, Math.max(1, Number(req.query.days) || 30))
+    const status = ['expiring', 'expired', 'all'].includes(req.query.status) ? req.query.status : 'all'
+
+    // "Hoy" según la zona horaria del negocio; expiry_date es DATE (medianoche UTC)
+    const tz = await getTimezone(prisma)
+    const nowTz = DateTime.now().setZone(tz)
+    const today = new Date(Date.UTC(nowTz.year, nowTz.month - 1, nowTz.day))
+    const limit = new Date(today.getTime() + days * 86400000)
+
+    const where = { qty_remaining: { gt: 0 } }
+    if (status === 'expired') where.expiry_date = { lt: today }
+    else if (status === 'expiring') where.expiry_date = { gte: today, lte: limit }
+    else where.expiry_date = { lte: limit } // all: vencidos + por vencer
+
+    const lots = await prisma.productLot.findMany({
+      where,
+      orderBy: { expiry_date: 'asc' },
+      include: {
+        product: {
+          select: { id: true, name: true, brand: true, size: true, barcode: true, stock: true, image_url: true }
+        }
+      },
+    })
+
+    // Σ qty_remaining por producto para reportar stock sin lote (stock viejo pre-lotes)
+    const productIds = [...new Set(lots.map(l => l.product_id))]
+    const sums = productIds.length
+      ? await prisma.productLot.groupBy({
+          by: ['product_id'],
+          where: { product_id: { in: productIds }, qty_remaining: { gt: 0 } },
+          _sum: { qty_remaining: true },
+        })
+      : []
+    const lottedByProduct = Object.fromEntries(sums.map(s => [s.product_id, s._sum.qty_remaining || 0]))
+
+    res.json({
+      days,
+      status,
+      lots: lots.map(l => {
+        const lotted = lottedByProduct[l.product_id] || 0
+        return {
+          id: l.id,
+          lot_code: l.lot_code,
+          expiry_date: l.expiry_date,
+          qty_remaining: l.qty_remaining,
+          days_to_expiry: Math.round((new Date(l.expiry_date).getTime() - today.getTime()) / 86400000),
+          received_at: l.received_at,
+          product: {
+            ...l.product,
+            lotted,
+            unlotted: Math.max(0, Number(l.product.stock) - lotted),
+          },
+        }
+      }),
+    })
+  } catch (e) { next(e) }
+}
+
 exports.registerIncomingMerchandise = async (req, res, next) => {
   try {
     const body = req.body || {}
@@ -891,6 +981,13 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
       }
       if (item.unit_cost == null || Number(item.unit_cost) < 0) {
         return res.status(400).json({ message: 'Cada item debe tener unit_cost >= 0' })
+      }
+      // Lote/caducidad (opcionales aquí; obligatoriedad se valida contra tracks_expiry en la transacción)
+      if (item.expiry_date != null && item.expiry_date !== '') {
+        const d = new Date(item.expiry_date)
+        if (Number.isNaN(d.getTime())) {
+          return res.status(400).json({ message: 'expiry_date inválida en uno de los items' })
+        }
       }
     }
 
@@ -1017,6 +1114,17 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
         }
       }
 
+      // Productos que controlan caducidad exigen expiry_date en su item
+      for (const item of items) {
+        const product = products.find(p => p.id === item.product_id)
+        const hasExpiry = item.expiry_date != null && item.expiry_date !== ''
+        if (product?.tracks_expiry && !hasExpiry) {
+          const err = new Error(`El producto "${product.name}" controla caducidad: expiry_date es requerida`)
+          err.status = 400
+          throw err
+        }
+      }
+
       // Create incoming merchandise audit record
       const incomingMerchandise = await tx.incomingMerchandise.create({
         data: {
@@ -1038,6 +1146,10 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
       const updatedProducts = []
       const purchaseLogs = []
       let totalPurchaseValue = 0
+      // Código compartido para todos los productos de esta entrada que no traigan su propio lot_code
+      // (llegaron en la misma entrega/factura). ponytail: un solo código por llamada, no por item.
+      const autoLotCode = generateLotCode(dateAsUtcWithGtClock)
+      let lotsCreated = 0
 
       for (const item of items) {
         const product = products.find(p => p.id === item.product_id)
@@ -1077,6 +1189,28 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
           }
         })
 
+        // Lote con caducidad (trazabilidad). Solo si el item trae datos de lote.
+        const lotCodeInput = item.lot_code != null ? String(item.lot_code).trim().slice(0, 60) : ''
+        const hasExpiry = item.expiry_date != null && item.expiry_date !== ''
+        if (hasExpiry || lotCodeInput) {
+          // Sin código de lote ingresado: comparte el auto-generado de esta entrada.
+          const lotCode = lotCodeInput || autoLotCode
+          await tx.productLot.create({
+            data: {
+              product_id: product.id,
+              lot_code: lotCode,
+              expiry_date: hasExpiry ? new Date(item.expiry_date) : null,
+              qty_received: quantity,
+              qty_remaining: quantity,
+              unit_cost: unitCost,
+              supplier_id,
+              incoming_merchandise_id: incomingMerchandise.id,
+              received_at: dateAsUtcWithGtClock,
+            }
+          })
+          lotsCreated++
+        }
+
         // Update stock alerts
         await ensureStockAlert(tx, product.id, newStock, product.min_stock)
 
@@ -1097,11 +1231,18 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
         updatedProducts,
         purchaseLogs,
         totalPurchaseValue,
+        lotsCreated,
       }
     }, {
       maxWait: 10000, // 10 seconds
       timeout: 30000, // 30 seconds
     })
+
+    // Si la entrada creó lotes, sincronizar alertas de vencimiento de inmediato
+    // (sin esperar el throttle de 10 min del GET /alerts). Advisory: no bloquea la respuesta.
+    if (result.lotsCreated > 0) {
+      await syncLotExpiryAlerts(prisma, { force: true })
+    }
 
     res.json(result)
   } catch (e) {
