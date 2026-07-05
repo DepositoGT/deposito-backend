@@ -657,6 +657,12 @@ exports.list = async (req, res, next) => {
           orderBy: {
             denomination: 'desc'
           }
+        },
+        cash_register_session: {
+          select: {
+            id: true,
+            cashRegister: { select: { id: true, name: true, code: true } }
+          }
         }
       },
       orderBy: {
@@ -706,7 +712,8 @@ exports.getById = async (req, res, next) => {
             id: true,
             opening_float: true,
             opened_at: true,
-            closed_at: true
+            closed_at: true,
+            cashRegister: { select: { id: true, name: true, code: true } }
           }
         }
       }
@@ -877,7 +884,16 @@ exports.updateStatus = async (req, res, next) => {
             payment_method: true
           }
         },
-        denominations: true
+        denominations: true,
+        cash_register_session: {
+          select: {
+            id: true,
+            opening_float: true,
+            opened_at: true,
+            closed_at: true,
+            cashRegister: { select: { id: true, name: true, code: true } }
+          }
+        }
       }
     })
 
