@@ -25,6 +25,7 @@ const { bulkValidateUsers, bulkCreateUsers } = require('../services/userBulkImpo
 // Consulta reutilizable de usuario con rol + permisos para el login/refresh/me.
 const userWithPerms = {
   role: { include: { permissions: { include: { permission: true } } } },
+  cashRegister: { select: { id: true, name: true, code: true, active: true } },
 }
 
 function serializeUser(user) {
@@ -39,6 +40,8 @@ function serializeUser(user) {
     phone: user.phone,
     address: user.address,
     hire_date: user.hire_date,
+    cash_register_id: user.cash_register_id,
+    cash_register: user.cashRegister || null,
     permissions: Array.isArray(user.role?.permissions)
       ? user.role.permissions.map((rp) => rp.permission?.code).filter(Boolean)
       : [],

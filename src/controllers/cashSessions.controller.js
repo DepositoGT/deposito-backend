@@ -124,10 +124,32 @@ exports.listRegisters = async (req, res, next) => {
       orderBy: [{ is_default: 'desc' }, { name: 'asc' }],
       include: {
         assigned_users: { select: { id: true, name: true } },
-        _count: { select: { sessions: { where: { status: 'OPEN' } } } }
+        sessions: {
+          where: { status: 'OPEN' },
+          take: 1,
+          select: {
+            id: true,
+            opened_at: true,
+            opening_float: true,
+            opened_by_id: true,
+            openedBy: { select: { id: true, name: true } },
+          },
+        },
       }
     })
-    res.json(rows.map(({ _count, ...r }) => ({ ...r, has_open_session: _count.sessions > 0 })))
+    res.json(rows.map(({ sessions, ...r }) => ({
+      ...r,
+      has_open_session: sessions.length > 0,
+      open_session: sessions[0]
+        ? {
+            id: sessions[0].id,
+            opened_at: sessions[0].opened_at,
+            opening_float: sessions[0].opening_float,
+            opened_by_id: sessions[0].opened_by_id,
+            opened_by_name: sessions[0].openedBy?.name ?? null,
+          }
+        : null,
+    })))
   } catch (e) {
     next(e)
   }
