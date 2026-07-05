@@ -233,6 +233,8 @@ model Product {
   barcode                    String?                   @unique @db.VarChar(100)
   /// Si es false, el producto no aparece en el punto de venta ni puede venderse por la API.
   available_for_sale         Boolean                   @default(true)
+  /// Opt-in: si es true, cada ingreso de mercancía exige fecha de caducidad (lotes).
+  tracks_expiry              Boolean                   @default(false)
   kind                       ProductKind               @default(STANDARD)
   description                String?                   @db.Text
   deleted                    Boolean                   @default(false)
@@ -251,8 +253,33 @@ model Product {
   inventory_count_lines      InventoryCountLine[]
   commercial_document_lines  CommercialDocumentLine[]
   stock_reservations         StockReservation[]
+  lots                       ProductLot[]
 
   @@map("products")
+}
+
+/// Lote de producto con caducidad. Capa advisory: `Product.stock` sigue siendo la
+/// verdad para vender; los lotes se descuentan FEFO en segundo plano (trazabilidad + alertas).
+model ProductLot {
+  id                      String    @id @default(uuid()) @db.Uuid
+  product_id              String    @db.Uuid
+  product                 Product   @relation(fields: [product_id], references: [id])
+  /// Nº de lote del proveedor (opcional)
+  lot_code                String?   @db.VarChar(60)
+  /// Obligatoria vía API si product.tracks_expiry
+  expiry_date             DateTime? @db.Date
+  qty_received            Int
+  /// Restante según consumo FEFO; advisory, se reconcilia por reporte
+  qty_remaining           Int
+  unit_cost               Decimal?  @db.Decimal(12, 2)
+  supplier_id             String?   @db.Uuid
+  /// Ingreso de mercancía que originó el lote (auditoría)
+  incoming_merchandise_id String?   @db.Uuid
+  received_at             DateTime  @default(now())
+
+  @@index([product_id, expiry_date])
+  @@index([expiry_date])
+  @@map("product_lots")
 }
 
 model ProductBomLine {
