@@ -130,6 +130,12 @@ router.get('/report.pdf', Auth, hasPermission('products.export', 'reports.view')
 router.get('/availability', Auth, hasPermission('products.view', 'sales.create', 'orders.view', 'quotes.view'), Products.availability)
 
 /**
+ * GET /products/lots/expiring?days=30&status=expiring|expired|all
+ * Lotes por vencer / vencidos (antes de /:id para no capturar "lots" como id)
+ */
+router.get('/lots/expiring', Auth, hasPermission('products.view'), Products.lotsExpiring)
+
+/**
  * @openapi
  * /products/import-template:
  *   get:
@@ -295,6 +301,8 @@ router.post(
  *               $ref: '#/components/schemas/Product'
  *       404: { description: No encontrado }
  */
+// Lotes con existencia del producto (FEFO)
+router.get('/:id/lots', Auth, hasPermission('products.view'), Products.getLots)
 router.get('/:id/bom', Auth, Products.getBom)
 router.put('/:id/bom', Auth, hasPermission('products.edit'), Products.updateBom)
 router.get('/:id', Auth, Products.getOne)

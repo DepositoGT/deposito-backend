@@ -25,6 +25,7 @@ const { bulkValidateUsers, bulkCreateUsers } = require('../services/userBulkImpo
 // Consulta reutilizable de usuario con rol + permisos para el login/refresh/me.
 const userWithPerms = {
   role: { include: { permissions: { include: { permission: true } } } },
+  cashRegister: { select: { id: true, name: true, code: true, active: true } },
 }
 
 function serializeUser(user) {
@@ -39,6 +40,8 @@ function serializeUser(user) {
     phone: user.phone,
     address: user.address,
     hire_date: user.hire_date,
+    cash_register_id: user.cash_register_id,
+    cash_register: user.cashRegister || null,
     permissions: Array.isArray(user.role?.permissions)
       ? user.role.permissions.map((rp) => rp.permission?.code).filter(Boolean)
       : [],
@@ -89,29 +92,31 @@ exports.list = async (req, res, next) => {
     const totalPages = Math.max(1, Math.ceil(totalItems / pageSize))
     const safePage = Math.min(page, totalPages)
     
-    const users = await prisma.user.findMany({ 
+    const users = await prisma.user.findMany({
       where,
-      include: { role: true }, 
+      include: { role: true, cashRegister: { select: { id: true, name: true, code: true, active: true } } },
       orderBy: { name: 'asc' },
       skip: (safePage - 1) * pageSize,
       take: pageSize
     })
-    
+
     const nextPage = safePage < totalPages ? safePage + 1 : null
     const prevPage = safePage > 1 ? safePage - 1 : null
-    
+
     res.json({
-      items: users.map(u => ({ 
-        id: u.id, 
-        name: u.name, 
-        email: u.email, 
-        role_id: u.role_id, 
+      items: users.map(u => ({
+        id: u.id,
+        name: u.name,
+        email: u.email,
+        role_id: u.role_id,
         role: u.role,
         is_employee: u.is_employee || false,
         photo_url: u.photo_url,
         phone: u.phone,
         address: u.address,
         hire_date: u.hire_date,
+        cash_register_id: u.cash_register_id,
+        cash_register: u.cashRegister,
         created_at: u.created_at,
         updated_at: u.updated_at
       })),
@@ -242,11 +247,11 @@ exports.logout = async (req, res, next) => {
 exports.getById = async (req, res, next) => {
   try {
     const { id } = req.params
-    const user = await prisma.user.findUnique({ 
-      where: { id }, 
-      include: { role: true } 
+    const user = await prisma.user.findUnique({
+      where: { id },
+      include: { role: true, cashRegister: { select: { id: true, name: true, code: true, active: true } } }
     })
-    
+
     if (!user) {
       return res.status(404).json({ message: 'Usuario no encontrado' })
     }
@@ -262,6 +267,8 @@ exports.getById = async (req, res, next) => {
       phone: user.phone,
       address: user.address,
       hire_date: user.hire_date,
+      cash_register_id: user.cash_register_id,
+      cash_register: user.cashRegister,
       created_at: user.created_at,
       updated_at: user.updated_at
     })
@@ -272,7 +279,7 @@ exports.getById = async (req, res, next) => {
 exports.update = async (req, res, next) => {
   try {
     const { id } = req.params
-    const { name, email, role_id, password, is_employee, photo_url, phone, address, hire_date } = req.body || {}
+    const { name, email, role_id, password, is_employee, photo_url, phone, address, hire_date, cash_register_id } = req.body || {}
 
     // Validar que el usuario existe
     const existingUser = await prisma.user.findUnique({ where: { id } })
@@ -298,7 +305,20 @@ exports.update = async (req, res, next) => {
     if (phone !== undefined) updateData.phone = phone || null
     if (address !== undefined) updateData.address = address || null
     if (hire_date !== undefined) updateData.hire_date = hire_date ? new Date(hire_date) : null
-    
+    if (cash_register_id !== undefined) {
+      if (cash_register_id) {
+        const register = await prisma.cashRegister.findFirst({
+          where: { id: String(cash_register_id), active: true }
+        })
+        if (!register) {
+          return res.status(400).json({ message: 'La caja indicada no existe o está inactiva' })
+        }
+        updateData.cash_register_id = register.id
+      } else {
+        updateData.cash_register_id = null
+      }
+    }
+
     // Si se proporciona nueva contraseña, hashearla
     if (password && password.trim() !== '') {
       updateData.password = await bcrypt.hash(password, 10)
@@ -308,7 +328,7 @@ exports.update = async (req, res, next) => {
     const updatedUser = await prisma.user.update({
       where: { id },
       data: updateData,
-      include: { role: true }
+      include: { role: true, cashRegister: { select: { id: true, name: true, code: true, active: true } } }
     })
 
     res.json({
@@ -322,6 +342,8 @@ exports.update = async (req, res, next) => {
       phone: updatedUser.phone,
       address: updatedUser.address,
       hire_date: updatedUser.hire_date,
+      cash_register_id: updatedUser.cash_register_id,
+      cash_register: updatedUser.cashRegister,
       created_at: updatedUser.created_at,
       updated_at: updatedUser.updated_at
     })
