@@ -187,19 +187,31 @@ async function resolveOrderLines(tx, items, ctx, { freezePrices = false } = {}) 
   }
 }
 
-async function requireCashSession(tx, user) {
+async function requireCashSession(tx, user, explicitRegisterId) {
   let cashSessionIdForSale = null
   const isAdmin = String(user.role?.name || user.role_name || '').toLowerCase() === 'admin'
-  const defaultReg = await tx.cashRegister.findFirst({
-    where: { is_default: true, active: true },
-  })
-  if (!defaultReg) {
+  // Caja: la explícita (POS) > la asignada al usuario > la predeterminada.
+  let register = null
+  if (explicitRegisterId) {
+    register = await tx.cashRegister.findFirst({ where: { id: String(explicitRegisterId), active: true } })
+  }
+  if (!register && user.sub) {
+    const u = await tx.user.findUnique({
+      where: { id: String(user.sub) },
+      select: { cashRegister: { select: { id: true, active: true } } },
+    })
+    if (u?.cashRegister?.active) register = u.cashRegister
+  }
+  if (!register) {
+    register = await tx.cashRegister.findFirst({ where: { is_default: true, active: true } })
+  }
+  if (!register) {
     const err = new Error('NO_CASH_REGISTER')
     err.status = 503
     throw err
   }
   const openSess = await tx.cashRegisterSession.findFirst({
-    where: { cash_register_id: defaultReg.id, status: 'OPEN' },
+    where: { cash_register_id: register.id, status: 'OPEN' },
   })
   if (!openSess && !isAdmin) {
     const err = new Error('CASH_SESSION_REQUIRED')
@@ -516,7 +528,7 @@ exports.convertToSale = async (req, res, next) => {
     const user = req.user
     if (!user?.sub) return res.status(401).json({ message: 'Usuario no autenticado' })
 
-    const { payment_method_id: paymentMethodIdRaw, amount_received, change: changeRaw, lines: linesRaw } =
+    const { payment_method_id: paymentMethodIdRaw, amount_received, change: changeRaw, lines: linesRaw, cash_register_id: cashRegisterId } =
       req.body || {}
     const paymentMethodId = Number(paymentMethodIdRaw)
     if (!Number.isFinite(paymentMethodId) || paymentMethodId <= 0) {
@@ -544,7 +556,7 @@ exports.convertToSale = async (req, res, next) => {
     }
 
     const result = await prismaTransaction.$transaction(async (tx) => {
-      const cashSessionIdForSale = await requireCashSession(tx, user)
+      const cashSessionIdForSale = await requireCashSession(tx, user, cashRegisterId)
 
       const paymentMethod = await tx.paymentMethod.findUnique({ where: { id: paymentMethodId } })
       if (!paymentMethod) {
