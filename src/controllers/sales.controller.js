@@ -28,6 +28,21 @@ const {
 const { expandLinesToStockMap, deductStockMap, restoreStockMap, getAvailabilityBatchWithKits } = require('../services/bomStock')
 const { nextDocumentReference } = require('../services/referenceGenerator')
 
+/** Caja de la venta: la explícita (POS) > la asignada al usuario > la predeterminada. */
+async function resolveSaleRegister (client, explicitId, userId) {
+  if (explicitId) {
+    return client.cashRegister.findFirst({ where: { id: String(explicitId), active: true } })
+  }
+  if (userId) {
+    const u = await client.user.findUnique({
+      where: { id: String(userId) },
+      select: { cashRegister: { select: { id: true, active: true } } }
+    })
+    if (u?.cashRegister?.active) return u.cashRegister
+  }
+  return client.cashRegister.findFirst({ where: { is_default: true, active: true } })
+}
+
 /** Include ligero para listados (tabla / búsqueda). Detalle completo en GET /sales/:id */
 const SALE_LIST_INCLUDE = {
   payment_method: { select: { id: true, name: true } },
@@ -346,34 +361,23 @@ exports.create = async (req, res, next) => {
     const created = await prismaTransaction.$transaction(async (tx) => {
       let cashSessionIdForSale = null
       const isAdmin = String(user.role?.name || user.role_name || '').toLowerCase() === 'admin'
-      if (!isAdmin) {
-        const defaultReg = await tx.cashRegister.findFirst({
-          where: { is_default: true, active: true }
-        })
-        if (!defaultReg) {
-          const err = new Error('NO_CASH_REGISTER')
-          err.status = 503
-          throw err
-        }
-        const openSess = await tx.cashRegisterSession.findFirst({
-          where: { cash_register_id: defaultReg.id, status: 'OPEN' }
-        })
-        if (!openSess) {
-          const err = new Error('CASH_SESSION_REQUIRED')
-          err.status = 403
-          throw err
-        }
+      // Resolver la caja: la seleccionada en el POS > la asignada al usuario > la predeterminada.
+      // Antes se usaba siempre la predeterminada, así que abrir turno en otra caja no contaba.
+      const register = await resolveSaleRegister(tx, saleData.cash_register_id, user.sub)
+      if (!register) {
+        const err = new Error('NO_CASH_REGISTER')
+        err.status = 503
+        throw err
+      }
+      const openSess = await tx.cashRegisterSession.findFirst({
+        where: { cash_register_id: register.id, status: 'OPEN' }
+      })
+      if (openSess) {
         cashSessionIdForSale = openSess.id
-      } else {
-        const defaultReg = await tx.cashRegister.findFirst({
-          where: { is_default: true, active: true }
-        })
-        if (defaultReg) {
-          const openSess = await tx.cashRegisterSession.findFirst({
-            where: { cash_register_id: defaultReg.id, status: 'OPEN' }
-          })
-          if (openSess) cashSessionIdForSale = openSess.id
-        }
+      } else if (!isAdmin) {
+        const err = new Error('CASH_SESSION_REQUIRED')
+        err.status = 403
+        throw err
       }
 
       // 1) Validación de stock: no permitir solicitar más que el stock disponible por producto
