@@ -236,6 +236,8 @@ model Product {
   /// Opt-in: si es true, cada ingreso de mercancía exige fecha de caducidad (lotes).
   tracks_expiry              Boolean                   @default(false)
   kind                       ProductKind               @default(STANDARD)
+  /// Solo aplica a kits: si es true, el kit tiene stock propio real (se armó por adelantado) y ya no se calcula desde sus componentes.
+  stock_assembled            Boolean                   @default(false)
   description                String?                   @db.Text
   deleted                    Boolean                   @default(false)
   deleted_at                 DateTime?

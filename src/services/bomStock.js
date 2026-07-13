@@ -47,6 +47,7 @@ async function loadProductsWithBom(tx, productIds) {
       name: true,
       kind: true,
       stock: true,
+      stock_assembled: true,
       kit_components: {
         orderBy: { sort_order: 'asc' },
         select: {
@@ -96,7 +97,7 @@ async function getAvailabilityBatchWithKits(productIds, tx) {
 
   for (const id of ids) {
     const p = prodMap.get(id)
-    if (!p || p.kind !== 'KIT') continue
+    if (!p || p.kind !== 'KIT' || p.stock_assembled) continue
     const kitAvailable = computeKitAvailableFromBom(p.kit_components, base)
     out[id] = {
       stock: kitAvailable,
@@ -130,7 +131,7 @@ async function expandLinesToStockMap(tx, lines) {
       throw err
     }
 
-    if (product.kind === 'KIT') {
+    if (product.kind === 'KIT' && !product.stock_assembled) {
       if (!product.kit_components.length) {
         const err = new Error(`El kit "${product.name}" no tiene componentes configurados`)
         err.status = 400
@@ -188,6 +189,74 @@ async function restoreStockMap(tx, stockMap) {
     WHERE p.id = v.id
     RETURNING p.id, p.name, p.stock, p.min_stock
   `
+}
+
+/**
+ * Cuánto se descuenta de cada componente para armar `qty` unidades de un kit.
+ */
+function buildComponentDeductionMap(bomLines, qty) {
+  const map = new Map()
+  for (const line of bomLines) {
+    const compId = String(line.component_product_id)
+    const need = Math.max(1, Number(line.qty_per_unit || 1)) * qty
+    map.set(compId, (map.get(compId) || 0) + need)
+  }
+  return map
+}
+
+/**
+ * Arma el máximo de unidades posible de un kit ahora mismo: descuenta los
+ * componentes y le da al kit stock propio real (stock_assembled = true).
+ */
+async function assembleKit(tx, kitProductId) {
+  const client = dbClient(tx)
+  const kit = await client.product.findFirst({
+    where: { id: kitProductId, deleted: false },
+    select: {
+      id: true,
+      name: true,
+      kind: true,
+      kit_components: {
+        select: { component_product_id: true, qty_per_unit: true },
+      },
+    },
+  })
+  if (!kit) {
+    const err = new Error('Producto no encontrado')
+    err.status = 404
+    throw err
+  }
+  if (kit.kind !== 'KIT') {
+    const err = new Error(`"${kit.name}" no es un kit`)
+    err.status = 400
+    throw err
+  }
+  if (!kit.kit_components.length) {
+    const err = new Error(`El kit "${kit.name}" no tiene componentes configurados`)
+    err.status = 400
+    throw err
+  }
+
+  const componentIds = kit.kit_components.map((c) => String(c.component_product_id))
+  const { getAvailabilityBatch } = require('./stockAvailability')
+  const availabilityMap = await getAvailabilityBatch(componentIds, tx)
+  const qty = computeKitAvailableFromBom(kit.kit_components, availabilityMap)
+  if (qty <= 0) {
+    const err = new Error(`No hay stock suficiente de componentes para armar "${kit.name}"`)
+    err.status = 400
+    throw err
+  }
+
+  const deductionMap = buildComponentDeductionMap(kit.kit_components, qty)
+  await deductStockMap(tx, deductionMap)
+
+  const product = await client.product.update({
+    where: { id: kitProductId },
+    data: { stock: { increment: qty }, stock_assembled: true },
+    select: { id: true, name: true, stock: true, min_stock: true, stock_assembled: true },
+  })
+
+  return { qty, product }
 }
 
 async function validateBomComponents(tx, kitProductId, components) {
@@ -264,11 +333,14 @@ module.exports = {
   parseKind,
   normalizeBomInput,
   loadProductsWithBom,
+  computeKitAvailableFromBom,
   getAvailabilityBatchWithKits,
   expandLinesToStockMap,
   stockMapToLines,
   deductStockMap,
   restoreStockMap,
+  buildComponentDeductionMap,
+  assembleKit,
   validateBomComponents,
   replaceProductBom,
 }
