@@ -159,7 +159,7 @@ async function reserveForDocument(tx, {
 
   for (const line of documentLines) {
     const product = prodMap.get(String(line.product_id))
-    if (product?.kind === 'KIT') {
+    if (product?.kind === 'KIT' && !product.stock_assembled) {
       if (!product.kit_components?.length) {
         const err = new Error(`El kit "${product.name}" no tiene componentes configurados`)
         err.status = 400
@@ -268,7 +268,7 @@ async function consumePartialByDocument(tx, documentId, consumptions) {
     const prodMap = await loadProductsWithBom(tx, [line.product_id])
     const product = prodMap.get(String(line.product_id))
 
-    if (product?.kind === 'KIT') {
+    if (product?.kind === 'KIT' && !product.stock_assembled) {
       if (!product.kit_components?.length) {
         const err = new Error(`El kit "${product.name}" no tiene componentes configurados`)
         err.status = 400
