@@ -26,6 +26,7 @@ const {
   replaceProductBom,
   BOM_INCLUDE,
   getAvailabilityBatchWithKits,
+  assembleKit,
 } = require('../services/bomStock')
 const { generateLotCode, syncLotExpiryAlerts } = require('../services/lots')
 
@@ -306,6 +307,23 @@ exports.updateBom = async (req, res, next) => {
 }
 
 /**
+ * POST /api/products/:id/kit/assemble
+ * Arma el máximo de unidades posible de un kit ahora mismo: descuenta los
+ * componentes y le da al kit stock propio real (permanente).
+ */
+exports.assembleKit = async (req, res, next) => {
+  try {
+    const { id } = req.params
+    const result = await prismaTransaction.$transaction(async (tx) => {
+      const out = await assembleKit(tx, id)
+      await ensureStockAlert(tx, out.product.id, out.product.stock, out.product.min_stock)
+      return out
+    })
+    res.json(result)
+  } catch (e) { next(e) }
+}
+
+/**
  * GET /api/products/availability?ids=uuid1,uuid2
  * Stock físico, reservado y disponible (stock − reservas ACTIVE).
  */
@@ -388,7 +406,7 @@ exports.update = async (req, res, next) => {
       }
     }
 
-    if (current.kind === 'KIT' || safePayload.kind === 'KIT') {
+    if (safePayload.kind === 'KIT' || (current.kind === 'KIT' && !current.stock_assembled)) {
       safePayload.stock = 0
     }
 
