@@ -395,7 +395,7 @@ exports.update = async (req, res, next) => {
 
     if (safePayload.kind !== undefined) {
       safePayload.kind = parseKind(safePayload.kind)
-      if (safePayload.kind === 'KIT') {
+      if (safePayload.kind === 'KIT' && !current.stock_assembled) {
         safePayload.stock = 0
         const bomCount = await prisma.productBomLine.count({ where: { kit_product_id: id } })
         if (bomCount === 0) {
@@ -406,7 +406,7 @@ exports.update = async (req, res, next) => {
       }
     }
 
-    if (safePayload.kind === 'KIT' || (current.kind === 'KIT' && !current.stock_assembled)) {
+    if (!current.stock_assembled && (safePayload.kind === 'KIT' || current.kind === 'KIT')) {
       safePayload.stock = 0
     }
 
@@ -885,7 +885,7 @@ exports.critical = async (req, res, next) => {
 
     // filter server-side for products where stock < min_stock
     const critical = products.filter((p) => {
-      if (p.kind === 'KIT') return false
+      if (p.kind === 'KIT' && !p.stock_assembled) return false
       const stock = Number(p.stock || 0)
       const min = Number(p.min_stock || 0)
       return stock < min
