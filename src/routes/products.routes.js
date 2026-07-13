@@ -135,6 +135,10 @@ router.get('/availability', Auth, hasPermission('products.view', 'sales.create',
  */
 router.get('/lots/expiring', Auth, hasPermission('products.view'), Products.lotsExpiring)
 
+/** Corregir / eliminar un lote mal ingresado (cantidad, caducidad, código). Reconcilia stock. */
+router.patch('/lots/:lotId', Auth, hasPermission('products.register_incoming'), Products.updateLot)
+router.delete('/lots/:lotId', Auth, hasPermission('products.register_incoming'), Products.deleteLot)
+
 /**
  * @openapi
  * /products/import-template:
@@ -305,6 +309,7 @@ router.post(
 router.get('/:id/lots', Auth, hasPermission('products.view'), Products.getLots)
 router.get('/:id/bom', Auth, Products.getBom)
 router.put('/:id/bom', Auth, hasPermission('products.edit'), Products.updateBom)
+router.post('/:id/kit/assemble', Auth, hasPermission('products.edit'), Products.assembleKit)
 router.get('/:id', Auth, Products.getOne)
 
 /**

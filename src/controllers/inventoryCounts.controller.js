@@ -198,7 +198,7 @@ async function assertNoBlockingSession(exceptId) {
 async function applyStockTransaction(tx, sessionId) {
   const lines = await tx.inventoryCountLine.findMany({
     where: { session_id: sessionId, qty_counted: { not: null } },
-    include: { product: { select: { min_stock: true, kind: true } } },
+    include: { product: { select: { min_stock: true, kind: true, stock_assembled: true } } },
   })
   const statuses = await tx.stockStatus.findMany()
   const byName = Object.fromEntries(statuses.map((s) => [s.name, s.id]))
@@ -212,7 +212,7 @@ async function applyStockTransaction(tx, sessionId) {
   }
   await Promise.all(
     lines.map((L) => {
-      if (L.product.kind === 'KIT') {
+      if (L.product.kind === 'KIT' && !L.product.stock_assembled) {
         return tx.product.update({
           where: { id: L.product_id },
           data: { stock: 0 },
