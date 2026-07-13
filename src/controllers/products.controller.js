@@ -894,6 +894,105 @@ exports.getLots = async (req, res, next) => {
 }
 
 /**
+ * PATCH /api/products/lots/:lotId
+ * Corrige un lote mal ingresado: cantidad, caducidad o código.
+ * La cantidad reconcilia product.stock por la diferencia (el ingreso sumó a ambos).
+ * body { qty_received?, expiry_date?, lot_code? }
+ */
+exports.updateLot = async (req, res, next) => {
+  try {
+    const { lotId } = req.params
+    const { qty_received, expiry_date, lot_code } = req.body || {}
+
+    const result = await prismaTransaction.$transaction(async (tx) => {
+      const lot = await tx.productLot.findUnique({
+        where: { id: lotId },
+        include: { product: { select: { id: true, stock: true, min_stock: true, tracks_expiry: true } } },
+      })
+      if (!lot) { const e = new Error('Lote no encontrado'); e.status = 404; throw e }
+
+      const data = {}
+      let expiryChanged = false
+
+      if (qty_received !== undefined) {
+        const newQty = Number(qty_received)
+        if (!Number.isInteger(newQty) || newQty <= 0) {
+          const e = new Error('qty_received debe ser un entero mayor a 0'); e.status = 400; throw e
+        }
+        const consumed = lot.qty_received - lot.qty_remaining
+        if (newQty < consumed) {
+          const e = new Error(`No puede recibir menos de lo ya vendido de este lote (${consumed})`); e.status = 400; throw e
+        }
+        const delta = newQty - lot.qty_received
+        data.qty_received = newQty
+        data.qty_remaining = lot.qty_remaining + delta
+        if (delta !== 0) {
+          const newStock = lot.product.stock + delta
+          const updatedProduct = await tx.product.update({
+            where: { id: lot.product_id },
+            data: { stock: newStock },
+            select: { id: true, min_stock: true },
+          })
+          await ensureStockAlert(tx, updatedProduct.id, newStock, updatedProduct.min_stock)
+        }
+      }
+
+      if (expiry_date !== undefined) {
+        const hasExpiry = expiry_date != null && expiry_date !== ''
+        if (!hasExpiry && lot.product.tracks_expiry) {
+          const e = new Error('Este producto requiere fecha de caducidad'); e.status = 400; throw e
+        }
+        data.expiry_date = hasExpiry ? new Date(expiry_date) : null
+        expiryChanged = true
+      }
+
+      if (lot_code !== undefined) {
+        data.lot_code = lot_code != null ? String(lot_code).trim().slice(0, 60) || null : null
+      }
+
+      const updated = await tx.productLot.update({ where: { id: lotId }, data })
+      return { updated, expiryChanged }
+    })
+
+    if (result.expiryChanged) await syncLotExpiryAlerts(prisma, { force: true })
+    res.json({ lot: result.updated })
+  } catch (e) { next(e) }
+}
+
+/**
+ * DELETE /api/products/lots/:lotId
+ * Elimina un lote (p. ej. ingresado al producto equivocado) y revierte del stock
+ * la existencia que aún atribuía al producto (qty_remaining).
+ */
+exports.deleteLot = async (req, res, next) => {
+  try {
+    const { lotId } = req.params
+    await prismaTransaction.$transaction(async (tx) => {
+      const lot = await tx.productLot.findUnique({
+        where: { id: lotId },
+        include: { product: { select: { id: true, stock: true, min_stock: true } } },
+      })
+      if (!lot) { const e = new Error('Lote no encontrado'); e.status = 404; throw e }
+
+      if (lot.qty_remaining > 0) {
+        const newStock = lot.product.stock - lot.qty_remaining
+        const updatedProduct = await tx.product.update({
+          where: { id: lot.product_id },
+          data: { stock: newStock < 0 ? 0 : newStock },
+          select: { id: true, stock: true, min_stock: true },
+        })
+        await ensureStockAlert(tx, updatedProduct.id, updatedProduct.stock, updatedProduct.min_stock)
+      }
+
+      await tx.productLot.delete({ where: { id: lotId } })
+    })
+
+    await syncLotExpiryAlerts(prisma, { force: true })
+    res.json({ ok: true })
+  } catch (e) { next(e) }
+}
+
+/**
  * GET /api/products/lots/expiring?days=30&status=expiring|expired|all
  * Reporte transversal de lotes por vencer / vencidos.
  */
