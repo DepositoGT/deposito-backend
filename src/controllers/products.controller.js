@@ -308,14 +308,16 @@ exports.updateBom = async (req, res, next) => {
 
 /**
  * POST /api/products/:id/kit/assemble
- * Arma el máximo de unidades posible de un kit ahora mismo: descuenta los
- * componentes y le da al kit stock propio real (permanente).
+ * Arma unidades de un kit ahora mismo (body.qty opcional, si no se pasa arma
+ * el máximo posible): descuenta los componentes y le da al kit stock propio
+ * real (permanente).
  */
 exports.assembleKit = async (req, res, next) => {
   try {
     const { id } = req.params
+    const { qty } = req.body || {}
     const result = await prismaTransaction.$transaction(async (tx) => {
-      const out = await assembleKit(tx, id)
+      const out = await assembleKit(tx, id, qty)
       await ensureStockAlert(tx, out.product.id, out.product.stock, out.product.min_stock)
       return out
     })

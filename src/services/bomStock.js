@@ -205,10 +205,11 @@ function buildComponentDeductionMap(bomLines, qty) {
 }
 
 /**
- * Arma el máximo de unidades posible de un kit ahora mismo: descuenta los
- * componentes y le da al kit stock propio real (stock_assembled = true).
+ * Arma unidades de un kit ahora mismo: descuenta los componentes y le da al
+ * kit stock propio real (stock_assembled = true). Si se pasa `requestedQty`
+ * se arma esa cantidad (limitada al máximo disponible); si no, el máximo.
  */
-async function assembleKit(tx, kitProductId) {
+async function assembleKit(tx, kitProductId, requestedQty) {
   const client = dbClient(tx)
   const kit = await client.product.findFirst({
     where: { id: kitProductId, deleted: false },
@@ -240,11 +241,25 @@ async function assembleKit(tx, kitProductId) {
   const componentIds = kit.kit_components.map((c) => String(c.component_product_id))
   const { getAvailabilityBatch } = require('./stockAvailability')
   const availabilityMap = await getAvailabilityBatch(componentIds, tx)
-  const qty = computeKitAvailableFromBom(kit.kit_components, availabilityMap)
-  if (qty <= 0) {
+  const maxQty = computeKitAvailableFromBom(kit.kit_components, availabilityMap)
+  if (maxQty <= 0) {
     const err = new Error(`No hay stock suficiente de componentes para armar "${kit.name}"`)
     err.status = 400
     throw err
+  }
+  let qty = maxQty
+  if (requestedQty !== undefined) {
+    qty = Number(requestedQty)
+    if (!Number.isInteger(qty) || qty <= 0) {
+      const err = new Error('La cantidad a armar debe ser un entero mayor a 0')
+      err.status = 400
+      throw err
+    }
+    if (qty > maxQty) {
+      const err = new Error(`Solo se pueden armar ${maxQty} unidades con el stock disponible`)
+      err.status = 400
+      throw err
+    }
   }
 
   const deductionMap = buildComponentDeductionMap(kit.kit_components, qty)
