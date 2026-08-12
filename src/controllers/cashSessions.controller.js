@@ -216,9 +216,11 @@ exports.setRegisterUsers = async (req, res, next) => {
     const userIds = [...new Set(rawIds.map(String))]
 
     if (userIds.length > 0) {
-      const found = await prisma.user.count({ where: { id: { in: userIds } } })
+      const found = await prisma.user.count({
+        where: { id: { in: userIds }, user_branches: { some: { branch_id: register.branch_id } } },
+      })
       if (found !== userIds.length) {
-        return res.status(400).json({ message: 'Uno o más usuarios no existen' })
+        return res.status(400).json({ message: 'Uno o más usuarios no existen o no pertenecen a la sucursal' })
       }
     }
 
@@ -294,7 +296,11 @@ exports.updateRegister = async (req, res, next) => {
         if (!register.active && data.active !== true) {
           throw Object.assign(new Error('BAD_DEFAULT'), { status: 400 })
         }
-        await tx.cashRegister.updateMany({ where: { is_default: true }, data: { is_default: false } })
+        // La caja predeterminada es por sucursal, no global.
+        await tx.cashRegister.updateMany({
+          where: { is_default: true, branch_id: register.branch_id },
+          data: { is_default: false },
+        })
         data.is_default = true
       }
       return tx.cashRegister.update({ where: { id }, data })

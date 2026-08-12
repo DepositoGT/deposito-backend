@@ -702,7 +702,7 @@ exports.getById = async (req, res, next) => {
     const { id } = req.params
 
     const closure = await prisma.cashClosure.findFirst({
-      where: { id, branch: { company_id: req.companyId } },
+      where: { id, ...require('../middlewares/tenant').branchWhere(req) },
       include: {
         payment_breakdowns: {
           include: {
@@ -766,6 +766,12 @@ exports.validate = async (req, res, next) => {
       nowLocal.hour, nowLocal.minute, nowLocal.second, nowLocal.millisecond
     ).toJSDate();
 
+    const target = await prisma.cashClosure.findFirst({
+      where: { id, ...require('../middlewares/tenant').branchWhere(req) },
+      select: { id: true },
+    })
+    if (!target) return res.status(404).json({ message: 'Cierre no encontrado' })
+
     // status se mantiene (Pendiente); aprobación/rechazo vía PATCH :id/status
     const updated = await prisma.cashClosure.update({
       where: { id },
@@ -799,10 +805,10 @@ exports.getLastClosureDate = async (req, res, next) => {
     const scope = String(req.query.scope || 'day').toLowerCase() === 'mine' ? 'mine' : 'day'
     const authUser = req.user
 
-    const where =
-      scope === 'mine' && authUser?.sub
-        ? { cashier_id: authUser.sub }
-        : undefined
+    const where = {
+      ...require('../middlewares/tenant').branchWhere(req),
+      ...(scope === 'mine' && authUser?.sub ? { cashier_id: authUser.sub } : {}),
+    }
 
     const lastClosure = await prisma.cashClosure.findFirst({
       where,
@@ -848,7 +854,7 @@ exports.updateStatus = async (req, res, next) => {
 
     // Buscar el cierre
     const closure = await prisma.cashClosure.findFirst({
-      where: { id, branch: { company_id: req.companyId } }
+      where: { id, ...require('../middlewares/tenant').branchWhere(req) }
     })
 
     if (!closure) {

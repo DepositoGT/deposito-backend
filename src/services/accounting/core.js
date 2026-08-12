@@ -63,7 +63,9 @@ async function assertPeriodOpen(tx, date, companyId) {
 
 /** Número secuencial A-000001 por empresa (lock transaccional para evitar duplicados). */
 async function nextEntryNumber(tx, companyId) {
-  await tx.$executeRaw`SELECT pg_advisory_xact_lock(${ENTRY_LOCK_KEY}, hashtext(${companyId}))`
+  // Los casts son obligatorios: la forma de dos argumentos es (int, int) y
+  // Prisma manda el número como bigint y el hash como integer.
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(${ENTRY_LOCK_KEY}::int, hashtext(${companyId})::int)`
   const last = await tx.journalEntry.findFirst({
     where: { company_id: companyId, entry_number: { startsWith: 'A-' } },
     orderBy: { entry_number: 'desc' },
@@ -78,7 +80,7 @@ async function nextEntryNumber(tx, companyId) {
  * Crea un asiento validado dentro de una transacción.
  * lines: [{ account_id, debit, credit, description? }]
  */
-async function createEntry(tx, { company_id, date, description, source_type = 'MANUAL', source_id = null, created_by = null, reversal_of_id = null, lines }) {
+async function createEntry(tx, { company_id, branch_id = null, date, description, source_type = 'MANUAL', source_id = null, created_by = null, reversal_of_id = null, lines }) {
   if (!company_id) throw new AccountingError('company_id es obligatorio para crear asientos')
   const check = validateLines(lines)
   if (!check.ok) throw new AccountingError(check.error)
@@ -99,6 +101,7 @@ async function createEntry(tx, { company_id, date, description, source_type = 'M
   return tx.journalEntry.create({
     data: {
       company_id,
+      branch_id,
       entry_number,
       date: toEntryDate(date),
       description: String(description || '').slice(0, 255),

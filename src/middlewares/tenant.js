@@ -149,9 +149,22 @@ function requireBranch(req) {
   return req.branchId
 }
 
+/**
+ * Guard para las rutas /auth/*, donde la resolución es suave y companyId puede
+ * venir vacío: un filtro `company_id: undefined` en Prisma NO filtra nada.
+ */
+function requireCompany(req) {
+  if (!req.companyId) {
+    const err = new Error('Selecciona una empresa (header X-Company-Id)')
+    err.status = 400
+    throw err
+  }
+  return req.companyId
+}
+
 /** Where de sucursal: una concreta o todas las de la empresa (consolidada). */
 function branchWhere(req) {
   return req.branchId ? { branch_id: req.branchId } : { branch_id: { in: req.branchIds || [] } }
 }
 
-module.exports = { resolveTenant, requireBranch, branchWhere, hasPerm }
+module.exports = { resolveTenant, requireBranch, requireCompany, branchWhere, hasPerm }

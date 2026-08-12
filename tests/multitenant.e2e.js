@@ -275,6 +275,58 @@ async function main() {
   } catch (e) { blocked = e.code === 'P2002' }
   assert(blocked, 'la BD rechaza una referencia de venta duplicada en la misma sucursal')
 
+  console.log('\n== 10. Alcance de devoluciones, usuarios y asientos ==')
+  // Devoluciones: viven en la sucursal de su venta.
+  const retStatus = await prisma.returnStatus.upsert({
+    where: { name: 'Pendiente' }, update: {}, create: { name: 'Pendiente' },
+  })
+  const saleCentro = await prisma.sale.findFirst({ where: { branch_id: acmeCentro.id, reference: 'V-CEN-000001' } })
+  await prisma.return.create({
+    data: {
+      sale_id: saleCentro.id, status_id: retStatus.id, type: 'REFUND',
+      total_refund: 100, reason: 'prueba', processed_by: user.id,
+    },
+  })
+  const retsCentro = await prisma.return.count({ where: { sale: { branch_id: acmeCentro.id } } })
+  const retsNorte = await prisma.return.count({ where: { sale: { branch_id: acmeNorte.id } } })
+  assert(retsCentro === 1 && retsNorte === 0, 'la devolución solo se ve desde la sucursal de la venta')
+
+  // Usuarios: el listado se filtra por empresa activa.
+  const ajeno = await prisma.user.create({
+    data: { name: 'Ajeno', email: `a${Date.now()}@x.com`, password: 'h', role_id: role.id },
+  })
+  await prisma.userCompany.create({ data: { user_id: ajeno.id, company_id: globex.id } })
+  const usersAcme = await prisma.user.count({ where: { user_companies: { some: { company_id: acme.id } } } })
+  const usersGlobex = await prisma.user.count({ where: { user_companies: { some: { company_id: globex.id } } } })
+  assert(usersAcme === 1 && usersGlobex === 2, 'el listado de usuarios se filtra por empresa')
+
+  // Asientos: guardan la sucursal de origen; los de empresa quedan en NULL.
+  const { createEntry } = require('../src/services/accounting/core')
+  const cuentaCaja = await prisma.account.findFirst({ where: { company_id: acme.id, code: '1101' } })
+  const cuentaVenta = await prisma.account.create({
+    data: { company_id: acme.id, code: '4101', name: 'Ventas', type: 'INCOME' },
+  })
+  const conSucursal = await prisma.$transaction((tx) =>
+    createEntry(tx, {
+      company_id: acme.id, branch_id: acmeCentro.id, date: new Date(), description: 'Venta Centro',
+      lines: [
+        { account_id: cuentaCaja.id, debit: 100, credit: 0 },
+        { account_id: cuentaVenta.id, debit: 0, credit: 100 },
+      ],
+    }),
+  )
+  assert(conSucursal.branch_id === acmeCentro.id, 'el asiento guarda la sucursal que lo originó')
+  const deEmpresa = await prisma.$transaction((tx) =>
+    createEntry(tx, {
+      company_id: acme.id, date: new Date(), description: 'Ajuste de empresa',
+      lines: [
+        { account_id: cuentaCaja.id, debit: 50, credit: 0 },
+        { account_id: cuentaVenta.id, debit: 0, credit: 50 },
+      ],
+    }),
+  )
+  assert(deEmpresa.branch_id === null, 'un asiento sin sucursal es de empresa (NULL)')
+
   console.log('\nTODAS LAS PRUEBAS PASARON')
 }
 

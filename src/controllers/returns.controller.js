@@ -17,6 +17,7 @@ const {
   deductStockMap,
   getAvailabilityBatchWithKits,
 } = require('../services/bomStock')
+const { branchWhere } = require('../middlewares/tenant')
 
 // El stock de una devolución/cambio se mueve en la sucursal DONDE SE VENDIÓ
 // (sale.branch_id), no en la del request.
@@ -68,11 +69,10 @@ async function applyRefundToSale(tx, currentReturn) {
 }
 
 /** Resuelve sale_id (UUID o referencia ej. V-000001) al id interno de la venta */
-async function resolveSaleId(saleIdOrRef, companyId) {
+async function resolveSaleId(saleIdOrRef, scope) {
   if (!saleIdOrRef) return null
   const s = String(saleIdOrRef).trim()
   const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s)
-  const scope = { branch: { company_id: companyId } }
   const sale = await prisma.sale.findFirst({
     where: isUuid ? { id: s, ...scope } : { reference: s, ...scope },
     select: { id: true },
@@ -91,14 +91,15 @@ exports.list = async (req, res, next) => {
     const page = Math.max(1, Number(req.query.page ?? 1))
     const pageSize = Math.min(1000, Math.max(1, Number(req.query.pageSize ?? 50)))
 
-    const where = { sale: { branch: { company_id: req.companyId } } }
+    // Una devolución "vive" en la sucursal de su venta.
+    const where = { sale: { ...branchWhere(req) } }
 
     if (status) {
       where.status = { name: String(status) }
     }
 
     if (sale_id) {
-      const resolvedId = await resolveSaleId(sale_id, req.companyId)
+      const resolvedId = await resolveSaleId(sale_id, branchWhere(req))
       if (resolvedId) where.sale_id = resolvedId
     }
 
@@ -171,7 +172,7 @@ exports.getById = async (req, res, next) => {
     const { id } = req.params
 
     const returnRecord = await prisma.return.findFirst({
-      where: { id, sale: { branch: { company_id: req.companyId } } },
+      where: { id, sale: { ...branchWhere(req) } },
       include: {
         sale: {
           include: {
@@ -231,7 +232,7 @@ exports.create = async (req, res, next) => {
       })
     }
 
-    const sale_id = await resolveSaleId(saleIdOrRef, req.companyId)
+    const sale_id = await resolveSaleId(saleIdOrRef, branchWhere(req))
     if (!sale_id) {
       return res.status(404).json({ message: 'Venta no encontrada' })
     }
@@ -239,7 +240,7 @@ exports.create = async (req, res, next) => {
     const created = await prismaTransaction.$transaction(async (tx) => {
       // 1. Validar que la venta existe y está completada
       const sale = await tx.sale.findFirst({
-        where: { id: sale_id, branch: { company_id: req.companyId } },
+        where: { id: sale_id, ...branchWhere(req) },
         include: {
           status: true,
           sale_items: {
@@ -497,8 +498,8 @@ exports.updateStatus = async (req, res, next) => {
 
     const result = await prismaTransaction.$transaction(async (tx) => {
       // 1. Cargar devolución actual
-      const currentReturn = await tx.return.findUnique({
-        where: { id },
+      const currentReturn = await tx.return.findFirst({
+        where: { id, sale: { ...branchWhere(req) } },
         include: {
           sale: { select: { branch_id: true } },
           status: true,

@@ -21,6 +21,7 @@ const {
 } = require('../config/security')
 const { generateUserTemplate } = require('../services/userTemplate')
 const { bulkValidateUsers, bulkCreateUsers } = require('../services/userBulkImport')
+const { requireCompany } = require('../middlewares/tenant')
 
 // Consulta reutilizable de usuario con rol + permisos para el login/refresh/me.
 const userWithPerms = {
@@ -91,9 +92,13 @@ exports.list = async (req, res, next) => {
     const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 20)))
     
     // Filtros opcionales
-    const { role_id, search } = req.query || {}
-    const where = {}
-    
+    const { role_id, search, branch_id } = req.query || {}
+    // Solo usuarios de la empresa activa; opcionalmente de una sucursal concreta.
+    const where = { user_companies: { some: { company_id: requireCompany(req) } } }
+    if (branch_id) {
+      where.user_branches = { some: { branch_id: String(branch_id) } }
+    }
+
     if (role_id) {
       where.role_id = Number(role_id)
     }
@@ -111,7 +116,14 @@ exports.list = async (req, res, next) => {
     
     const users = await prisma.user.findMany({
       where,
-      include: { role: true, cashRegister: { select: { id: true, name: true, code: true, active: true } } },
+      include: {
+        role: true,
+        cashRegister: { select: { id: true, name: true, code: true, active: true } },
+        user_branches: {
+          where: { branch: { company_id: req.companyId } },
+          select: { branch: { select: { id: true, name: true, code: true, active: true } } },
+        },
+      },
       orderBy: { name: 'asc' },
       skip: (safePage - 1) * pageSize,
       take: pageSize
@@ -134,6 +146,8 @@ exports.list = async (req, res, next) => {
         hire_date: u.hire_date,
         cash_register_id: u.cash_register_id,
         cash_register: u.cashRegister,
+        default_branch_id: u.default_branch_id,
+        branches: u.user_branches.map((ub) => ub.branch),
         created_at: u.created_at,
         updated_at: u.updated_at
       })),
@@ -272,9 +286,16 @@ exports.logout = async (req, res, next) => {
 exports.getById = async (req, res, next) => {
   try {
     const { id } = req.params
-    const user = await prisma.user.findUnique({
-      where: { id },
-      include: { role: true, cashRegister: { select: { id: true, name: true, code: true, active: true } } }
+    const user = await prisma.user.findFirst({
+      where: { id, user_companies: { some: { company_id: requireCompany(req) } } },
+      include: {
+        role: true,
+        cashRegister: { select: { id: true, name: true, code: true, active: true } },
+        user_branches: {
+          where: { branch: { company_id: req.companyId } },
+          select: { branch: { select: { id: true, name: true, code: true, active: true } } },
+        },
+      }
     })
 
     if (!user) {
@@ -294,6 +315,8 @@ exports.getById = async (req, res, next) => {
       hire_date: user.hire_date,
       cash_register_id: user.cash_register_id,
       cash_register: user.cashRegister,
+      default_branch_id: user.default_branch_id,
+      branches: user.user_branches.map((ub) => ub.branch),
       created_at: user.created_at,
       updated_at: user.updated_at
     })
@@ -306,8 +329,10 @@ exports.update = async (req, res, next) => {
     const { id } = req.params
     const { name, email, role_id, password, is_employee, photo_url, phone, address, hire_date, cash_register_id } = req.body || {}
 
-    // Validar que el usuario existe
-    const existingUser = await prisma.user.findUnique({ where: { id } })
+    // Validar que el usuario existe y pertenece a la empresa activa
+    const existingUser = await prisma.user.findFirst({
+      where: { id, user_companies: { some: { company_id: requireCompany(req) } } }
+    })
     if (!existingUser) {
       return res.status(404).json({ message: 'Usuario no encontrado' })
     }
@@ -333,7 +358,7 @@ exports.update = async (req, res, next) => {
     if (cash_register_id !== undefined) {
       if (cash_register_id) {
         const register = await prisma.cashRegister.findFirst({
-          where: { id: String(cash_register_id), active: true }
+          where: { id: String(cash_register_id), active: true, branch: { company_id: req.companyId } }
         })
         if (!register) {
           return res.status(400).json({ message: 'La caja indicada no existe o está inactiva' })
@@ -380,8 +405,10 @@ exports.delete = async (req, res, next) => {
   try {
     const { id } = req.params
 
-    // Validar que el usuario existe
-    const user = await prisma.user.findUnique({ where: { id } })
+    // Validar que el usuario existe y pertenece a la empresa activa
+    const user = await prisma.user.findFirst({
+      where: { id, user_companies: { some: { company_id: requireCompany(req) } } }
+    })
     if (!user) {
       return res.status(404).json({ message: 'Usuario no encontrado' })
     }

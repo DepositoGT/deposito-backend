@@ -164,6 +164,7 @@ exports.updateConfig = async (req, res, next) => {
 const ENTRY_INCLUDE = {
   lines: { include: { account: { select: { code: true, name: true } } }, orderBy: { id: 'asc' } },
   createdBy: { select: { name: true } },
+  branch: { select: { id: true, name: true, code: true } },
   reversals: { select: { id: true, entry_number: true } },
   reversalOf: { select: { id: true, entry_number: true } },
 }
@@ -177,6 +178,12 @@ exports.listJournal = async (req, res, next) => {
       company_id: req.companyId,
       ...(from || to ? { date: { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) } } : {}),
       ...(req.query.source ? { source_type: req.query.source } : {}),
+      // 'company' = solo asientos sin sucursal (manuales, cierre, importación)
+      ...(req.query.branch_id === 'company'
+        ? { branch_id: null }
+        : req.query.branch_id
+          ? { branch_id: String(req.query.branch_id) }
+          : {}),
     }
     const totalItems = await prisma.journalEntry.count({ where })
     const totalPages = Math.max(1, Math.ceil(totalItems / pageSize))
@@ -208,7 +215,7 @@ exports.createManualEntry = async (req, res, next) => {
     const { date, description, lines } = req.body || {}
     if (!date || !description) return res.status(400).json({ error: 'Fecha y descripción son requeridas' })
     const entry = await prisma.$transaction((tx) =>
-      createEntry(tx, { company_id: req.companyId, date, description, source_type: 'MANUAL', created_by: userId(req), lines }),
+      createEntry(tx, { company_id: req.companyId, branch_id: req.branchId ?? null, date, description, source_type: 'MANUAL', created_by: userId(req), lines }),
     )
     res.status(201).json(entry)
   } catch (e) { handle(e, res, next) }
@@ -232,6 +239,7 @@ exports.reverseEntry = async (req, res, next) => {
     const entry = await prisma.$transaction((tx) =>
       createEntry(tx, {
         company_id: req.companyId,
+        branch_id: original.branch_id,
         date: reversalDate,
         description: `Anulación de ${original.entry_number}: ${original.description}`.slice(0, 255),
         source_type: 'MANUAL',

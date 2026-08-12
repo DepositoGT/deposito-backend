@@ -158,8 +158,8 @@ exports.listForUser = async (req, res, next) => {
       where: { user_id: userId, branch: { company_id: req.companyId } },
       select: { branch: { select: BRANCH_SELECT } },
     })
-    const user = await prisma.user.findUnique({
-      where: { id: userId },
+    const user = await prisma.user.findFirst({
+      where: { id: userId, user_companies: { some: { company_id: req.companyId } } },
       select: { default_branch_id: true },
     })
     res.json({
