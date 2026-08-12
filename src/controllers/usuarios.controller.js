@@ -295,6 +295,9 @@ exports.getById = async (req, res, next) => {
           where: { branch: { company_id: req.companyId } },
           select: { branch: { select: { id: true, name: true, code: true, active: true } } },
         },
+        user_companies: {
+          select: { company: { select: { id: true, name: true, code: true } } },
+        },
       }
     })
 
@@ -317,6 +320,7 @@ exports.getById = async (req, res, next) => {
       cash_register: user.cashRegister,
       default_branch_id: user.default_branch_id,
       branches: user.user_branches.map((ub) => ub.branch),
+      companies: user.user_companies.map((uc) => uc.company),
       created_at: user.created_at,
       updated_at: user.updated_at
     })

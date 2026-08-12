@@ -17,5 +17,7 @@ router.get('/', Auth, Companies.list)
 router.post('/', Auth, hasPermission('companies.manage'), Companies.create)
 router.put('/:id', Auth, hasPermission('companies.manage'), Companies.update)
 router.put('/:id/users', Auth, hasPermission('companies.manage'), Companies.assignUsers)
+router.post('/:id/users/:userId', Auth, hasPermission('companies.manage'), Companies.addUser)
+router.delete('/:id/users/:userId', Auth, hasPermission('companies.manage'), Companies.removeUser)
 
 module.exports = router

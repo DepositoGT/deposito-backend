@@ -194,6 +194,45 @@ async function main() {
   assert(n.stock === 30, 'el destino sumó lo recibido (20 → 30)')
   assert(m.stock === 115, 'el espejo refleja la merma de tránsito (2 unidades perdidas)')
 
+  // Los lotes viajan con la mercancía: salen del origen y se recrean en destino
+  console.log('\n== 6b. Lotes en traslados ==')
+  const { consumeLotsFEFO, recreateLotsFromSnapshot } = require('../src/services/lots')
+  const lotProd = await mk('Leche', acme, catA, supA, 'LECHE-1')
+  await setStock(lotProd, acmeCentro, 20)
+  await prisma.productLot.createMany({
+    data: [
+      { product_id: lotProd.id, branch_id: acmeCentro.id, lot_code: 'L-VIEJO', expiry_date: new Date('2026-09-01'), qty_received: 8, qty_remaining: 8 },
+      { product_id: lotProd.id, branch_id: acmeCentro.id, lot_code: 'L-NUEVO', expiry_date: new Date('2026-12-01'), qty_received: 12, qty_remaining: 12 },
+    ],
+  })
+
+  const snapshot = await prisma.$transaction(async (tx) => {
+    const consumed = await consumeLotsFEFO(tx, new Map([[lotProd.id, 10]]), acmeCentro.id)
+    return consumed.get(lotProd.id)
+  })
+  assert(snapshot.length === 2 && snapshot[0].lot_code === 'L-VIEJO' && snapshot[0].qty === 8,
+    'al enviar salen los lotes más próximos a vencer primero (FEFO)')
+
+  const centroLots = await prisma.productLot.findMany({
+    where: { product_id: lotProd.id, branch_id: acmeCentro.id }, orderBy: { lot_code: 'asc' },
+  })
+  assert(centroLots.find((l) => l.lot_code === 'L-VIEJO').qty_remaining === 0 &&
+    centroLots.find((l) => l.lot_code === 'L-NUEVO').qty_remaining === 10,
+    'el origen queda sin el lote viejo y con 10 del nuevo')
+
+  // Llegan 9 de 10: el faltante sale del último lote del snapshot
+  await prisma.$transaction((tx) =>
+    recreateLotsFromSnapshot(tx, lotProd.id, acmeNorte.id, snapshot, 9))
+  const norteLots = await prisma.productLot.findMany({
+    where: { product_id: lotProd.id, branch_id: acmeNorte.id }, orderBy: { lot_code: 'asc' },
+  })
+  assert(norteLots.length === 2, 'el destino recibe los dos lotes con su identidad')
+  assert(norteLots.find((l) => l.lot_code === 'L-VIEJO').qty_remaining === 8 &&
+    norteLots.find((l) => l.lot_code === 'L-NUEVO').qty_remaining === 1,
+    'la merma de tránsito se descuenta del último lote (8 + 1 = 9 recibidas)')
+  assert(norteLots.find((l) => l.lot_code === 'L-VIEJO').expiry_date.toISOString().slice(0, 10) === '2026-09-01',
+    'la caducidad viaja con el lote')
+
   console.log('\n== 7. Kits por sucursal ==')
   const compA = await mk('Botella', acme, catA, supA, 'BOT-1')
   const compB = await mk('Caja', acme, catA, supA, 'CAJ-1')

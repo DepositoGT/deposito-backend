@@ -20,6 +20,11 @@ const { nextDocumentReference } = require('../services/referenceGenerator')
 const { deductStockMap, restoreStockMap, expandLinesToStockMap } = require('../services/bomStock')
 const { assertLinesAvailable } = require('../services/stockAvailability')
 const { ensureStockAlertsBatch } = require('../services/stockAlerts')
+const { consumeLotsFEFO, recreateLotsFromSnapshot } = require('../services/lots')
+
+// El pooler de Supabase excede los 5s por defecto en conexiones frías: sin esto
+// el envío fallaba "a veces" y funcionaba al reintentar (conexión ya caliente).
+const TX_OPTIONS = { maxWait: 10000, timeout: 20000 }
 
 const TRANSFER_INCLUDE = {
   fromBranch: { select: { id: true, name: true, code: true } },
@@ -176,8 +181,21 @@ exports.create = async (req, res, next) => {
       const updated = await deductStockMap(tx, stockMap, fromBranchId)
       await ensureStockAlertsBatch(tx, updated, fromBranchId)
 
+      // Los lotes viajan con la mercancía: salen del origen y se guardan en la
+      // línea para recrearlos en el destino al recibir.
+      const lotsByProduct = await consumeLotsFEFO(tx, stockMap, fromBranchId)
+      for (const line of transfer.lines) {
+        const snapshot = lotsByProduct.get(String(line.product_id))
+        if (snapshot?.length) {
+          await tx.stockTransferLine.update({
+            where: { id: line.id },
+            data: { lots_snapshot: snapshot },
+          })
+        }
+      }
+
       return transfer
-    })
+    }, TX_OPTIONS)
 
     res.status(201).json(created)
   } catch (e) { next(e) }
@@ -242,6 +260,7 @@ exports.receive = async (req, res, next) => {
         })
         if (qty > 0) {
           stockMap.set(String(line.product_id), (stockMap.get(String(line.product_id)) || 0) + qty)
+          await recreateLotsFromSnapshot(tx, String(line.product_id), branchId, line.lots_snapshot, qty)
         }
       }
 
@@ -259,7 +278,7 @@ exports.receive = async (req, res, next) => {
         },
         include: TRANSFER_INCLUDE,
       })
-    })
+    }, TX_OPTIONS)
 
     res.json(result)
   } catch (e) { next(e) }
@@ -295,6 +314,10 @@ exports.cancel = async (req, res, next) => {
       const stockMap = new Map()
       for (const line of transfer.lines) {
         stockMap.set(String(line.product_id), (stockMap.get(String(line.product_id)) || 0) + line.qty_sent)
+        // Los lotes que salieron vuelven al origen
+        await recreateLotsFromSnapshot(
+          tx, String(line.product_id), transfer.from_branch_id, line.lots_snapshot, line.qty_sent,
+        )
       }
       const updated = await restoreStockMap(tx, stockMap, transfer.from_branch_id)
       await ensureStockAlertsBatch(tx, updated, transfer.from_branch_id)
@@ -304,7 +327,7 @@ exports.cancel = async (req, res, next) => {
         data: { status: 'CANCELADA', cancelled_at: new Date() },
         include: TRANSFER_INCLUDE,
       })
-    })
+    }, TX_OPTIONS)
 
     res.json(result)
   } catch (e) { next(e) }

@@ -173,6 +173,9 @@ model StockTransferLine {
   product      Product       @relation(fields: [product_id], references: [id], onDelete: Restrict)
   qty_sent     Int
   qty_received Int?
+  /// Lotes consumidos en el origen al enviar: [{ lot_code, expiry_date, unit_cost, supplier_id, qty }].
+  /// Al recibir se recrean en el destino; al cancelar se devuelven al origen.
+  lots_snapshot Json?
 
   @@index([transfer_id])
   @@index([product_id])

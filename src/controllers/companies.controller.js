@@ -84,6 +84,63 @@ exports.update = async (req, res, next) => {
   } catch (e) { next(e) }
 }
 
+/** El que administra debe pertenecer a la empresa que toca. */
+async function assertMember(req, companyId) {
+  const member = await prisma.userCompany.findUnique({
+    where: { user_id_company_id: { user_id: req.user.sub, company_id: companyId } },
+  })
+  if (!member) {
+    const err = new Error('Sin acceso a esa empresa')
+    err.status = 403
+    throw err
+  }
+}
+
+// POST /api/companies/:id/users/:userId — da acceso a la empresa (sin sucursales aún)
+exports.addUser = async (req, res, next) => {
+  try {
+    const { id, userId } = req.params
+    await assertMember(req, id)
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true } })
+    if (!user) return res.status(404).json({ message: 'Usuario no encontrado' })
+
+    await prisma.userCompany.upsert({
+      where: { user_id_company_id: { user_id: userId, company_id: id } },
+      update: {},
+      create: { user_id: userId, company_id: id },
+    })
+    res.json({ ok: true })
+  } catch (e) { next(e) }
+}
+
+// DELETE /api/companies/:id/users/:userId — quita el acceso y sus sucursales ahí
+exports.removeUser = async (req, res, next) => {
+  try {
+    const { id, userId } = req.params
+    await assertMember(req, id)
+    if (userId === req.user.sub) {
+      return res.status(400).json({ message: 'No puedes quitarte a ti mismo de la empresa' })
+    }
+
+    await prisma.$transaction(async (tx) => {
+      await tx.userBranch.deleteMany({
+        where: { user_id: userId, branch: { company_id: id } },
+      })
+      await tx.userCompany.deleteMany({ where: { user_id: userId, company_id: id } })
+      // Si su sucursal por defecto era de esta empresa, deja de serlo
+      const remaining = await tx.userBranch.findFirst({
+        where: { user_id: userId },
+        select: { branch_id: true },
+      })
+      await tx.user.update({
+        where: { id: userId },
+        data: { default_branch_id: remaining?.branch_id ?? null },
+      })
+    })
+    res.json({ ok: true })
+  } catch (e) { next(e) }
+}
+
 // PUT /api/companies/:id/users — reemplaza los usuarios de la empresa
 exports.assignUsers = async (req, res, next) => {
   try {

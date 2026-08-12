@@ -92,6 +92,12 @@ exports.list = async (req, res, next) => {
 
     const where = includeDeleted === 'true' ? {} : { deleted: false }
     where.company_id = req.companyId
+    // ?in_branch=1 → solo los productos que esta sucursal maneja (tienen fila de
+    // stock propia), en vez de todo el catálogo de la empresa en cero.
+    const inBranchOnly = req.query.in_branch === '1' || req.query.in_branch === 'true'
+    if (inBranchOnly && req.branchId) {
+      where.branch_stocks = { some: { branch_id: req.branchId } }
+    }
     if (forSaleOnly) {
       where.available_for_sale = true
     }
@@ -1108,7 +1114,12 @@ exports.lotsExpiring = async (req, res, next) => {
     const today = new Date(Date.UTC(nowTz.year, nowTz.month - 1, nowTz.day))
     const limit = new Date(today.getTime() + days * 86400000)
 
-    const where = { qty_remaining: { gt: 0 } }
+    // Los lotes son de una sucursal: sin este filtro el reporte mezclaba
+    // sucursales (y empresas).
+    const where = {
+      qty_remaining: { gt: 0 },
+      ...(req.branchId ? { branch_id: req.branchId } : { branch: { company_id: req.companyId } }),
+    }
     if (status === 'expired') where.expiry_date = { lt: today }
     else if (status === 'expiring') where.expiry_date = { gte: today, lte: limit }
     else where.expiry_date = { lte: limit } // all: vencidos + por vencer
@@ -1119,7 +1130,8 @@ exports.lotsExpiring = async (req, res, next) => {
       include: {
         product: {
           select: { id: true, name: true, brand: true, size: true, barcode: true, stock: true, image_url: true }
-        }
+        },
+        branch: { select: { id: true, name: true, code: true } },
       },
     })
 
@@ -1128,7 +1140,11 @@ exports.lotsExpiring = async (req, res, next) => {
     const sums = productIds.length
       ? await prisma.productLot.groupBy({
           by: ['product_id'],
-          where: { product_id: { in: productIds }, qty_remaining: { gt: 0 } },
+          where: {
+            product_id: { in: productIds },
+            qty_remaining: { gt: 0 },
+            ...(req.branchId ? { branch_id: req.branchId } : { branch: { company_id: req.companyId } }),
+          },
           _sum: { qty_remaining: true },
         })
       : []
@@ -1146,6 +1162,7 @@ exports.lotsExpiring = async (req, res, next) => {
           qty_remaining: l.qty_remaining,
           days_to_expiry: Math.round((new Date(l.expiry_date).getTime() - today.getTime()) / 86400000),
           received_at: l.received_at,
+          branch: l.branch,
           product: {
             ...l.product,
             lotted,

@@ -124,6 +124,7 @@ exports.listRegisters = async (req, res, next) => {
       where: { ...(includeInactive ? {} : { active: true }), ...branchWhere(req) },
       orderBy: [{ is_default: 'desc' }, { name: 'asc' }],
       include: {
+        branch: { select: { id: true, name: true, code: true } },
         assigned_users: { select: { id: true, name: true } },
         sessions: {
           where: { status: 'OPEN' },

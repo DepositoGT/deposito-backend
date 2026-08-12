@@ -82,20 +82,28 @@ function fefoSort(a, b) {
  * Best-effort: nunca lanza.
  * @param {object} tx cliente Prisma (transacción o no)
  * @param {Map<string, number>} stockMap product_id -> qty vendida
+ * @returns {Promise<Map<string, Array<object>>>} product_id -> lotes consumidos
+ *   [{ lot_code, expiry_date, unit_cost, supplier_id, qty }], en orden FEFO.
+ *   Vacío si algo falló: quien lo use debe tolerarlo (los lotes son advisory).
  */
 async function consumeLotsFEFO(tx, stockMap, branchId) {
+  const consumed = new Map()
   try {
     const client = tx || prisma
     const productIds = Array.from(stockMap.keys())
-    if (productIds.length === 0) return
+    if (productIds.length === 0) return consumed
     if (!branchId) {
       console.error('[lots] consumeLotsFEFO sin branchId; omitido')
-      return
+      return consumed
     }
     const lots = await client.productLot.findMany({
       where: { product_id: { in: productIds }, branch_id: branchId, qty_remaining: { gt: 0 } },
-      select: { id: true, product_id: true, qty_remaining: true, expiry_date: true, received_at: true },
+      select: {
+        id: true, product_id: true, qty_remaining: true, expiry_date: true, received_at: true,
+        lot_code: true, unit_cost: true, supplier_id: true,
+      },
     })
+    const byId = new Map(lots.map((l) => [l.id, l]))
     for (const [productId, qty] of stockMap.entries()) {
       const productLots = lots.filter((l) => l.product_id === productId).sort(fefoSort)
       for (const { lotId, take } of planConsume(productLots, qty)) {
@@ -103,10 +111,54 @@ async function consumeLotsFEFO(tx, stockMap, branchId) {
           where: { id: lotId },
           data: { qty_remaining: { decrement: take } },
         })
+        const lot = byId.get(lotId)
+        if (!consumed.has(productId)) consumed.set(productId, [])
+        consumed.get(productId).push({
+          lot_code: lot.lot_code,
+          expiry_date: lot.expiry_date ? lot.expiry_date.toISOString().slice(0, 10) : null,
+          unit_cost: lot.unit_cost != null ? Number(lot.unit_cost) : null,
+          supplier_id: lot.supplier_id,
+          qty: take,
+        })
       }
     }
   } catch (e) {
     console.error('[lots] consumeLotsFEFO (advisory) falló:', e.message)
+  }
+  return consumed
+}
+
+/**
+ * Recrea en `branchId` los lotes que viajaron en un traslado, hasta cubrir
+ * `qty` (lo efectivamente recibido puede ser menor a lo enviado). Los lotes se
+ * toman en el orden del snapshot, que ya viene FEFO. Best-effort: nunca lanza.
+ * @param {Array<object>} snapshot lotes serializados por consumeLotsFEFO
+ */
+async function recreateLotsFromSnapshot(tx, productId, branchId, snapshot, qty) {
+  try {
+    if (!branchId || !Array.isArray(snapshot) || snapshot.length === 0) return
+    const client = tx || prisma
+    let left = Number(qty) || 0
+    for (const lot of snapshot) {
+      if (left <= 0) break
+      const take = Math.min(left, Number(lot.qty) || 0)
+      if (take <= 0) continue
+      left -= take
+      await client.productLot.create({
+        data: {
+          product_id: productId,
+          branch_id: branchId,
+          lot_code: lot.lot_code || null,
+          expiry_date: lot.expiry_date ? new Date(lot.expiry_date) : null,
+          qty_received: take,
+          qty_remaining: take,
+          unit_cost: lot.unit_cost != null ? lot.unit_cost : null,
+          supplier_id: lot.supplier_id || null,
+        },
+      })
+    }
+  } catch (e) {
+    console.error('[lots] recreateLotsFromSnapshot (advisory) falló:', e.message)
   }
 }
 
@@ -261,5 +313,6 @@ async function syncLotExpiryAlerts(tx, opts = {}) {
 
 module.exports = {
   planConsume, planRestore, fefoSort, consumeLotsFEFO, restoreLotsFEFO, generateLotCode,
+  recreateLotsFromSnapshot,
   syncLotExpiryAlerts,
 }
