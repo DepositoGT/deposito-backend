@@ -327,6 +327,45 @@ async function main() {
   )
   assert(deEmpresa.branch_id === null, 'un asiento sin sucursal es de empresa (NULL)')
 
+  // Resultado por sucursal: la sucursal como centro de costo.
+  const cuentaCosto = await prisma.account.create({
+    data: { company_id: acme.id, code: '5101', name: 'Costo de ventas', type: 'COST' },
+  })
+  await prisma.$transaction((tx) =>
+    createEntry(tx, {
+      company_id: acme.id, branch_id: acmeNorte.id, date: new Date(), description: 'Venta Norte',
+      lines: [
+        { account_id: cuentaCaja.id, debit: 60, credit: 0 },
+        { account_id: cuentaVenta.id, debit: 0, credit: 60 },
+      ],
+    }),
+  )
+  await prisma.$transaction((tx) =>
+    createEntry(tx, {
+      company_id: acme.id, branch_id: acmeCentro.id, date: new Date(), description: 'Costo Centro',
+      lines: [
+        { account_id: cuentaCosto.id, debit: 40, credit: 0 },
+        { account_id: cuentaCaja.id, debit: 0, credit: 40 },
+      ],
+    }),
+  )
+  const reports = require('../src/controllers/accountingReports.controller')
+  const porSucursal = await new Promise((resolve, reject) => {
+    reports.byBranch(
+      { companyId: acme.id, query: {} },
+      { json: resolve },
+      reject,
+    )
+  })
+  const centroRow = porSucursal.branches.find((b) => b.branch_id === acmeCentro.id)
+  const norteRow = porSucursal.branches.find((b) => b.branch_id === acmeNorte.id)
+  const empresaRow = porSucursal.branches.find((b) => b.branch_id === null)
+  assert(centroRow.income === 100 && centroRow.costs === 40 && centroRow.netIncome === 60,
+    'Centro: ingresos 100, costo 40, utilidad 60')
+  assert(norteRow.income === 60 && norteRow.netIncome === 60, 'Norte: ingresos 60, utilidad 60')
+  assert(empresaRow.income === 50, 'el asiento sin sucursal se agrupa como "Empresa"')
+  assert(porSucursal.totals.income === 210, 'el total de la empresa suma todas las sucursales (100+60+50)')
+
   console.log('\nTODAS LAS PRUEBAS PASARON')
 }
 
