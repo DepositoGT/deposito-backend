@@ -159,7 +159,7 @@ exports.calculateTheoretical = async (req, res, next) => {
 
     const isAdminRole = String(req.user?.role?.name || req.user?.role_name || '').toLowerCase() === 'admin'
 
-    const tz = await getTimezone(prisma)
+    const tz = await getTimezone(prisma, req.companyId)
     let start
     let end
     let sessionOpeningFloat = 0
@@ -414,7 +414,7 @@ exports.create = async (req, res, next) => {
       return res.status(403).json({ message: 'Solo puede registrar el cierre de su propia caja' })
     }
 
-    const tz = await getTimezone(prisma)
+    const tz = await getTimezone(prisma, req.companyId)
     // Parsear fechas: vienen sin 'Z', son hora local configurada
     const cleanStartDate = String(startDate).replace('Z', '').replace(/[+-]\d{2}:\d{2}$/, '');
     const cleanEndDate = String(endDate).replace('Z', '').replace(/[+-]\d{2}:\d{2}$/, '');
@@ -759,7 +759,7 @@ exports.validate = async (req, res, next) => {
       return res.status(400).json({ message: 'Nombre y firma del supervisor son requeridos' })
     }
 
-    const tz = await getTimezone(prisma)
+    const tz = await getTimezone(prisma, req.companyId)
     const nowLocal = DateTime.now().setZone(tz);
     const validatedAtUTC = DateTime.utc(
       nowLocal.year, nowLocal.month, nowLocal.day,
@@ -821,7 +821,7 @@ exports.getLastClosureDate = async (req, res, next) => {
       }
     })
 
-    const tz = await getTimezone(prisma)
+    const tz = await getTimezone(prisma, req.companyId)
     const fallbackStart = DateTime.now().setZone(tz).startOf('day').toJSDate()
 
     res.json({
@@ -880,7 +880,7 @@ exports.updateStatus = async (req, res, next) => {
     }
 
     if (status === 'Rechazado' && rejection_reason) {
-      const tz = await getTimezone(prisma)
+      const tz = await getTimezone(prisma, req.companyId)
       const nowStr = DateTime.now().setZone(tz).toFormat('dd/MM/yyyy HH:mm')
       const existingNotes = closure.notes || ''
       updateData.notes = existingNotes 

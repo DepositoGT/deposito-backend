@@ -9,6 +9,8 @@
  */
 
 const { prisma } = require('../models/prisma')
+const { seedCompanySettings } = require('../services/companySettings')
+const { invalidateSystemConfigCache } = require('../utils/getTimezone')
 
 const COMPANY_SELECT = {
   id: true, name: true, code: true, tax_id: true, address: true,
@@ -50,6 +52,8 @@ exports.create = async (req, res, next) => {
       })
       await tx.userCompany.create({ data: { user_id: req.user.sub, company_id: company.id } })
       await tx.userBranch.create({ data: { user_id: req.user.sub, branch_id: branch.id } })
+      // Nace configurada: moneda, zona horaria, denominaciones y sus datos fiscales
+      await seedCompanySettings(tx, company.id, company)
       return { ...company, branches: [branch] }
     })
     res.status(201).json(result)
@@ -80,6 +84,22 @@ exports.update = async (req, res, next) => {
     if (active !== undefined) data.active = Boolean(active)
 
     const company = await prisma.company.update({ where: { id }, data, select: COMPANY_SELECT })
+
+    // Espejo a las claves que usan los PDFs y membretes (ver settings.update)
+    const mirror = []
+    if (name !== undefined) mirror.push(['company_name', String(name)])
+    if (tax_id !== undefined) mirror.push(['company_nit', String(tax_id ?? '')])
+    if (address !== undefined) mirror.push(['company_address', String(address ?? '')])
+    if (logo_url !== undefined) mirror.push(['company_logo_url', String(logo_url ?? '')])
+    for (const [key, value] of mirror) {
+      await prisma.systemSetting.upsert({
+        where: { company_id_key: { company_id: id, key } },
+        update: { value, type: 'string' },
+        create: { company_id: id, key, value, type: 'string' },
+      })
+    }
+    if (mirror.length > 0) invalidateSystemConfigCache(id)
+
     res.json(company)
   } catch (e) { next(e) }
 }

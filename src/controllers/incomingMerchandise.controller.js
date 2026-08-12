@@ -686,7 +686,7 @@ exports.generateReport = async (req, res, next) => {
     res.setHeader('Content-Disposition', 'attachment; filename="reporte-mercancia.pdf"')
     doc.pipe(res)
 
-    const branding = await getBrandingForPdf(prisma)
+    const branding = await getBrandingForPdf(prisma, req.companyId)
     const companyName = branding.company_name
     if (branding.logoBuffer) {
       try {

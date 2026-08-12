@@ -834,7 +834,7 @@ function sendCsv(res, filename, headerLines = [], sections = []) {
 
 async function salesReport(req, res, next) {
   try {
-  const branding = await getBrandingForPdf(prisma)
+  const branding = await getBrandingForPdf(prisma, req.companyId)
   const companyName = branding.company_name
   const logoBuffer = branding.logoBuffer
   const money = makeMoney(branding.currency_code)
@@ -943,7 +943,7 @@ async function salesReport(req, res, next) {
 
 async function inventoryReport(req,res,next){
   try {
-    const branding = await getBrandingForPdf(prisma)
+    const branding = await getBrandingForPdf(prisma, req.companyId)
     const companyName = branding.company_name
     const logoBuffer = branding.logoBuffer
     const money = makeMoney(branding.currency_code)
@@ -984,7 +984,7 @@ async function inventoryReport(req,res,next){
 
 async function suppliersReport(req, res, next) {
   try {
-    const branding = await getBrandingForPdf(prisma)
+    const branding = await getBrandingForPdf(prisma, req.companyId)
     const companyName = branding.company_name
     const logoBuffer = branding.logoBuffer
     const money = makeMoney(branding.currency_code)
@@ -1134,7 +1134,7 @@ async function suppliersReport(req, res, next) {
 
 async function financialReport(req, res, next) {
   try {
-    const branding = await getBrandingForPdf(prisma)
+    const branding = await getBrandingForPdf(prisma, req.companyId)
     const companyName = branding.company_name
     const logoBuffer = branding.logoBuffer
     const money = makeMoney(branding.currency_code)
@@ -1365,7 +1365,7 @@ async function getAlertsReportData(req) {
 
 async function alertsReport(req, res, next) {
   try {
-    const branding = await getBrandingForPdf(prisma)
+    const branding = await getBrandingForPdf(prisma, req.companyId)
     const companyName = branding.company_name
     const logoBuffer = branding.logoBuffer
     const money = makeMoney(branding.currency_code)
@@ -1712,7 +1712,7 @@ async function getProductsAnalysisData(req) {
 
 async function productsReport(req, res, next) {
   try {
-    const branding = await getBrandingForPdf(prisma)
+    const branding = await getBrandingForPdf(prisma, req.companyId)
     const companyName = branding.company_name
     const logoBuffer = branding.logoBuffer
     const money = makeMoney(branding.currency_code)
@@ -2022,7 +2022,7 @@ async function inventoryCountSessionReport(req, res, next) {
       },
     })
 
-    const branding = await getBrandingForPdf(prisma)
+    const branding = await getBrandingForPdf(prisma, req.companyId)
     const companyName = branding.company_name
     const logoBuffer = branding.logoBuffer
     const money = makeMoney(branding.currency_code)
@@ -2171,7 +2171,7 @@ function inventoryCountStatusLabel(status) {
  */
 async function inventoryCountsHistoryReport(req, res, next) {
   try {
-    const branding = await getBrandingForPdf(prisma)
+    const branding = await getBrandingForPdf(prisma, req.companyId)
     const companyName = branding.company_name
     const logoBuffer = branding.logoBuffer
     const money = makeMoney(branding.currency_code)
@@ -2343,7 +2343,7 @@ async function inventoryCountsHistoryReport(req, res, next) {
 
 async function merchandiseReport(req, res, next) {
   try {
-    const branding = await getBrandingForPdf(prisma)
+    const branding = await getBrandingForPdf(prisma, req.companyId)
     const companyName = branding.company_name
     const logoBuffer = branding.logoBuffer
     const money = makeMoney(branding.currency_code)

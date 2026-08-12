@@ -109,7 +109,7 @@ exports.list = async (req, res, next) => {
     let startDate
     let endDate
     if (period && !searchTerm) {
-      const tz = await getTimezone(prisma)
+      const tz = await getTimezone(prisma, req.companyId)
       const nowGt = DateTime.now().setZone(tz)
       let startGt
       let endGt
@@ -627,7 +627,7 @@ exports.create = async (req, res, next) => {
       const completadaStatus = await tx.saleStatus.findFirst({ where: { name: 'Completada' } })
       if (!completadaStatus) throw new Error("No existe el estado 'Completada'")
 
-      const tz = await getTimezone(prisma)
+      const tz = await getTimezone(prisma, req.companyId)
       const nowGt = DateTime.now().setZone(tz);
 
       // Create UTC Date with Guatemala's time values

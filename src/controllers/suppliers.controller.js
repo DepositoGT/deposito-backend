@@ -192,7 +192,7 @@ exports.list = async (req, res, next) => {
       take: pageSize,
     })
 
-    const tz = await getTimezone(prisma)
+    const tz = await getTimezone(prisma, req.companyId)
     const adapted = items.map(s => {
       const shaped = shapeSupplierResponse(s)
       let lastOrder = ''
@@ -348,7 +348,7 @@ exports.getOne = async (req, res, next) => {
         : []
     const categoryNames = categories.map(c => c.name)
 
-    const tz = await getTimezone(prisma)
+    const tz = await getTimezone(prisma, req.companyId)
     const shaped = shapeSupplierResponse(item)
     const adapted = {
       ...shaped,
@@ -494,7 +494,7 @@ exports.remove = async (req, res, next) => {
       return res.status(err.statusCode || 403).json({ message: err.message })
     }
 
-    const tz = await getTimezone(prisma)
+    const tz = await getTimezone(prisma, req.companyId)
     const nowGt = DateTime.now().setZone(tz)
     const dateAsUtcWithGtClock = new Date(Date.UTC(
       nowGt.year,

@@ -83,8 +83,11 @@ exports.getPublic = async (req, res, next) => {
  */
 exports.getCompanyName = async (req, res, next) => {
   try {
+    // Sin empresa resuelta (login, cotización pública) se responde el default:
+    // servir el nombre y logo de una empresa cualquiera sería peor.
+    if (!req.companyId) return res.json({ company_name: 'Deposito', company_logo_url: '' })
     const rows = await prisma.systemSetting.findMany({
-      where: { key: { in: ['company_name', 'company_logo_url'] }, ...(req.companyId ? { company_id: req.companyId } : {}) },
+      where: { key: { in: ['company_name', 'company_logo_url'] }, company_id: req.companyId },
     })
     const map = Object.fromEntries(rows.map((r) => [r.key, r.value]))
     const company_name = (map.company_name && String(map.company_name).trim()) || 'Deposito'
@@ -101,7 +104,8 @@ exports.getCompanyName = async (req, res, next) => {
  */
 exports.getCompanyLogo = async (req, res, next) => {
   try {
-    const row = await prisma.systemSetting.findFirst({ where: { key: 'company_logo_url', ...(req.companyId ? { company_id: req.companyId } : {}) } })
+    if (!req.companyId) return res.status(404).end()
+    const row = await prisma.systemSetting.findFirst({ where: { key: 'company_logo_url', company_id: req.companyId } })
     const logoUrl = row?.value?.trim()
     if (!logoUrl) return res.status(404).end()
 
@@ -168,7 +172,8 @@ exports.uploadLogo = async (req, res, next) => {
       await removePublicObject(prevUrl, COMPANY_LOGO_BUCKET)
     }
 
-    invalidateSystemConfigCache()
+    await prisma.company.update({ where: { id: req.companyId }, data: { logo_url: imageUrl } })
+    invalidateSystemConfigCache(req.companyId)
     res.json({ imageUrl, company_logo_url: imageUrl })
   } catch (e) {
     if (e.status) return res.status(e.status).json({ message: e.message })
@@ -201,7 +206,8 @@ exports.removeLogo = async (req, res, next) => {
       await removePublicObject(prevUrl, COMPANY_LOGO_BUCKET)
     }
 
-    invalidateSystemConfigCache()
+    await prisma.company.update({ where: { id: req.companyId }, data: { logo_url: null } })
+    invalidateSystemConfigCache(req.companyId)
     res.json({ company_logo_url: '' })
   } catch (e) {
     next(e)
@@ -334,7 +340,19 @@ exports.update = async (req, res, next) => {
       })
     }
 
-    invalidateSystemConfigCache()
+    // La identidad de la empresa vive en dos lados: la fila Company (selector,
+    // traslados, contabilidad) y estas claves (PDFs, membretes). Se espejan para
+    // que editar la configuración no deje el selector mostrando el nombre viejo.
+    const companyFields = {}
+    if (payload.company_name !== undefined) companyFields.name = String(payload.company_name).slice(0, 150)
+    if (payload.company_nit !== undefined) companyFields.tax_id = String(payload.company_nit).slice(0, 100)
+    if (payload.company_address !== undefined) companyFields.address = String(payload.company_address)
+    if (payload.company_logo_url !== undefined) companyFields.logo_url = String(payload.company_logo_url).slice(0, 500)
+    if (Object.keys(companyFields).length > 0) {
+      await prisma.company.update({ where: { id: req.companyId }, data: companyFields })
+    }
+
+    invalidateSystemConfigCache(req.companyId)
 
     const rows = await prisma.systemSetting.findMany({ where: { company_id: req.companyId }, orderBy: { key: 'asc' } })
     const settings = {}

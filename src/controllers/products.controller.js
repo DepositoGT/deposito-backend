@@ -256,7 +256,7 @@ exports.create = async (req, res, next) => {
           throw new Error('supplier_id required when initial stock > 0')
         }
 
-        const tz = await getTimezone(prisma)
+        const tz = await getTimezone(prisma, req.companyId)
         const nowGt = DateTime.now().setZone(tz)
         const dateAsUtcWithGtClock = new Date(Date.UTC(
           nowGt.year,
@@ -606,7 +606,7 @@ exports.update = async (req, res, next) => {
 
 exports.remove = async (req, res, next) => {
   try {
-    const tz = await getTimezone(prisma)
+    const tz = await getTimezone(prisma, req.companyId)
     const nowGt = DateTime.now().setZone(tz)
     const dateAsUtcWithGtClock = new Date(Date.UTC(
       nowGt.year,
@@ -630,7 +630,7 @@ exports.remove = async (req, res, next) => {
 
 exports.reportPdf = async (req, res, next) => {
   try {
-    const branding = await getBrandingForPdf(prisma)
+    const branding = await getBrandingForPdf(prisma, req.companyId)
     const companyName = branding.company_name
     const currencyCode = (branding.currency_code && branding.currency_code.trim()) || 'GTQ'
     const money = (v) => new Intl.NumberFormat('es-GT', { style: 'currency', currency: currencyCode }).format(Number(v || 0))
@@ -1109,7 +1109,7 @@ exports.lotsExpiring = async (req, res, next) => {
     const status = ['expiring', 'expired', 'all'].includes(req.query.status) ? req.query.status : 'all'
 
     // "Hoy" según la zona horaria del negocio; expiry_date es DATE (medianoche UTC)
-    const tz = await getTimezone(prisma)
+    const tz = await getTimezone(prisma, req.companyId)
     const nowTz = DateTime.now().setZone(tz)
     const today = new Date(Date.UTC(nowTz.year, nowTz.month - 1, nowTz.day))
     const limit = new Date(today.getTime() + days * 86400000)
@@ -1208,7 +1208,7 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
       }
     }
 
-    const tz = await getTimezone(prisma)
+    const tz = await getTimezone(prisma, req.companyId)
     const nowGt = DateTime.now().setZone(tz)
     const dateAsUtcWithGtClock = new Date(Date.UTC(
       nowGt.year,

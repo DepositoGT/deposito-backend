@@ -596,7 +596,7 @@ exports.convertToSale = async (req, res, next) => {
       const completadaStatus = await tx.saleStatus.findFirst({ where: { name: 'Completada' } })
       if (!completadaStatus) throw new Error("No existe el estado 'Completada'")
 
-      const tz = await getTimezone(prisma)
+      const tz = await getTimezone(prisma, req.companyId)
       const nowGt = DateTime.now().setZone(tz)
       const saleDate = DateTime.utc(
         nowGt.year,

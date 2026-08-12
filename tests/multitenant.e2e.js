@@ -405,6 +405,30 @@ async function main() {
   assert(empresaRow.income === 50, 'el asiento sin sucursal se agrupa como "Empresa"')
   assert(porSucursal.totals.income === 210, 'el total de la empresa suma todas las sucursales (100+60+50)')
 
+  // La configuración es de la empresa: nombre, logo, moneda y zona horaria
+  console.log('\n== 11. Configuración por empresa ==')
+  const { seedCompanySettings } = require('../src/services/companySettings')
+  const { getSystemConfig, invalidateSystemConfigCache } = require('../src/utils/getTimezone')
+  await prisma.$transaction((tx) => seedCompanySettings(tx, globex.id, { name: 'Globex', tax_id: '999' }))
+  const globexSettings = await prisma.systemSetting.count({ where: { company_id: globex.id } })
+  assert(globexSettings >= 19, `una empresa nueva nace configurada (${globexSettings} claves)`)
+
+  await prisma.systemSetting.update({
+    where: { company_id_key: { company_id: globex.id, key: 'timezone' } },
+    data: { value: 'America/Mexico_City' },
+  })
+  invalidateSystemConfigCache()
+  const cfgAcme = await getSystemConfig(prisma, acme.id)
+  const cfgGlobex = await getSystemConfig(prisma, globex.id)
+  assert(cfgGlobex.timezone === 'America/Mexico_City' && cfgAcme.timezone === 'America/Guatemala',
+    'cada empresa resuelve su propia zona horaria')
+  assert(cfgGlobex.company_name === 'Globex' && cfgAcme.company_name !== 'Globex',
+    'cada empresa resuelve su propio nombre para PDFs y membretes')
+
+  const sinEmpresa = await getSystemConfig(prisma, null)
+  assert(sinEmpresa.company_name === 'Depósito' && sinEmpresa.timezone === 'America/Guatemala',
+    'sin empresa se responden los valores por defecto, no los de otra empresa')
+
   console.log('\nTODAS LAS PRUEBAS PASARON')
 }
 
