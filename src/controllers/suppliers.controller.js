@@ -625,7 +625,7 @@ exports.bulkImportMapped = async (req, res, next) => {
       return res.status(400).json({ message: 'No se proporcionaron contactos' })
     }
 
-    const validation = await bulkValidateSuppliers(suppliers, importOptions)
+    const validation = await bulkValidateSuppliers(suppliers, importOptions, { companyId: req.companyId })
 
     if (validation.invalidRows.length > 0) {
       return res.status(400).json({
@@ -635,7 +635,7 @@ exports.bulkImportMapped = async (req, res, next) => {
       })
     }
 
-    const result = await bulkCreateSuppliers(validation.validRows, importOptions)
+    const result = await bulkCreateSuppliers(validation.validRows, importOptions, { companyId: req.companyId })
 
     res.json({
       ok: true,
@@ -669,7 +669,7 @@ exports.validateImportMapped = async (req, res, next) => {
       return res.status(400).json({ message: 'No se proporcionaron contactos' })
     }
 
-    const validation = await bulkValidateSuppliers(suppliers, importOptions)
+    const validation = await bulkValidateSuppliers(suppliers, importOptions, { companyId: req.companyId })
 
     res.json({
       ok: validation.invalidRows.length === 0,
@@ -698,7 +698,7 @@ exports.validateImportMapped = async (req, res, next) => {
  */
 exports.downloadTemplate = async (req, res, next) => {
   try {
-    const buffer = await generateSupplierTemplate()
+    const buffer = await generateSupplierTemplate(req.companyId)
 
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
     res.setHeader('Content-Disposition', 'attachment; filename="plantilla_contactos.xlsx"')

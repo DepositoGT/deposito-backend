@@ -23,6 +23,19 @@ const BRAND = {
 }
 
 // Utility: parse period range (supports: week, month, quarter, semester, year, all)
+const { branchWhere } = require('../middlewares/tenant')
+
+/** Sustituye p.stock por el stock de la sucursal activa (in place). */
+async function overlayReportBranchStock(products, branchId) {
+  if (!branchId || !products?.length) return
+  const rows = await prisma.productStock.findMany({
+    where: { branch_id: branchId, product_id: { in: products.map((p) => p.id) } },
+    select: { product_id: true, stock: true },
+  })
+  const byId = new Map(rows.map((r) => [r.product_id, r.stock]))
+  for (const p of products) p.stock = byId.get(p.id) ?? 0
+}
+
 function periodRange(period, yearParam, opts = {}, zone = 'America/Guatemala') {
   const now = DateTime.now().setZone(zone)
   const isAll = String(yearParam || '').toLowerCase() === 'all'
@@ -408,12 +421,13 @@ function drawSuppliersGrid(doc, suppliers) {
   })
 }
 
-async function getSalesData(startUtc, endUtc) {
+async function getSalesData(startUtc, endUtc, req) {
   const status = await prisma.saleStatus.findFirst({ where: { name: 'Completada' } })
+  const tenantSales = branchWhere(req)
 
   // Obtener sale_items (productos / categorías / costos)
   const items = await prisma.saleItem.findMany({
-    where: { sale: { date: { gte: startUtc, lte: endUtc }, ...(status ? { status_id: status.id } : {}) } },
+    where: { sale: { ...tenantSales, date: { gte: startUtc, lte: endUtc }, ...(status ? { status_id: status.id } : {}) } },
     include: {
       product: { include: { category: true } },
       sale: {
@@ -432,6 +446,7 @@ async function getSalesData(startUtc, endUtc) {
   // También obtener ventas a nivel cabecera para conteos rápidos
   const sales = await prisma.sale.findMany({
     where: {
+      ...tenantSales,
       date: { gte: startUtc, lte: endUtc },
       ...(status ? { status_id: status.id } : {})
     },
@@ -587,13 +602,14 @@ async function getSalesData(startUtc, endUtc) {
  * Datos para reporte financiero: P&L del período + inventario a la fecha + compras registradas.
  * No sustituye al reporte de ventas (sin desglose operativo por cajero/método/top productos).
  */
-async function getFinancialData(startUtc, endUtc) {
-  const sales = await getSalesData(startUtc, endUtc)
+async function getFinancialData(startUtc, endUtc, req) {
+  const sales = await getSalesData(startUtc, endUtc, req)
 
   const products = await prisma.product.findMany({
-    where: { deleted: false, deleted_at: null },
-    select: { stock: true, cost: true }
+    where: { deleted: false, deleted_at: null, company_id: req.companyId },
+    select: { id: true, stock: true, cost: true }
   })
+  await overlayReportBranchStock(products, req.branchId)
   let inventoryValue = 0
   let inventoryUnits = 0
   for (const p of products) {
@@ -603,7 +619,7 @@ async function getFinancialData(startUtc, endUtc) {
   }
 
   const purchaseLogs = await prisma.purchaseLog.findMany({
-    where: { date: { gte: startUtc, lte: endUtc } },
+    where: { date: { gte: startUtc, lte: endUtc }, product: { company_id: req.companyId } },
     select: {
       qty: true,
       cost: true,
@@ -636,6 +652,7 @@ async function getFinancialData(startUtc, endUtc) {
   const saleItems = await prisma.saleItem.findMany({
     where: {
       sale: {
+        ...branchWhere(req),
         date: { gte: startUtc, lte: endUtc },
         ...(status ? { status_id: status.id } : {})
       }
@@ -695,9 +712,9 @@ async function getFinancialData(startUtc, endUtc) {
 }
 
 /** Agrega por proveedor: conteo de SKUs activos, unidades en stock y valor de inventario (stock × costo). */
-async function getSuppliersReportData() {
+async function getSuppliersReportData(req) {
   const suppliers = await prisma.supplier.findMany({
-    where: { deleted: false, party_type: 'SUPPLIER' },
+    where: { deleted: false, party_type: 'SUPPLIER', company_id: req.companyId },
     include: {
       supplier_payment_terms: {
         include: { payment_term: true },
@@ -708,9 +725,10 @@ async function getSuppliersReportData() {
   })
 
   const productRows = await prisma.product.findMany({
-    where: { deleted: false, deleted_at: null },
-    select: { supplier_id: true, stock: true, cost: true }
+    where: { deleted: false, deleted_at: null, company_id: req.companyId },
+    select: { id: true, supplier_id: true, stock: true, cost: true }
   })
+  await overlayReportBranchStock(productRows, req.branchId)
 
   const aggBySupplier = new Map()
   for (const p of productRows) {
@@ -822,7 +840,7 @@ async function salesReport(req, res, next) {
   const money = makeMoney(branding.currency_code)
   const { period='month', year, format='pdf', month, quarter, semester } = req.query
   const { startUtc, endUtc, label } = periodRange(period, year, { month, quarter, semester })
-    const data = await getSalesData(startUtc, endUtc)
+    const data = await getSalesData(startUtc, endUtc, req)
     if (String(format).toLowerCase() === 'csv' || String(format).toLowerCase() === 'excel') {
       const total = data.totalRevenueGross || 1
       sendCsv(res, 'reporte-ventas', [
@@ -930,7 +948,8 @@ async function inventoryReport(req,res,next){
     const logoBuffer = branding.logoBuffer
     const money = makeMoney(branding.currency_code)
     const { format='pdf' } = req.query
-    const products = await prisma.product.findMany({ where:{ deleted_at: null }, include:{ category:true } })
+    const products = await prisma.product.findMany({ where:{ deleted_at: null, company_id: req.companyId }, include:{ category:true } })
+    await overlayReportBranchStock(products, req.branchId)
     if (String(format).toLowerCase() === 'csv' || String(format).toLowerCase() === 'excel') {
       const totalValue = products.reduce((acc,p)=>acc+ number(p.stock)* number(p.cost),0)
       sendCsv(res, 'reporte-inventario', [
@@ -970,7 +989,7 @@ async function suppliersReport(req, res, next) {
     const logoBuffer = branding.logoBuffer
     const money = makeMoney(branding.currency_code)
     const { format = 'pdf' } = req.query
-    const data = await getSuppliersReportData()
+    const data = await getSuppliersReportData(req)
     const { suppliers, summary } = data
     const fmtLast = (d) =>
       d ? DateTime.fromJSDate(d).setZone('America/Guatemala').toFormat('yyyy-LL-dd') : '—'
@@ -1121,7 +1140,7 @@ async function financialReport(req, res, next) {
     const money = makeMoney(branding.currency_code)
     const { period = 'month', year, format = 'pdf', month, quarter, semester } = req.query
     const { startUtc, endUtc, label } = periodRange(period, year, { month, quarter, semester })
-    const data = await getFinancialData(startUtc, endUtc)
+    const data = await getFinancialData(startUtc, endUtc, req)
 
     const rotTxt = data.inventoryTurnover != null ? String(data.inventoryTurnover) : '—'
     const dInvTxt = data.daysOfInventoryApprox != null ? String(data.daysOfInventoryApprox) : '—'
@@ -1269,11 +1288,12 @@ async function financialReport(req, res, next) {
 }
 
 /** Stock, categoría, proveedor, brechas de reposición y alertas del sistema abiertas. */
-async function getAlertsReportData() {
+async function getAlertsReportData(req) {
   const products = await prisma.product.findMany({
-    where: { deleted: false, deleted_at: null },
+    where: { deleted: false, deleted_at: null, company_id: req.companyId },
     include: { category: true, supplier: true, status: true }
   })
+  await overlayReportBranchStock(products, req.branchId)
 
   const gapUnits = (p) => Math.max(0, number(p.min_stock) - number(p.stock))
 
@@ -1351,7 +1371,7 @@ async function alertsReport(req, res, next) {
     const money = makeMoney(branding.currency_code)
     const { format = 'pdf' } = req.query
     const zone = 'America/Guatemala'
-    const data = await getAlertsReportData()
+    const data = await getAlertsReportData(req)
     const { summary, categoryBreakdown, actionList, critical, systemAlerts } = data
 
     const gapUnits = (p) => Math.max(0, number(p.min_stock) - number(p.stock))
@@ -1574,11 +1594,12 @@ async function alertsReport(req, res, next) {
 }
 
 /** Catálogo: márgenes, valor a costo vs precio público, mix por categoría y proveedor. */
-async function getProductsAnalysisData() {
+async function getProductsAnalysisData(req) {
   const products = await prisma.product.findMany({
-    where: { deleted: false, deleted_at: null },
+    where: { deleted: false, deleted_at: null, company_id: req.companyId },
     include: { category: true, supplier: true, status: true }
   })
+  await overlayReportBranchStock(products, req.branchId)
 
   let inventoryValue = 0
   let retailInventoryValue = 0
@@ -1697,7 +1718,7 @@ async function productsReport(req, res, next) {
     const money = makeMoney(branding.currency_code)
     const zone = 'America/Guatemala'
     const { format = 'pdf' } = req.query
-    const data = await getProductsAnalysisData()
+    const data = await getProductsAnalysisData(req)
     const { products, summary, categoryRows, supplierRows, topByInv, topByRetail, tightMargins } = data
 
     const rowDetalle = (p) => [
@@ -1974,8 +1995,8 @@ async function inventoryCountSessionReport(req, res, next) {
     const { id } = req.params
     const format = String(req.query.format || 'pdf').toLowerCase()
 
-    const session = await prisma.inventoryCountSession.findUnique({
-      where: { id },
+    const session = await prisma.inventoryCountSession.findFirst({
+      where: { id, branch: { company_id: req.companyId } },
       include: {
         createdBy: { select: { name: true, email: true } },
         approvedBy: { select: { name: true, email: true } },

@@ -355,20 +355,21 @@ function validateSupplierRow(
  * @param {object} [importOptionsRaw]
  * @returns {Promise<Object>}
  */
-async function bulkValidateSuppliers(rows, importOptionsRaw) {
+async function bulkValidateSuppliers(rows, importOptionsRaw, ctx = {}) {
     const importOptions = normalizeImportOptions(importOptionsRaw)
+    const { companyId } = ctx
 
     const [categoriesRaw, paymentTermsRaw, existingSuppliersRaw] = await Promise.all([
         prisma.productCategory.findMany({
-            where: { deleted: false },
+            where: { deleted: false, company_id: companyId },
             select: { id: true, name: true },
         }),
         prisma.paymentTerm.findMany({
-            where: { deleted: false },
+            where: { deleted: false, company_id: companyId },
             select: { id: true, name: true },
         }),
         prisma.supplier.findMany({
-            where: { deleted: false },
+            where: { deleted: false, company_id: companyId },
             select: { email: true },
         }),
     ])
@@ -428,9 +429,9 @@ async function bulkValidateSuppliers(rows, importOptionsRaw) {
     }
 }
 
-async function getDefaultPaymentTermId() {
+async function getDefaultPaymentTermId(companyId) {
     const first = await prisma.paymentTerm.findFirst({
-       where: { deleted: false },
+       where: { deleted: false, company_id: companyId },
        orderBy: { id: 'asc' },
     })
     if (!first) throw new Error('No hay términos de pago en el sistema. Cree al menos uno.')
@@ -441,18 +442,18 @@ async function getDefaultPaymentTermId() {
  * @param {string} name
  * @param {Map<string, number>} cache lower -> id
  */
-async function ensureProductCategoryId(name, cache) {
+async function ensureProductCategoryId(name, cache, companyId) {
     const trimmed = String(name || '').trim()
     if (!trimmed) return null
     const key = trimmed.toLowerCase()
     if (cache.has(key)) return cache.get(key)
 
     let cat = await prisma.productCategory.findFirst({
-        where: { deleted: false, name: { equals: trimmed, mode: 'insensitive' } },
+        where: { deleted: false, company_id: companyId, name: { equals: trimmed, mode: 'insensitive' } },
     })
     if (!cat) {
         const safe = trimmed.slice(0, 100)
-        cat = await prisma.productCategory.create({ data: { name: safe } })
+        cat = await prisma.productCategory.create({ data: { name: safe, company_id: companyId } })
     }
     cache.set(key, cat.id)
     return cat.id
@@ -462,18 +463,18 @@ async function ensureProductCategoryId(name, cache) {
  * @param {string} name
  * @param {Map<string, number>} cache
  */
-async function ensurePaymentTermId(name, cache) {
+async function ensurePaymentTermId(name, cache, companyId) {
     const trimmed = String(name || '').trim()
     if (!trimmed) return null
     const key = trimmed.toLowerCase()
     if (cache.has(key)) return cache.get(key)
 
     let pt = await prisma.paymentTerm.findFirst({
-        where: { deleted: false, name: { equals: trimmed, mode: 'insensitive' } },
+        where: { deleted: false, company_id: companyId, name: { equals: trimmed, mode: 'insensitive' } },
     })
     if (!pt) {
         const safe = trimmed.slice(0, 50)
-        pt = await prisma.paymentTerm.create({ data: { name: safe } })
+        pt = await prisma.paymentTerm.create({ data: { name: safe, company_id: companyId } })
     }
     cache.set(key, pt.id)
     return pt.id
@@ -484,7 +485,8 @@ async function ensurePaymentTermId(name, cache) {
  * @param {object} [importOptionsRaw]
  * @returns {Promise<Object>}
  */
-async function bulkCreateSuppliers(validRows, importOptionsRaw) {
+async function bulkCreateSuppliers(validRows, importOptionsRaw, ctx = {}) {
+    const { companyId } = ctx
     normalizeImportOptions(importOptionsRaw)
 
     const errors = []
@@ -494,7 +496,7 @@ async function bulkCreateSuppliers(validRows, importOptionsRaw) {
     const paymentCache = new Map()
     let defaultPaymentIdCached = null
     const resolveDefaultPaymentId = async () => {
-        if (defaultPaymentIdCached == null) defaultPaymentIdCached = await getDefaultPaymentTermId()
+        if (defaultPaymentIdCached == null) defaultPaymentIdCached = await getDefaultPaymentTermId(companyId)
         return defaultPaymentIdCached
     }
 
@@ -520,7 +522,7 @@ async function bulkCreateSuppliers(validRows, importOptionsRaw) {
             if (partyType === 'SUPPLIER' && Array.isArray(row.data.category_labels) && row.data.category_labels.length > 0) {
                 const ids = []
                 for (const label of row.data.category_labels) {
-                    const id = await ensureProductCategoryId(label, categoryCache)
+                    const id = await ensureProductCategoryId(label, categoryCache, companyId)
                     if (id && !ids.includes(id)) ids.push(id)
                 }
                 if (ids.length > 0) {
@@ -538,7 +540,7 @@ async function bulkCreateSuppliers(validRows, importOptionsRaw) {
             } else if (Array.isArray(row.data.payment_term_names) && row.data.payment_term_names.length > 0) {
                 const ids = []
                 for (let i = 0; i < row.data.payment_term_names.length; i++) {
-                    const ptId = await ensurePaymentTermId(row.data.payment_term_names[i], paymentCache)
+                    const ptId = await ensurePaymentTermId(row.data.payment_term_names[i], paymentCache, companyId)
                     if (ptId) ids.push(ptId)
                 }
                 if (ids.length === 0) {
@@ -558,7 +560,7 @@ async function bulkCreateSuppliers(validRows, importOptionsRaw) {
                 }
             }
 
-            await prisma.supplier.create({ data: createData })
+            await prisma.supplier.create({ data: { ...createData, company_id: companyId } })
             created++
         } catch (err) {
             skipped++
@@ -575,10 +577,10 @@ async function bulkCreateSuppliers(validRows, importOptionsRaw) {
 /**
  * @returns {Promise<Buffer>}
  */
-async function generateSupplierTemplate() {
+async function generateSupplierTemplate(companyId) {
     const [paymentTerms] = await Promise.all([
         prisma.paymentTerm.findMany({
-            where: { deleted: false },
+            where: { deleted: false, company_id: companyId },
             select: { name: true },
             orderBy: { name: 'asc' },
             take: 5,

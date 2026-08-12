@@ -327,9 +327,19 @@ async function validateBomComponents(tx, kitProductId, components) {
     seen.add(row.component_product_id)
   }
 
+  // Los componentes deben ser de la MISMA empresa que el kit
+  const kit = await dbClient(tx).product.findUnique({
+    where: { id: kitProductId },
+    select: { company_id: true },
+  })
+  if (!kit) {
+    const err = new Error('Producto no encontrado')
+    err.status = 404
+    throw err
+  }
   const componentIds = rows.map((r) => r.component_product_id)
   const products = await dbClient(tx).product.findMany({
-    where: { id: { in: componentIds }, deleted: false },
+    where: { id: { in: componentIds }, deleted: false, company_id: kit.company_id },
     select: { id: true, name: true, kind: true },
   })
   const prodMap = new Map(products.map((p) => [String(p.id), p]))

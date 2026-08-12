@@ -17,12 +17,13 @@ const number = (v) => {
   return Number.isFinite(n) ? n : 0
 }
 
-async function analyticsContext() {
+async function analyticsContext(req) {
+  const { branchWhere } = require('../middlewares/tenant')
   const now = DateTime.now().setZone('America/Guatemala')
   const completedStatus = await prisma.saleStatus.findFirst({ where: { name: 'Completada' } })
   const minAgg = await prisma.sale.aggregate({
     _min: { date: true },
-    where: completedStatus ? { status_id: completedStatus.id } : {},
+    where: { ...branchWhere(req), ...(completedStatus ? { status_id: completedStatus.id } : {}) },
   })
   const firstSaleYear = minAgg._min.date
     ? DateTime.fromJSDate(minAgg._min.date, { zone: 'utc' }).setZone('America/Guatemala').year
@@ -32,7 +33,7 @@ async function analyticsContext() {
 
 exports.firstSaleYear = async (req, res, next) => {
   try {
-    const { firstSaleYear } = await analyticsContext()
+    const { firstSaleYear } = await analyticsContext(req)
     res.json({ firstSaleYear })
   } catch (e) {
     next(e)
@@ -42,7 +43,9 @@ exports.firstSaleYear = async (req, res, next) => {
 exports.summary = async (req, res, next) => {
   try {
     const yearParam = req.query.year
-    const { now, completedStatus, firstSaleYear } = await analyticsContext()
+    const { now, completedStatus, firstSaleYear } = await analyticsContext(req)
+    const { branchWhere } = require('../middlewares/tenant')
+    const tenantSales = branchWhere(req)
     const isAll = String(yearParam || '').toLowerCase() === 'all'
     let year = Number(yearParam || now.year)
     if (!Number.isInteger(year) || year < firstSaleYear) year = firstSaleYear
@@ -61,6 +64,7 @@ exports.summary = async (req, res, next) => {
     const saleItems = await prisma.saleItem.findMany({
       where: {
         sale: {
+          ...tenantSales,
           date: { gte: startUtc, lte: endUtc },
           ...(completedStatus ? { status_id: completedStatus.id } : {}),
         },
@@ -71,6 +75,7 @@ exports.summary = async (req, res, next) => {
     // Cargar todas las ventas del período para calcular devoluciones
     const sales = await prisma.sale.findMany({
       where: {
+        ...tenantSales,
         date: { gte: startUtc, lte: endUtc },
         ...(completedStatus ? { status_id: completedStatus.id } : {}),
       },
@@ -194,11 +199,27 @@ exports.summary = async (req, res, next) => {
       .map(([channel, v]) => ({ channel, label: channelLabels[channel] || channel, total: Number(v.total.toFixed(2)), count: v.count }))
       .sort((a, b) => b.total - a.total)
 
-    // Inventario: snapshot actual (no depende del año)
-    const products = await prisma.product.findMany({
-      where: { deleted: false },
-      select: { name: true, stock: true, min_stock: true, cost: true, price: true, category: { select: { name: true } } },
-    })
+    // Inventario: snapshot actual (no depende del año). Por sucursal si hay una
+    // activa; espejo total de la empresa en vista consolidada.
+    let products
+    if (req.branchId) {
+      const rows = await prisma.productStock.findMany({
+        where: { branch_id: req.branchId, product: { deleted: false } },
+        select: {
+          stock: true, min_stock: true,
+          product: { select: { name: true, cost: true, price: true, category: { select: { name: true } } } },
+        },
+      })
+      products = rows.map((r) => ({
+        name: r.product.name, stock: r.stock, min_stock: r.min_stock,
+        cost: r.product.cost, price: r.product.price, category: r.product.category,
+      }))
+    } else {
+      products = await prisma.product.findMany({
+        where: { deleted: false, company_id: req.companyId },
+        select: { name: true, stock: true, min_stock: true, cost: true, price: true, category: { select: { name: true } } },
+      })
+    }
     let stockValue = 0, retailValue = 0, lowStockCount = 0, outOfStockCount = 0
     const stockByCategory = new Map() // name -> { value, units }
     for (const p of products) {

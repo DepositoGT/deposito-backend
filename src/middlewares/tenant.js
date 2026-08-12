@@ -58,8 +58,14 @@ function hasPerm(user, code) {
 
 async function resolveTenant(req, res, next) {
   try {
-    // Login/refresh/me y demás rutas de auth no necesitan tenant.
-    if (req.path.startsWith('/auth')) return next()
+    // Rutas de auth (login/refresh/me y gestión de usuarios): resolución en modo
+    // suave — si se puede, se resuelve (para crear usuarios con empresa); si no,
+    // se sigue sin tenant en vez de bloquear el login o /me.
+    const soft = req.path.startsWith('/auth')
+    const fail = (status, message) => {
+      if (soft) return next()
+      return res.status(status).json({ message })
+    }
 
     const user = decodeUser(req)
     if (!user) return next()
@@ -77,11 +83,11 @@ async function resolveTenant(req, res, next) {
         },
       },
     })
-    if (!row) return res.status(401).json({ message: 'No autenticado' })
+    if (!row) return fail(401, 'No autenticado')
 
     const branches = row.user_branches.map((m) => m.branch).filter((b) => b.active)
     if (branches.length === 0) {
-      return res.status(403).json({ message: 'No tienes ninguna sucursal asignada' })
+      return fail(403, 'No tienes ninguna sucursal asignada')
     }
 
     const headerBranch = req.headers['x-branch-id'] || null
@@ -112,17 +118,17 @@ async function resolveTenant(req, res, next) {
     let branch = null
     if (headerBranch) {
       branch = branches.find((b) => b.id === headerBranch)
-      if (!branch) return res.status(403).json({ message: 'Sin acceso a esa sucursal' })
+      if (!branch) return fail(403, 'Sin acceso a esa sucursal')
     } else if (row.default_branch_id) {
       branch = branches.find((b) => b.id === row.default_branch_id)
     }
     if (!branch && branches.length === 1) branch = branches[0]
     if (!branch) branch = branches.find((b) => b.is_default)
     if (!branch) {
-      return res.status(400).json({ message: 'Selecciona una sucursal (header X-Branch-Id)' })
+      return fail(400, 'Selecciona una sucursal (header X-Branch-Id)')
     }
     if (headerCompany && headerCompany !== branch.company_id) {
-      return res.status(400).json({ message: 'La sucursal no pertenece a esa empresa' })
+      return fail(400, 'La sucursal no pertenece a esa empresa')
     }
 
     req.companyId = branch.company_id

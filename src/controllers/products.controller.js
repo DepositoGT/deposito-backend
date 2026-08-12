@@ -319,7 +319,7 @@ exports.getOne = async (req, res, next) => {
 exports.getBom = async (req, res, next) => {
   try {
     const product = await prisma.product.findFirst({
-      where: { id: req.params.id, deleted: false },
+      where: { id: req.params.id, deleted: false, company_id: req.companyId },
       select: { id: true, name: true, kind: true },
     })
     if (!product) return res.status(404).json({ message: 'Producto no encontrado' })
@@ -347,7 +347,7 @@ exports.updateBom = async (req, res, next) => {
     const { components } = req.body || {}
     const updated = await prismaTransaction.$transaction(async (tx) => {
       const product = await tx.product.findFirst({
-        where: { id, deleted: false },
+        where: { id, deleted: false, company_id: req.companyId },
         select: { id: true, kind: true },
       })
       if (!product) {
@@ -612,6 +612,11 @@ exports.remove = async (req, res, next) => {
       nowGt.millisecond
     ))
 
+    const owned = await prisma.product.findFirst({
+      where: { id: req.params.id, company_id: req.companyId },
+      select: { id: true },
+    })
+    if (!owned) return res.status(404).json({ message: 'Producto no encontrado' })
     await prisma.product.update({ where: { id: req.params.id }, data: { deleted: true, deleted_at: dateAsUtcWithGtClock } })
     res.json({ ok: true })
   } catch (e) { next(e) }
@@ -623,18 +628,19 @@ exports.reportPdf = async (req, res, next) => {
     const companyName = branding.company_name
     const currencyCode = (branding.currency_code && branding.currency_code.trim()) || 'GTQ'
     const money = (v) => new Intl.NumberFormat('es-GT', { style: 'currency', currency: currencyCode }).format(Number(v || 0))
-    const where = { deleted: false }
+    const where = { deleted: false, company_id: req.companyId }
     const idsParam = req.query.ids
     if (idsParam && typeof idsParam === 'string' && idsParam.trim()) {
       const ids = idsParam.split(',').map((id) => id.trim()).filter(Boolean)
       if (ids.length > 0) where.id = { in: ids }
     }
 
-    const products = await prisma.product.findMany({
+    const productRows = await prisma.product.findMany({
       where,
       include: { category: true, supplier: true, status: true },
       orderBy: { name: 'asc' },
     })
+    const products = await overlayBranchStock(productRows, req.branchId)
 
     const doc = new PDFDocument({ size: 'A4', margin: 50 })
     res.setHeader('Content-Type', 'application/pdf')
@@ -1465,6 +1471,8 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
 exports.restore = async (req, res, next) => {
   try {
     const { id } = req.params
+    const owned = await prisma.product.findFirst({ where: { id, company_id: req.companyId }, select: { id: true } })
+    if (!owned) return res.status(404).json({ message: 'Producto no encontrado' })
     const restored = await prisma.product.update({
       where: { id },
       data: { deleted: false, deleted_at: null },
@@ -1494,7 +1502,7 @@ exports.restore = async (req, res, next) => {
  */
 exports.getImportTemplate = async (req, res, next) => {
   try {
-    const buffer = await generateTemplateWithCatalogs()
+    const buffer = await generateTemplateWithCatalogs(req.companyId)
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
     res.setHeader('Content-Disposition', 'attachment; filename="plantilla_productos.xlsx"')
     res.send(buffer)
@@ -1537,7 +1545,7 @@ exports.validateImport = async (req, res, next) => {
       return res.status(400).json({ message: 'El archivo está vacío o no tiene datos válidos' })
     }
 
-    const result = await validateBulkData(rows)
+    const result = await validateBulkData(rows, undefined, { companyId: req.companyId })
     res.json(result)
   } catch (e) {
     next(e)
@@ -1581,7 +1589,7 @@ exports.bulkImport = async (req, res, next) => {
     }
 
     // First validate
-    const validation = await validateBulkData(rows)
+    const validation = await validateBulkData(rows, undefined, { companyId: req.companyId })
 
     if (validation.invalidRows.length > 0) {
       return res.status(400).json({
@@ -1591,7 +1599,7 @@ exports.bulkImport = async (req, res, next) => {
     }
 
     // All valid, proceed to import
-    const result = await bulkCreateProducts(validation.validRows)
+    const result = await bulkCreateProducts(validation.validRows, { companyId: req.companyId, branchId: requireBranch(req) })
 
     res.json({
       ok: true,
@@ -1637,7 +1645,7 @@ exports.bulkImportMapped = async (req, res, next) => {
       return res.status(400).json({ message: 'No se proporcionaron productos para importar' })
     }
 
-    const validation = await validateBulkData(products, importOptions)
+    const validation = await validateBulkData(products, importOptions, { companyId: req.companyId })
 
     if (validation.invalidRows.length > 0) {
       return res.status(400).json({
@@ -1647,7 +1655,7 @@ exports.bulkImportMapped = async (req, res, next) => {
     }
 
     // All valid, proceed to import
-    const result = await bulkCreateProducts(validation.validRows)
+    const result = await bulkCreateProducts(validation.validRows, { companyId: req.companyId, branchId: requireBranch(req) })
 
     res.json({
       ok: true,
@@ -1695,7 +1703,7 @@ exports.validateImportMapped = async (req, res, next) => {
       return res.status(400).json({ message: 'No se proporcionaron productos para validar' })
     }
 
-    const validation = await validateBulkData(products, importOptions)
+    const validation = await validateBulkData(products, importOptions, { companyId: req.companyId })
 
     res.json({
       ok: validation.invalidRows.length === 0,
@@ -1760,7 +1768,7 @@ exports.pricingPreview = async (req, res, next) => {
     }
 
     const products = await prisma.product.findMany({
-      where: { id: { in: ids }, deleted: false, available_for_sale: true },
+      where: { id: { in: ids }, deleted: false, available_for_sale: true, company_id: req.companyId },
       select: {
         id: true,
         name: true,

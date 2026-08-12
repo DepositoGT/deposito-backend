@@ -182,6 +182,14 @@ exports.register = async (req, res, next) => {
         }
       }
     })
+    // El usuario nuevo nace en la empresa/sucursal del request (si hay contexto)
+    if (req.companyId) {
+      await prisma.userCompany.create({ data: { user_id: user.id, company_id: req.companyId } }).catch(() => {})
+      if (req.branchId) {
+        await prisma.userBranch.create({ data: { user_id: user.id, branch_id: req.branchId } }).catch(() => {})
+        await prisma.user.update({ where: { id: user.id }, data: { default_branch_id: req.branchId } }).catch(() => {})
+      }
+    }
     const token = crearToken(user)
     res.status(201).json({
       user: {
