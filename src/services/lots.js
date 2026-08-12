@@ -83,13 +83,17 @@ function fefoSort(a, b) {
  * @param {object} tx cliente Prisma (transacción o no)
  * @param {Map<string, number>} stockMap product_id -> qty vendida
  */
-async function consumeLotsFEFO(tx, stockMap) {
+async function consumeLotsFEFO(tx, stockMap, branchId) {
   try {
     const client = tx || prisma
     const productIds = Array.from(stockMap.keys())
     if (productIds.length === 0) return
+    if (!branchId) {
+      console.error('[lots] consumeLotsFEFO sin branchId; omitido')
+      return
+    }
     const lots = await client.productLot.findMany({
-      where: { product_id: { in: productIds }, qty_remaining: { gt: 0 } },
+      where: { product_id: { in: productIds }, branch_id: branchId, qty_remaining: { gt: 0 } },
       select: { id: true, product_id: true, qty_remaining: true, expiry_date: true, received_at: true },
     })
     for (const [productId, qty] of stockMap.entries()) {
@@ -112,13 +116,17 @@ async function consumeLotsFEFO(tx, stockMap) {
  * @param {object} tx cliente Prisma
  * @param {Map<string, number>} stockMap product_id -> qty restaurada
  */
-async function restoreLotsFEFO(tx, stockMap) {
+async function restoreLotsFEFO(tx, stockMap, branchId) {
   try {
     const client = tx || prisma
     const productIds = Array.from(stockMap.keys())
     if (productIds.length === 0) return
+    if (!branchId) {
+      console.error('[lots] restoreLotsFEFO sin branchId; omitido')
+      return
+    }
     const lots = await client.productLot.findMany({
-      where: { product_id: { in: productIds } },
+      where: { product_id: { in: productIds }, branch_id: branchId },
       select: {
         id: true, product_id: true, qty_received: true, qty_remaining: true,
         expiry_date: true, received_at: true,
@@ -174,39 +182,44 @@ async function syncLotExpiryAlerts(tx, opts = {}) {
     const lots = await client.productLot.findMany({
       where: { qty_remaining: { gt: 0 }, expiry_date: { lte: limit } },
       select: {
-        product_id: true, lot_code: true, expiry_date: true, qty_remaining: true,
+        product_id: true, branch_id: true, lot_code: true, expiry_date: true, qty_remaining: true,
         product: { select: { name: true } },
       },
       orderBy: { expiry_date: 'asc' },
     })
 
-    const qualifyingProductIds = [...new Set(lots.map((l) => l.product_id))]
+    // Clave por producto+sucursal: las alertas de vencimiento son por sucursal
+    const keyOf = (productId, branchId) => `${productId}|${branchId}`
+    const qualifyingKeys = [...new Set(lots.map((l) => keyOf(l.product_id, l.branch_id)))]
+    const qualifyingSet = new Set(qualifyingKeys)
 
-    // Resolver alertas de "Vencimiento" de productos que ya no califican
-    // (product_id es Uuid: sin placeholders inválidos, condicionar el where en vez de usar notIn con un dummy)
-    await client.alert.updateMany({
-      where: {
-        type_id: alertType.id,
-        status_id: statusActive.id,
-        resolved: 0,
-        ...(qualifyingProductIds.length > 0 ? { product_id: { notIn: qualifyingProductIds } } : {}),
-      },
-      data: { status_id: statusResolved.id, resolved: 1 },
+    // Resolver alertas de "Vencimiento" cuyo (producto, sucursal) ya no califica
+    const activeExpiryAlerts = await client.alert.findMany({
+      where: { type_id: alertType.id, status_id: statusActive.id, resolved: 0 },
+      select: { id: true, product_id: true, branch_id: true },
     })
+    const toResolve = activeExpiryAlerts
+      .filter((a) => !qualifyingSet.has(keyOf(a.product_id, a.branch_id)))
+      .map((a) => a.id)
+    if (toResolve.length > 0) {
+      await client.alert.updateMany({
+        where: { id: { in: toResolve } },
+        data: { status_id: statusResolved.id, resolved: 1 },
+      })
+    }
 
-    if (qualifyingProductIds.length === 0) return
+    if (qualifyingKeys.length === 0) return
 
-    const existingAlerts = await client.alert.findMany({
-      where: { type_id: alertType.id, status_id: statusActive.id, resolved: 0, product_id: { in: qualifyingProductIds } },
-      select: { id: true, product_id: true },
-    })
-    const existingByProduct = new Map(existingAlerts.map((a) => [a.product_id, a.id]))
+    const existingByKey = new Map(
+      activeExpiryAlerts.map((a) => [keyOf(a.product_id, a.branch_id), a.id])
+    )
     const timestamp = new Date()
     const createData = []
     const updates = []
 
-    for (const productId of qualifyingProductIds) {
-      const productLots = lots.filter((l) => l.product_id === productId)
+    for (const key of qualifyingKeys) {
+      const [productId, branchId] = key.split('|')
+      const productLots = lots.filter((l) => l.product_id === productId && l.branch_id === branchId)
       const nearest = productLots[0] // ya viene ordenado por expiry_date asc
       const days = Math.round((new Date(nearest.expiry_date).getTime() - today.getTime()) / 86400000)
       const expired = days < 0

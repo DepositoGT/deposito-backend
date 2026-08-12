@@ -92,6 +92,9 @@ exports.assignUsers = async (req, res, next) => {
     if (!Array.isArray(user_ids)) {
       return res.status(400).json({ message: 'user_ids debe ser un arreglo' })
     }
+    if (!user_ids.includes(req.user.sub)) {
+      return res.status(400).json({ message: 'No puedes quitarte a ti mismo de la empresa' })
+    }
     const member = await prisma.userCompany.findUnique({
       where: { user_id_company_id: { user_id: req.user.sub, company_id: id } },
     })

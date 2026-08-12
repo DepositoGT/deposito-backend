@@ -76,7 +76,7 @@ function computeKitAvailableFromBom(bomLines, availabilityMap) {
   return Number.isFinite(min) ? Math.max(0, min) : 0
 }
 
-async function getAvailabilityBatchWithKits(productIds, tx) {
+async function getAvailabilityBatchWithKits(productIds, tx, branchId) {
   const ids = [...new Set(productIds.filter(Boolean).map(String))]
   if (ids.length === 0) return {}
 
@@ -92,7 +92,7 @@ async function getAvailabilityBatchWithKits(productIds, tx) {
 
   const allIds = [...new Set([...ids, ...componentIds])]
   const { getAvailabilityBatch } = require('./stockAvailability')
-  const base = await getAvailabilityBatch(allIds, tx)
+  const base = await getAvailabilityBatch(allIds, tx, { branchId })
   const out = { ...base }
 
   for (const id of ids) {
@@ -163,32 +163,48 @@ async function stockMapToLines(stockMap) {
   return Array.from(stockMap.entries()).map(([product_id, qty]) => ({ product_id, qty }))
 }
 
-async function deductStockMap(tx, stockMap) {
+/**
+ * Aplica un delta de stock por sucursal (+/-) sobre product_stocks y mantiene
+ * products.stock como espejo (total de todas las sucursales).
+ * Devuelve filas { id, name, stock, min_stock } con los valores DE LA SUCURSAL
+ * (para alertas de mínimo por sucursal).
+ */
+async function applyStockDelta(tx, stockMap, branchId, sign) {
   const client = dbClient(tx)
+  const { requireBranchId, ensureBranchStockRows } = require('./stockAvailability')
+  const b = requireBranchId(branchId)
   const entries = Array.from(stockMap.entries()).filter(([, qty]) => Number(qty) > 0)
   if (entries.length === 0) return []
-  const values = Prisma.join(entries.map(([id, qty]) => Prisma.sql`(${id}::uuid, ${Number(qty)}::int)`))
+  await ensureBranchStockRows(client, entries.map(([id]) => id), b)
+  const values = Prisma.join(
+    entries.map(([id, qty]) => Prisma.sql`(${id}::uuid, ${sign * Number(qty)}::int)`)
+  )
   return client.$queryRaw`
-    UPDATE products p
-    SET stock = p.stock - v.qty
-    FROM (VALUES ${values}) AS v(id, qty)
-    WHERE p.id = v.id
-    RETURNING p.id, p.name, p.stock, p.min_stock
+    WITH v(id, qty) AS (VALUES ${values}),
+    upd AS (
+      UPDATE product_stocks ps
+      SET stock = ps.stock + v.qty
+      FROM v
+      WHERE ps.product_id = v.id AND ps.branch_id = ${b}::uuid
+      RETURNING ps.product_id, ps.stock, ps.min_stock
+    ),
+    mirror AS (
+      UPDATE products p
+      SET stock = p.stock + v.qty
+      FROM v
+      WHERE p.id = v.id
+    )
+    SELECT u.product_id AS id, p.name, u.stock, u.min_stock
+    FROM upd u JOIN products p ON p.id = u.product_id
   `
 }
 
-async function restoreStockMap(tx, stockMap) {
-  const client = dbClient(tx)
-  const entries = Array.from(stockMap.entries()).filter(([, qty]) => Number(qty) > 0)
-  if (entries.length === 0) return []
-  const values = Prisma.join(entries.map(([id, qty]) => Prisma.sql`(${id}::uuid, ${Number(qty)}::int)`))
-  return client.$queryRaw`
-    UPDATE products p
-    SET stock = p.stock + v.qty
-    FROM (VALUES ${values}) AS v(id, qty)
-    WHERE p.id = v.id
-    RETURNING p.id, p.name, p.stock, p.min_stock
-  `
+async function deductStockMap(tx, stockMap, branchId) {
+  return applyStockDelta(tx, stockMap, branchId, -1)
+}
+
+async function restoreStockMap(tx, stockMap, branchId) {
+  return applyStockDelta(tx, stockMap, branchId, 1)
 }
 
 /**
@@ -205,12 +221,15 @@ function buildComponentDeductionMap(bomLines, qty) {
 }
 
 /**
- * Arma unidades de un kit ahora mismo: descuenta los componentes y le da al
- * kit stock propio real (stock_assembled = true). Si se pasa `requestedQty`
- * se arma esa cantidad (limitada al máximo disponible); si no, el máximo.
+ * Arma unidades de un kit ahora mismo EN UNA SUCURSAL: descuenta los
+ * componentes de esa sucursal y le da al kit stock propio real ahí
+ * (stock_assembled = true). Si se pasa `requestedQty` se arma esa cantidad
+ * (limitada al máximo disponible); si no, el máximo.
  */
-async function assembleKit(tx, kitProductId, requestedQty) {
+async function assembleKit(tx, kitProductId, requestedQty, branchId) {
   const client = dbClient(tx)
+  const { requireBranchId } = require('./stockAvailability')
+  const b = requireBranchId(branchId)
   const kit = await client.product.findFirst({
     where: { id: kitProductId, deleted: false },
     select: {
@@ -240,7 +259,7 @@ async function assembleKit(tx, kitProductId, requestedQty) {
 
   const componentIds = kit.kit_components.map((c) => String(c.component_product_id))
   const { getAvailabilityBatch } = require('./stockAvailability')
-  const availabilityMap = await getAvailabilityBatch(componentIds, tx)
+  const availabilityMap = await getAvailabilityBatch(componentIds, tx, { branchId: b })
   const maxQty = computeKitAvailableFromBom(kit.kit_components, availabilityMap)
   if (maxQty <= 0) {
     const err = new Error(`No hay stock suficiente de componentes para armar "${kit.name}"`)
@@ -263,15 +282,25 @@ async function assembleKit(tx, kitProductId, requestedQty) {
   }
 
   const deductionMap = buildComponentDeductionMap(kit.kit_components, qty)
-  await deductStockMap(tx, deductionMap)
+  await deductStockMap(tx, deductionMap, b)
 
+  // Stock propio del kit en esta sucursal (+ espejo global en products.stock)
+  const [kitRow] = await restoreStockMap(tx, new Map([[String(kitProductId), qty]]), b)
   const product = await client.product.update({
     where: { id: kitProductId },
-    data: { stock: { increment: qty }, stock_assembled: true },
+    data: { stock_assembled: true },
     select: { id: true, name: true, stock: true, min_stock: true, stock_assembled: true },
   })
 
-  return { qty, product }
+  return {
+    qty,
+    product: {
+      ...product,
+      // stock/min de la sucursal donde se armó (para alertas y respuesta)
+      stock: Number(kitRow?.stock ?? product.stock),
+      min_stock: Number(kitRow?.min_stock ?? product.min_stock),
+    },
+  }
 }
 
 async function validateBomComponents(tx, kitProductId, components) {

@@ -9,6 +9,7 @@
  */
 
 const { prisma } = require('../models/prisma')
+const { hasPerm } = require('../middlewares/tenant')
 
 const BRANCH_SELECT = {
   id: true, company_id: true, name: true, code: true, address: true,
@@ -21,6 +22,9 @@ exports.list = async (req, res, next) => {
   try {
     const wantAll = req.query.all === '1' || req.query.all === 'true'
     if (wantAll) {
+      if (!hasPerm(req.user, 'branches.manage') && !hasPerm(req.user, 'branches.view_all') && !hasPerm(req.user, 'users.view')) {
+        return res.status(403).json({ message: 'No autorizado para listar todas las sucursales' })
+      }
       const rows = await prisma.branch.findMany({
         where: { company_id: req.companyId },
         select: BRANCH_SELECT,
@@ -106,6 +110,14 @@ exports.assignUser = async (req, res, next) => {
     if (!user_id || !Array.isArray(branch_ids)) {
       return res.status(400).json({ message: 'user_id y branch_ids son obligatorios' })
     }
+    // El usuario destino debe ser miembro de la empresa actual: la membresía a
+    // la empresa se otorga aparte (companies.manage), aquí solo se reparten sucursales.
+    const targetMembership = await prisma.userCompany.findUnique({
+      where: { user_id_company_id: { user_id, company_id: req.companyId } },
+    })
+    if (!targetMembership) {
+      return res.status(403).json({ message: 'El usuario no pertenece a la empresa actual' })
+    }
     const companyBranches = await prisma.branch.findMany({
       where: { company_id: req.companyId },
       select: { id: true },
@@ -128,14 +140,6 @@ exports.assignUser = async (req, res, next) => {
           where: { user_id_branch_id: { user_id, branch_id: bid } },
           update: {},
           create: { user_id, branch_id: bid },
-        })
-      }
-      // Pertenencia a la empresa va implícita con tener sucursales en ella
-      if (branch_ids.length > 0) {
-        await tx.userCompany.upsert({
-          where: { user_id_company_id: { user_id, company_id: req.companyId } },
-          update: {},
-          create: { user_id, company_id: req.companyId },
         })
       }
       if (default_branch_id !== undefined) {

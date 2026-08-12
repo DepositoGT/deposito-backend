@@ -148,4 +148,4 @@ function branchWhere(req) {
   return req.branchId ? { branch_id: req.branchId } : { branch_id: { in: req.branchIds || [] } }
 }
 
-module.exports = { resolveTenant, requireBranch, branchWhere }
+module.exports = { resolveTenant, requireBranch, branchWhere, hasPerm }
