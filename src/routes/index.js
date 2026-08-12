@@ -23,6 +23,8 @@ router.use(resolveTenant)
 // Empresas y sucursales
 router.use('/companies', require('./companies.routes'))
 router.use('/branches', require('./branches.routes'))
+// Traslados de mercancía entre sucursales
+router.use('/transfers', require('./transfers.routes'))
 
 // Mount products routes
 router.use('/products', require('./products.routes'))
