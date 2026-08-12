@@ -68,15 +68,15 @@ async function applyRefundToSale(tx, currentReturn) {
 }
 
 /** Resuelve sale_id (UUID o referencia ej. V-000001) al id interno de la venta */
-async function resolveSaleId(saleIdOrRef) {
+async function resolveSaleId(saleIdOrRef, companyId) {
   if (!saleIdOrRef) return null
   const s = String(saleIdOrRef).trim()
   const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s)
-  if (isUuid) {
-    const sale = await prisma.sale.findUnique({ where: { id: s }, select: { id: true } })
-    return sale?.id ?? null
-  }
-  const sale = await prisma.sale.findFirst({ where: { reference: s }, select: { id: true } })
+  const scope = { branch: { company_id: companyId } }
+  const sale = await prisma.sale.findFirst({
+    where: isUuid ? { id: s, ...scope } : { reference: s, ...scope },
+    select: { id: true },
+  })
   return sale?.id ?? null
 }
 
@@ -98,7 +98,7 @@ exports.list = async (req, res, next) => {
     }
 
     if (sale_id) {
-      const resolvedId = await resolveSaleId(sale_id)
+      const resolvedId = await resolveSaleId(sale_id, req.companyId)
       if (resolvedId) where.sale_id = resolvedId
     }
 
@@ -170,8 +170,8 @@ exports.getById = async (req, res, next) => {
   try {
     const { id } = req.params
 
-    const returnRecord = await prisma.return.findUnique({
-      where: { id },
+    const returnRecord = await prisma.return.findFirst({
+      where: { id, sale: { branch: { company_id: req.companyId } } },
       include: {
         sale: {
           include: {
@@ -231,7 +231,7 @@ exports.create = async (req, res, next) => {
       })
     }
 
-    const sale_id = await resolveSaleId(saleIdOrRef)
+    const sale_id = await resolveSaleId(saleIdOrRef, req.companyId)
     if (!sale_id) {
       return res.status(404).json({ message: 'Venta no encontrada' })
     }

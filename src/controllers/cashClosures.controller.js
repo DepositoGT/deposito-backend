@@ -90,19 +90,21 @@ function checkClosureScopePermission(req, isOwnClosure) {
  */
 exports.validateStocks = async (req, res, next) => {
   try {
-    // Buscar todos los productos con stock < 0
-    const negativeStockProducts = await prisma.product.findMany({
+    // Productos con stock negativo EN LA SUCURSAL activa
+    const negativeRows = await prisma.productStock.findMany({
+      where: { stock: { lt: 0 }, branch_id: req.branchId ?? undefined, product: { deleted: false, company_id: req.companyId } },
+      select: { stock: true, product_id: true },
+    })
+    const stockByProduct = new Map(negativeRows.map((r) => [r.product_id, r.stock]))
+    const negativeStockProducts = negativeRows.length === 0 ? [] : await prisma.product.findMany({
       where: {
-        stock: { lt: 0 },
+        id: { in: negativeRows.map((r) => r.product_id) },
         deleted: false
       },
       include: {
         category: true,
         supplier: true,
         status: true
-      },
-      orderBy: {
-        stock: 'asc' // Los más negativos primero
       }
     })
 
@@ -111,15 +113,17 @@ exports.validateStocks = async (req, res, next) => {
     return res.json({
       valid: !hasNegativeStock,
       negative_stock_count: negativeStockProducts.length,
-      products: negativeStockProducts.map(p => ({
-        id: p.id,
-        name: p.name,
-        category: p.category.name,
-        supplier: p.supplier.name,
-        current_stock: p.stock,
-        barcode: p.barcode,
-        status: p.status.name
-      }))
+      products: negativeStockProducts
+        .map(p => ({
+          id: p.id,
+          name: p.name,
+          category: p.category.name,
+          supplier: p.supplier.name,
+          current_stock: stockByProduct.get(p.id) ?? 0,
+          barcode: p.barcode,
+          status: p.status.name
+        }))
+        .sort((a, b) => a.current_stock - b.current_stock) // los más negativos primero
     })
   } catch (error) {
     console.error('Error validating stocks:', error)

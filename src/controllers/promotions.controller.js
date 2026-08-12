@@ -34,7 +34,7 @@ function generateRandomCode(prefix = '') {
 /**
  * Generate multiple unique codes
  */
-async function generateUniqueCodes(count = 1, prefix = '') {
+async function generateUniqueCodes(count = 1, prefix = '', companyId) {
     const codes = []
     const maxAttempts = count * 10
     let attempts = 0
@@ -480,7 +480,7 @@ exports.deleteCode = async (req, res, next) => {
 exports.generateCodes = async (req, res, next) => {
     try {
         const { count = 1, prefix = '' } = req.body
-        const codes = await generateUniqueCodes(Math.min(100, Number(count)), prefix)
+        const codes = await generateUniqueCodes(Math.min(100, Number(count)), prefix, req.companyId)
         res.json({ codes })
     } catch (e) { next(e) }
 }
@@ -760,8 +760,8 @@ exports.calculateDiscount = async (req, res, next) => {
             return res.status(400).json({ message: 'promotion_id requerido' })
         }
 
-        const promotion = await prisma.promotion.findUnique({
-            where: { id: promotion_id },
+        const promotion = await prisma.promotion.findFirst({
+            where: { id: promotion_id, company_id: req.companyId },
             include: {
                 type: true,
                 applicable_products: true,

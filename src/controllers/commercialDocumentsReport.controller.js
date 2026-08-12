@@ -87,6 +87,7 @@ exports.committedStockReport = async (req, res, next) => {
       where: {
         doc_type: 'QUOTE',
         status: { in: ['DRAFT', 'SENT', 'ACCEPTED'] },
+        ...branchWhere(req),
       },
       select: {
         id: true,

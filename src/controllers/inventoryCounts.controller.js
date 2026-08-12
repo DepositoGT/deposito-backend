@@ -383,9 +383,9 @@ exports.getById = async (req, res, next) => {
 exports.listLines = async (req, res, next) => {
   try {
     const { id } = req.params
-    const session = await prisma.inventoryCountSession.findUnique({
-      where: { id },
-      select: { id: true, scope_json: true },
+    const session = await prisma.inventoryCountSession.findFirst({
+      where: { id, branch: { company_id: req.companyId } },
+      select: { id: true, branch_id: true, scope_json: true },
     })
     if (!session) return res.status(404).json({ message: 'Sesión no encontrada' })
 
@@ -513,8 +513,8 @@ exports.create = async (req, res, next) => {
 exports.start = async (req, res, next) => {
   try {
     const { id } = req.params
-    const session = await prisma.inventoryCountSession.findUnique({
-      where: { id },
+    const session = await prisma.inventoryCountSession.findFirst({
+      where: { id, branch: { company_id: req.companyId } },
       include: { _count: { select: { lines: true } } },
     })
     if (!session) return res.status(404).json({ message: 'Sesión no encontrada' })
@@ -549,8 +549,8 @@ exports.start = async (req, res, next) => {
       }),
     ])
 
-    const updated = await prisma.inventoryCountSession.findUnique({
-      where: { id },
+    const updated = await prisma.inventoryCountSession.findFirst({
+      where: { id, branch: { company_id: req.companyId } },
       include: sessionIncludeSummary,
     })
     res.json(updated)
@@ -570,9 +570,9 @@ exports.updateLine = async (req, res, next) => {
     const uid = userId(req)
     if (!uid) return res.status(401).json({ message: 'Usuario no identificado' })
 
-    const session = await prisma.inventoryCountSession.findUnique({
-      where: { id },
-      select: { status: true, scope_json: true },
+    const session = await prisma.inventoryCountSession.findFirst({
+      where: { id, branch: { company_id: req.companyId } },
+      select: { status: true, branch_id: true, scope_json: true },
     })
     if (!session) return res.status(404).json({ message: 'Sesión no encontrada' })
     if (session.status !== 'IN_PROGRESS') {
@@ -739,8 +739,8 @@ exports.submit = async (req, res, next) => {
     }
     const reasonStr = String(reason).trim().slice(0, 2000)
 
-    const session = await prisma.inventoryCountSession.findUnique({
-      where: { id },
+    const session = await prisma.inventoryCountSession.findFirst({
+      where: { id, branch: { company_id: req.companyId } },
       include: { _count: { select: { lines: true } } },
     })
     if (!session) return res.status(404).json({ message: 'Sesión no encontrada' })
@@ -816,10 +816,11 @@ exports.approve = async (req, res, next) => {
     }
     const reasonStr = String(reason).trim().slice(0, 2000)
 
-    const session = await prisma.inventoryCountSession.findUnique({
-      where: { id },
+    const session = await prisma.inventoryCountSession.findFirst({
+      where: { id, branch: { company_id: req.companyId } },
       select: {
         status: true,
+        branch_id: true,
         dual_approval: true,
         first_approved_by_id: true,
         scope_json: true,
@@ -910,8 +911,8 @@ exports.approve = async (req, res, next) => {
       }
     }
 
-    const updated = await prisma.inventoryCountSession.findUnique({
-      where: { id },
+    const updated = await prisma.inventoryCountSession.findFirst({
+      where: { id, branch: { company_id: req.companyId } },
       include: sessionIncludeSummary,
     })
     res.json(updated)
@@ -932,8 +933,8 @@ exports.cancel = async (req, res, next) => {
       return res.status(400).json({ message: 'Indique el motivo de cancelación' })
     }
 
-    const session = await prisma.inventoryCountSession.findUnique({
-      where: { id },
+    const session = await prisma.inventoryCountSession.findFirst({
+      where: { id, branch: { company_id: req.companyId } },
       select: { status: true },
     })
     if (!session) return res.status(404).json({ message: 'Sesión no encontrada' })
