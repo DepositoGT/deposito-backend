@@ -81,6 +81,15 @@ async function main() {
     { code: 'roles.view', name: 'Ver roles', description: 'Puede ver roles disponibles' },
     { code: 'roles.manage', name: 'Gestionar roles y permisos', description: 'Puede crear, editar y asignar permisos a roles' },
 
+    // Empresas y sucursales
+    { code: 'companies.manage', name: 'Gestionar empresas', description: 'Puede crear y editar empresas y asignar usuarios' },
+    { code: 'branches.manage', name: 'Gestionar sucursales', description: 'Puede crear y editar sucursales y asignar usuarios' },
+    { code: 'branches.view_all', name: 'Vista consolidada de sucursales', description: 'Puede ver reportes y datos de todas las sucursales de la empresa' },
+    { code: 'transfers.view', name: 'Ver traslados', description: 'Puede ver traslados entre sucursales' },
+    { code: 'transfers.create', name: 'Crear traslados', description: 'Puede enviar mercancía a otra sucursal' },
+    { code: 'transfers.receive', name: 'Recibir traslados', description: 'Puede confirmar la recepción de traslados' },
+    { code: 'transfers.cancel', name: 'Cancelar traslados', description: 'Puede cancelar traslados en tránsito' },
+
     // Productos e inventario
     { code: 'products.view', name: 'Ver productos', description: 'Puede ver el catálogo de productos' },
     { code: 'products.create', name: 'Crear productos', description: 'Puede crear productos' },

@@ -26,6 +26,16 @@ const { bulkValidateUsers, bulkCreateUsers } = require('../services/userBulkImpo
 const userWithPerms = {
   role: { include: { permissions: { include: { permission: true } } } },
   cashRegister: { select: { id: true, name: true, code: true, active: true } },
+  user_companies: {
+    select: {
+      company: { select: { id: true, name: true, code: true, logo_url: true, active: true } },
+    },
+  },
+  user_branches: {
+    select: {
+      branch: { select: { id: true, company_id: true, name: true, code: true, active: true, is_default: true } },
+    },
+  },
 }
 
 function serializeUser(user) {
@@ -42,6 +52,13 @@ function serializeUser(user) {
     hire_date: user.hire_date,
     cash_register_id: user.cash_register_id,
     cash_register: user.cashRegister || null,
+    companies: Array.isArray(user.user_companies)
+      ? user.user_companies.map((uc) => uc.company).filter((c) => c && c.active)
+      : [],
+    branches: Array.isArray(user.user_branches)
+      ? user.user_branches.map((ub) => ub.branch).filter((b) => b && b.active)
+      : [],
+    default_branch_id: user.default_branch_id || null,
     permissions: Array.isArray(user.role?.permissions)
       ? user.role.permissions.map((rp) => rp.permission?.code).filter(Boolean)
       : [],
