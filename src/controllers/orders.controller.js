@@ -12,6 +12,11 @@ const { ensureStockAlertsBatch } = require('../services/stockAlerts')
 const { expandLinesToStockMap, deductStockMap } = require('../services/bomStock')
 const { resolvePriceTierForContext, resolveUnitPriceFromProduct, VALID_CHANNELS } = require('../services/priceResolution')
 const { nextDocumentReference } = require('../services/referenceGenerator')
+const { requireBranch, branchWhere } = require('../middlewares/tenant')
+
+async function loadBranch(tx, branchId) {
+  return tx.branch.findUnique({ where: { id: branchId }, select: { id: true, code: true, seq: true } })
+}
 const {
   appendCommercialDocSearchFilter,
 } = require('../services/commercialDocumentSearch')
@@ -187,23 +192,27 @@ async function resolveOrderLines(tx, items, ctx, { freezePrices = false } = {}) 
   }
 }
 
-async function requireCashSession(tx, user, explicitRegisterId) {
+async function requireCashSession(tx, user, explicitRegisterId, branchId) {
   let cashSessionIdForSale = null
   const isAdmin = String(user.role?.name || user.role_name || '').toLowerCase() === 'admin'
-  // Caja: la explícita (POS) > la asignada al usuario > la predeterminada.
+  // Caja: la explícita (POS) > la asignada al usuario > la predeterminada. Siempre de la sucursal.
   let register = null
   if (explicitRegisterId) {
-    register = await tx.cashRegister.findFirst({ where: { id: String(explicitRegisterId), active: true } })
+    register = await tx.cashRegister.findFirst({
+      where: { id: String(explicitRegisterId), active: true, branch_id: branchId },
+    })
   }
   if (!register && user.sub) {
     const u = await tx.user.findUnique({
       where: { id: String(user.sub) },
-      select: { cashRegister: { select: { id: true, active: true } } },
+      select: { cashRegister: { select: { id: true, active: true, branch_id: true } } },
     })
-    if (u?.cashRegister?.active) register = u.cashRegister
+    if (u?.cashRegister?.active && u.cashRegister.branch_id === branchId) register = u.cashRegister
   }
   if (!register) {
-    register = await tx.cashRegister.findFirst({ where: { is_default: true, active: true } })
+    register = await tx.cashRegister.findFirst({
+      where: { is_default: true, active: true, branch_id: branchId },
+    })
   }
   if (!register) {
     const err = new Error('NO_CASH_REGISTER')
@@ -229,7 +238,7 @@ exports.list = async (req, res, next) => {
     const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 25)))
     const searchTerm = String(search || '').trim()
 
-    const where = { doc_type: ORDER_DOC_TYPE }
+    const where = { doc_type: ORDER_DOC_TYPE, ...branchWhere(req) }
     let searchMeta = null
     if (status && String(status).toUpperCase() !== 'ALL' && !searchTerm) {
       where.status = String(status).toUpperCase()
@@ -280,7 +289,10 @@ exports.list = async (req, res, next) => {
 
 exports.getById = async (req, res, next) => {
   try {
-    const where = orderWhereIdOrReference(req.params.id)
+    const where = {
+      ...orderWhereIdOrReference(req.params.id),
+      branch: { company_id: req.companyId },
+    }
     const doc = await prisma.commercialDocument.findFirst({
       where,
       include: ORDER_DETAIL_INCLUDE,
@@ -314,6 +326,8 @@ exports.create = async (req, res, next) => {
       customerContactId = String(customerContactIdRaw).trim()
     }
 
+    const branchId = requireBranch(req)
+
     const created = await prismaTransaction.$transaction(async (tx) => {
       await validateCustomerContact(tx, customerContactId)
       const { lines, subtotal, total } = await resolveOrderLines(tx, items, {
@@ -328,10 +342,12 @@ exports.create = async (req, res, next) => {
         throw err
       }
 
-      const reference = await nextDocumentReference(tx, 'P')
+      const branch = await loadBranch(tx, branchId)
+      const reference = await nextDocumentReference(tx, 'P', branch)
 
       return tx.commercialDocument.create({
         data: {
+          branch_id: branchId,
           reference,
           doc_type: ORDER_DOC_TYPE,
           status: 'DRAFT',
@@ -363,7 +379,7 @@ exports.update = async (req, res, next) => {
     const user = req.user
     if (!user?.sub) return res.status(401).json({ message: 'Usuario no autenticado' })
 
-    const where = orderWhereIdOrReference(req.params.id)
+    const where = { ...orderWhereIdOrReference(req.params.id), branch: { company_id: req.companyId } }
     const existing = await prisma.commercialDocument.findFirst({ where })
     if (!existing) return res.status(404).json({ message: 'Pedido no encontrado' })
     if (existing.status !== 'DRAFT') {
@@ -443,7 +459,7 @@ exports.confirm = async (req, res, next) => {
     const user = req.user
     if (!user?.sub) return res.status(401).json({ message: 'Usuario no autenticado' })
 
-    const where = orderWhereIdOrReference(req.params.id)
+    const where = { ...orderWhereIdOrReference(req.params.id), branch: { company_id: req.companyId } }
     const order = await prisma.commercialDocument.findFirst({
       where,
       include: { lines: { orderBy: { sort_order: 'asc' } } },
@@ -461,7 +477,8 @@ exports.confirm = async (req, res, next) => {
     await prismaTransaction.$transaction(async (tx) => {
       await assertLinesAvailable(
         tx,
-        lineRows.map((l) => ({ product_id: l.product_id, qty: l.qty }))
+        lineRows.map((l) => ({ product_id: l.product_id, qty: l.qty })),
+        { branchId: order.branch_id }
       )
 
       const now = new Date()
@@ -478,6 +495,7 @@ exports.confirm = async (req, res, next) => {
         documentLines: lineRows,
         expiresAt: order.valid_until,
         createdBy: user.sub,
+        branchId: order.branch_id,
       })
     }, ORDER_TX_OPTIONS)
 
@@ -494,7 +512,7 @@ exports.confirm = async (req, res, next) => {
 
 exports.cancel = async (req, res, next) => {
   try {
-    const where = orderWhereIdOrReference(req.params.id)
+    const where = { ...orderWhereIdOrReference(req.params.id), branch: { company_id: req.companyId } }
     const order = await prisma.commercialDocument.findFirst({ where })
     if (!order) return res.status(404).json({ message: 'Pedido no encontrado' })
 
@@ -535,7 +553,7 @@ exports.convertToSale = async (req, res, next) => {
       return res.status(400).json({ message: 'payment_method_id requerido' })
     }
 
-    const where = orderWhereIdOrReference(req.params.id)
+    const where = { ...orderWhereIdOrReference(req.params.id), branch: { company_id: req.companyId } }
     const order = await prisma.commercialDocument.findFirst({
       where,
       include: { lines: { orderBy: { sort_order: 'asc' } } },
@@ -543,6 +561,10 @@ exports.convertToSale = async (req, res, next) => {
     if (!order) return res.status(404).json({ message: 'Pedido no encontrado' })
     if (!['CONFIRMED', 'PARTIALLY_FULFILLED'].includes(order.status)) {
       return res.status(400).json({ message: 'Solo pedidos confirmados o parciales pueden convertirse en venta' })
+    }
+    // La entrega ocurre en la sucursal del pedido: ahí están la reserva y el stock
+    if (req.branchId !== order.branch_id) {
+      return res.status(400).json({ message: 'El pedido pertenece a otra sucursal; cambia de sucursal para entregarlo' })
     }
 
     let fulfillments
@@ -556,7 +578,7 @@ exports.convertToSale = async (req, res, next) => {
     }
 
     const result = await prismaTransaction.$transaction(async (tx) => {
-      const cashSessionIdForSale = await requireCashSession(tx, user, cashRegisterId)
+      const cashSessionIdForSale = await requireCashSession(tx, user, cashRegisterId, order.branch_id)
 
       const paymentMethod = await tx.paymentMethod.findUnique({ where: { id: paymentMethodId } })
       if (!paymentMethod) {
@@ -568,7 +590,7 @@ exports.convertToSale = async (req, res, next) => {
       await assertLinesAvailable(
         tx,
         fulfillments.map(({ line, qty }) => ({ product_id: line.product_id, qty })),
-        { excludeDocumentId: order.id }
+        { excludeDocumentId: order.id, branchId: order.branch_id }
       )
 
       const completadaStatus = await tx.saleStatus.findFirst({ where: { name: 'Completada' } })
@@ -591,10 +613,12 @@ exports.convertToSale = async (req, res, next) => {
         fulfillments.reduce((acc, f) => acc + Number(f.line.unit_price) * f.qty, 0) * 100
       ) / 100
       const total = subtotal
-      const saleRef = await nextDocumentReference(tx, 'V')
+      const branch = await loadBranch(tx, order.branch_id)
+      const saleRef = await nextDocumentReference(tx, 'V', branch)
 
       const sale = await tx.sale.create({
         data: {
+          branch_id: order.branch_id,
           customer: order.customer,
           customer_nit: order.customer_nit,
           is_final_consumer: order.is_final_consumer,
@@ -631,8 +655,8 @@ exports.convertToSale = async (req, res, next) => {
         tx,
         fulfillments.map(({ line, qty }) => ({ product_id: line.product_id, qty }))
       )
-      const updatedProducts = await deductStockMap(tx, stockMap)
-      await ensureStockAlertsBatch(tx, updatedProducts)
+      const updatedProducts = await deductStockMap(tx, stockMap, order.branch_id)
+      await ensureStockAlertsBatch(tx, updatedProducts, order.branch_id)
 
       await consumePartialByDocument(
         tx,

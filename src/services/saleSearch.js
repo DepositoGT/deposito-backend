@@ -3,7 +3,8 @@
  */
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-const REF_FULL_REGEX = /^V-[\dA-Za-z]+$/i
+// Acepta el formato viejo (V-000001) y el nuevo por sucursal (V-SUC1-000001)
+const REF_FULL_REGEX = /^V-(?:[\dA-Za-z]+-)?[\dA-Za-z]+$/i
 const REF_PREFIX_REGEX = /^V-/i
 const NIT_LIKE_REGEX = /^[\d.\-kK\s]+$/
 

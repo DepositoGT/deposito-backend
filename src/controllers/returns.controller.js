@@ -18,24 +18,26 @@ const {
   getAvailabilityBatchWithKits,
 } = require('../services/bomStock')
 
-async function restoreReturnItemsStock(tx, returnItems) {
+// El stock de una devolución/cambio se mueve en la sucursal DONDE SE VENDIÓ
+// (sale.branch_id), no en la del request.
+async function restoreReturnItemsStock(tx, returnItems, branchId) {
   const stockMap = await expandLinesToStockMap(
     tx,
     returnItems.map((item) => ({ product_id: item.product_id, qty: item.qty_returned }))
   )
-  const updatedProducts = await restoreStockMap(tx, stockMap)
-  await ensureStockAlertsBatch(tx, updatedProducts)
+  const updatedProducts = await restoreStockMap(tx, stockMap, branchId)
+  await ensureStockAlertsBatch(tx, updatedProducts, branchId)
   return updatedProducts
 }
 
 /** Descuenta stock de los productos que el cliente se lleva en un cambio (EXCHANGE). */
-async function deductReplacementStock(tx, replacementItems) {
+async function deductReplacementStock(tx, replacementItems, branchId) {
   const stockMap = await expandLinesToStockMap(
     tx,
     replacementItems.map((item) => ({ product_id: item.product_id, qty: item.qty }))
   )
-  const updatedProducts = await deductStockMap(tx, stockMap)
-  await ensureStockAlertsBatch(tx, updatedProducts)
+  const updatedProducts = await deductStockMap(tx, stockMap, branchId)
+  await ensureStockAlertsBatch(tx, updatedProducts, branchId)
   return updatedProducts
 }
 
@@ -89,7 +91,7 @@ exports.list = async (req, res, next) => {
     const page = Math.max(1, Number(req.query.page ?? 1))
     const pageSize = Math.min(1000, Math.max(1, Number(req.query.pageSize ?? 50)))
 
-    const where = {}
+    const where = { sale: { branch: { company_id: req.companyId } } }
 
     if (status) {
       where.status = { name: String(status) }
@@ -236,8 +238,8 @@ exports.create = async (req, res, next) => {
 
     const created = await prismaTransaction.$transaction(async (tx) => {
       // 1. Validar que la venta existe y está completada
-      const sale = await tx.sale.findUnique({
-        where: { id: sale_id },
+      const sale = await tx.sale.findFirst({
+        where: { id: sale_id, branch: { company_id: req.companyId } },
         include: {
           status: true,
           sale_items: {
@@ -334,7 +336,7 @@ exports.create = async (req, res, next) => {
           select: { id: true, name: true }
         })
         const productById = new Map(products.map((p) => [p.id, p]))
-        const availability = await getAvailabilityBatchWithKits(ids, tx)
+        const availability = await getAvailabilityBatchWithKits(ids, tx, sale.branch_id)
 
         for (const rep of replacements) {
           const product_id = String(rep.product_id || '')
@@ -498,6 +500,7 @@ exports.updateStatus = async (req, res, next) => {
       const currentReturn = await tx.return.findUnique({
         where: { id },
         include: {
+          sale: { select: { branch_id: true } },
           status: true,
           return_items: {
             include: {
@@ -531,6 +534,7 @@ exports.updateStatus = async (req, res, next) => {
 
       const prevStatusName = currentReturn.status.name
       const newStatusName = newStatus.name
+      const saleBranchId = currentReturn.sale?.branch_id
 
       // 3. Validar transición de estados
       if (prevStatusName === 'Completada' || prevStatusName === 'Rechazada') {
@@ -568,20 +572,20 @@ exports.updateStatus = async (req, res, next) => {
         }
 
         console.log(`[RETURN STOCK RESTORE] Return ${id}: restaurando stock de devueltos al completar...`)
-        const restored = await restoreReturnItemsStock(tx, currentReturn.return_items)
+        const restored = await restoreReturnItemsStock(tx, currentReturn.return_items, saleBranchId)
         restored.forEach((p) => console.log(`[RETURN STOCK RESTORE] ${p.name}: stock = ${p.stock}`))
       }
 
       // Cambios: al completar, descontar el stock de los productos de reemplazo.
       if (isExchange && (isCompletingFromApproved || isCompletingFromPending)) {
-        const deducted = await deductReplacementStock(tx, currentReturn.replacement_items)
+        const deducted = await deductReplacementStock(tx, currentReturn.replacement_items, saleBranchId)
         deducted.forEach((p) => console.log(`[EXCHANGE STOCK] ${p.name}: stock = ${p.stock}`))
       }
 
       // CASO 3: Si se aprueba desde "Pendiente", restaurar stock solo si restore_stock es true
       if (isApproving && shouldRestoreStock) {
         console.log(`[RETURN STOCK RESTORE] Return ${id}: ${prevStatusName} -> ${newStatusName}. Restaurando stock solamente...`)
-        const updatedProducts = await restoreReturnItemsStock(tx, currentReturn.return_items)
+        const updatedProducts = await restoreReturnItemsStock(tx, currentReturn.return_items, saleBranchId)
         updatedProducts.forEach((p) => {
           console.log(`[RETURN STOCK RESTORE] ${p.name}: stock restaurado = ${p.stock}`)
         })

@@ -27,20 +27,25 @@ const {
 } = require('../services/saleSearch')
 const { expandLinesToStockMap, deductStockMap, restoreStockMap, getAvailabilityBatchWithKits } = require('../services/bomStock')
 const { nextDocumentReference } = require('../services/referenceGenerator')
+const { requireBranch, branchWhere } = require('../middlewares/tenant')
 
 /** Caja de la venta: la explícita (POS) > la asignada al usuario > la predeterminada. */
-async function resolveSaleRegister (client, explicitId, userId) {
+async function resolveSaleRegister (client, explicitId, userId, branchId) {
   if (explicitId) {
-    return client.cashRegister.findFirst({ where: { id: String(explicitId), active: true } })
+    return client.cashRegister.findFirst({
+      where: { id: String(explicitId), active: true, branch_id: branchId },
+    })
   }
   if (userId) {
     const u = await client.user.findUnique({
       where: { id: String(userId) },
-      select: { cashRegister: { select: { id: true, active: true } } }
+      select: { cashRegister: { select: { id: true, active: true, branch_id: true } } }
     })
-    if (u?.cashRegister?.active) return u.cashRegister
+    if (u?.cashRegister?.active && u.cashRegister.branch_id === branchId) return u.cashRegister
   }
-  return client.cashRegister.findFirst({ where: { is_default: true, active: true } })
+  return client.cashRegister.findFirst({
+    where: { is_default: true, active: true, branch_id: branchId },
+  })
 }
 
 /** Include ligero para listados (tabla / búsqueda). Detalle completo en GET /sales/:id */
@@ -152,7 +157,7 @@ exports.list = async (req, res, next) => {
       }
     }
 
-    const where = {}
+    const where = { ...branchWhere(req) }
     if (startDate && endDate) {
       where.date = { gte: startDate, lte: endDate }
     }
@@ -311,7 +316,12 @@ const saleWhereIdOrReference = (idOrRef) => {
 exports.getById = async (req, res, next) => {
   try {
     const { id: idOrRef } = req.params
-    const where = saleWhereIdOrReference(idOrRef)
+    // Lectura a nivel empresa: una venta de otra sucursal de la misma empresa
+    // se puede consultar (p. ej. escanear un recibo), de otra empresa no.
+    const where = {
+      ...saleWhereIdOrReference(idOrRef),
+      branch: { company_id: req.companyId },
+    }
 
     const sale = await prisma.sale.findFirst({
       where,
@@ -358,12 +368,18 @@ exports.create = async (req, res, next) => {
     // Convertir admin_authorized_products a Set para búsqueda rápida
     const adminAuthorizedSet = new Set(admin_authorized_products || [])
 
+    const branchId = requireBranch(req)
+
     const created = await prismaTransaction.$transaction(async (tx) => {
       let cashSessionIdForSale = null
       const isAdmin = String(user.role?.name || user.role_name || '').toLowerCase() === 'admin'
+      const branch = await tx.branch.findUnique({
+        where: { id: branchId },
+        select: { id: true, code: true, seq: true },
+      })
       // Resolver la caja: la seleccionada en el POS > la asignada al usuario > la predeterminada.
       // Antes se usaba siempre la predeterminada, así que abrir turno en otra caja no contaba.
-      const register = await resolveSaleRegister(tx, saleData.cash_register_id, user.sub)
+      const register = await resolveSaleRegister(tx, saleData.cash_register_id, user.sub, branchId)
       if (!register) {
         const err = new Error('NO_CASH_REGISTER')
         err.status = 503
@@ -409,7 +425,7 @@ exports.create = async (req, res, next) => {
         },
       })
       const prodMap = new Map(products.map(p => [String(p.id), p]))
-      const availabilityMap = await getAvailabilityBatchWithKits(productIds, tx)
+      const availabilityMap = await getAvailabilityBatchWithKits(productIds, tx, branchId)
       // Verifica existencia y stock suficiente por producto (considera cantidades sumadas si hay repetidos)
       for (const pid of productIds) {
         const p = prodMap.get(pid)
@@ -433,11 +449,12 @@ exports.create = async (req, res, next) => {
 
         const requested = Number(qtyByProduct.get(pid) || 0)
         const availability = availabilityMap[pid]
-        const available = Number(availability?.available ?? p.stock ?? 0)
+        const available = Number(availability?.available ?? 0)
         if (requested > available) {
           const reserved = Number(availability?.reserved ?? 0)
+          const physical = Number(availability?.stock ?? 0)
           const err = new Error(
-            `Stock insuficiente para ${p.name}. Disponible: ${available}${reserved > 0 ? ` (${Number(p.stock || 0)} físico − ${reserved} reservado)` : ''}, solicitado: ${requested}`
+            `Stock insuficiente para ${p.name}. Disponible: ${available}${reserved > 0 ? ` (${physical} físico − ${reserved} reservado)` : ''}, solicitado: ${requested}`
           )
           err.status = 400
           throw err
@@ -627,10 +644,11 @@ exports.create = async (req, res, next) => {
       console.log('[SALE DATE] Guatemala local time:', nowGt.toFormat('yyyy-MM-dd HH:mm:ss'));
       console.log('[SALE DATE] Will be stored in DB as:', DateTime.fromJSDate(saleDate).toUTC().toFormat('yyyy-MM-dd HH:mm:ss'));
 
-      const nextRef = await nextDocumentReference(tx, 'V')
+      const nextRef = await nextDocumentReference(tx, 'V', branch)
 
       const sale = await tx.sale.create({
         data: {
+          branch_id: branchId,
           customer: saleData.customer,
           customer_nit: saleData.customer_nit,
           is_final_consumer: saleData.is_final_consumer,
@@ -668,9 +686,9 @@ exports.create = async (req, res, next) => {
         tx,
         resolvedItems.map((it) => ({ product_id: it.product_id, qty: it.qty }))
       )
-      const updatedProducts = await deductStockMap(tx, stockMap)
-      await consumeLotsFEFO(tx, stockMap) // advisory: descuenta lotes por caducidad
-      await ensureStockAlertsBatch(tx, updatedProducts)
+      const updatedProducts = await deductStockMap(tx, stockMap, branchId)
+      await consumeLotsFEFO(tx, stockMap, branchId) // advisory: descuenta lotes por caducidad
+      await ensureStockAlertsBatch(tx, updatedProducts, branchId)
 
       // 3) Guardar promociones con descuento efectivo e incrementar solo esos códigos
       if (promotionRowsToRecord.length > 0) {
@@ -750,10 +768,12 @@ exports.updateStatus = async (req, res, next) => {
       return await prismaTransaction.$transaction(async (tx) => {
         // Cargar venta actual con su status e items (por id o por reference)
         const current = await tx.sale.findFirst({
-          where,
+          where: { ...where, branch: { company_id: req.companyId } },
           include: { status: true, sale_items: true }
         })
         if (!current) throw new Error('Venta no encontrada')
+        // El stock se ajusta en la sucursal DONDE SE VENDIÓ, no en la del request
+        const saleBranchId = current.branch_id
 
         const prevStatusName = current.status?.name || ''
         // Obtener nombre del nuevo status para comparar lógicamente
@@ -773,15 +793,15 @@ exports.updateStatus = async (req, res, next) => {
             tx,
             current.sale_items.map((si) => ({ product_id: si.product_id, qty: si.qty }))
           )
-          const updatedProducts = await deductStockMap(tx, stockMap)
-          await consumeLotsFEFO(tx, stockMap) // advisory: descuenta lotes por caducidad
+          const updatedProducts = await deductStockMap(tx, stockMap, saleBranchId)
+          await consumeLotsFEFO(tx, stockMap, saleBranchId) // advisory: descuenta lotes por caducidad
 
           updatedProducts.forEach(p => {
             console.log(`[STOCK ADJUSTMENT] ${p.name}: nuevo stock = ${p.stock}`)
           })
 
           // Procesar alertas en lote (mucho más eficiente)
-          await ensureStockAlertsBatch(tx, updatedProducts)
+          await ensureStockAlertsBatch(tx, updatedProducts, saleBranchId)
           console.log(`[STOCK ADJUSTMENT] Alertas de stock actualizadas`)
         }
 
@@ -793,15 +813,15 @@ exports.updateStatus = async (req, res, next) => {
             tx,
             current.sale_items.map((si) => ({ product_id: si.product_id, qty: si.qty }))
           )
-          const updatedProducts = await restoreStockMap(tx, stockMap)
-          await restoreLotsFEFO(tx, stockMap) // advisory: devuelve cantidad a los lotes
+          const updatedProducts = await restoreStockMap(tx, stockMap, saleBranchId)
+          await restoreLotsFEFO(tx, stockMap, saleBranchId) // advisory: devuelve cantidad a los lotes
 
           updatedProducts.forEach(p => {
             console.log(`[STOCK REVERT] ${p.name}: stock restaurado = ${p.stock}`)
           })
 
           // Actualizar alertas de stock (puede resolver alertas si el stock volvió a niveles normales)
-          await ensureStockAlertsBatch(tx, updatedProducts)
+          await ensureStockAlertsBatch(tx, updatedProducts, saleBranchId)
           console.log(`[STOCK REVERT] Alertas de stock actualizadas después de reversión`)
         }
 

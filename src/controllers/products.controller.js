@@ -16,6 +16,47 @@ const { createClient } = require('@supabase/supabase-js')
 
 // Reuse shared stock alert service
 const { ensureStockAlert } = require('../services/stockAlerts')
+const { requireBranch, branchWhere } = require('../middlewares/tenant')
+const { ensureBranchStockRows } = require('../services/stockAvailability')
+
+/**
+ * Fija stock/min_stock del producto EN LA SUCURSAL dada y ajusta el espejo
+ * products.stock por el delta. Devuelve la fila de la sucursal actualizada.
+ */
+async function setBranchStock(tx, productId, branchId, { stock, minStock }) {
+  await ensureBranchStockRows(tx, [productId], branchId)
+  const key = { product_id_branch_id: { product_id: productId, branch_id: branchId } }
+  const row = await tx.productStock.findUnique({ where: key })
+  const data = {}
+  if (minStock !== undefined) data.min_stock = Number(minStock)
+  if (stock !== undefined) data.stock = Number(stock)
+  const updated = await tx.productStock.update({ where: key, data })
+  if (stock !== undefined) {
+    const delta = Number(stock) - Number(row?.stock || 0)
+    if (delta !== 0) {
+      await tx.product.update({ where: { id: productId }, data: { stock: { increment: delta } } })
+    }
+  }
+  return updated
+}
+
+/**
+ * Sustituye stock/min_stock por los valores de la sucursal activa en las
+ * respuestas de productos (la forma del JSON no cambia). En vista consolidada
+ * (sin sucursal) se devuelven los totales espejo tal cual.
+ */
+async function overlayBranchStock(items, branchId) {
+  if (!branchId || !items?.length) return items
+  const rows = await prisma.productStock.findMany({
+    where: { branch_id: branchId, product_id: { in: items.map((p) => p.id) } },
+    select: { product_id: true, stock: true, min_stock: true },
+  })
+  const byId = new Map(rows.map((r) => [r.product_id, r]))
+  return items.map((p) => {
+    const s = byId.get(p.id)
+    return { ...p, stock: s ? s.stock : 0, min_stock: s ? s.min_stock : p.min_stock }
+  })
+}
 const { getTimezone } = require('../utils/getTimezone')
 const { getBrandingForPdf } = require('../utils/pdfBranding')
 
@@ -27,6 +68,8 @@ const {
   BOM_INCLUDE,
   getAvailabilityBatchWithKits,
   assembleKit,
+  restoreStockMap,
+  deductStockMap,
 } = require('../services/bomStock')
 const { generateLotCode, syncLotExpiryAlerts } = require('../services/lots')
 
@@ -48,6 +91,7 @@ exports.list = async (req, res, next) => {
       String(forSale || '').toLowerCase() === 'yes'
 
     const where = includeDeleted === 'true' ? {} : { deleted: false }
+    where.company_id = req.companyId
     if (forSaleOnly) {
       where.available_for_sale = true
     }
@@ -87,9 +131,9 @@ exports.list = async (req, res, next) => {
     
     const nextPage = safePage < totalPages ? safePage + 1 : null
     const prevPage = safePage > 1 ? safePage - 1 : null
-    
+
     res.json({
-      items: products,
+      items: await overlayBranchStock(products, req.branchId),
       page: safePage,
       pageSize,
       totalPages,
@@ -105,6 +149,7 @@ exports.create = async (req, res, next) => {
     const payload = req.body || {}
     const stock = Number(payload.stock || 0)
     const cost = payload.cost != null ? Number(payload.cost) : 0
+    const branchId = requireBranch(req)
 
     // Preparar payload seguro: normalizar campos y validar
     const safePayload = { ...payload }
@@ -127,9 +172,10 @@ exports.create = async (req, res, next) => {
       if (!uuidRegex.test(supplierId)) {
         // Si no es un UUID válido, intentar buscar el proveedor por nombre
         const supplier = await prisma.supplier.findFirst({
-          where: { 
+          where: {
             name: { equals: supplierId, mode: 'insensitive' },
-            deleted: false
+            deleted: false,
+            company_id: req.companyId
           }
         })
         if (supplier) {
@@ -142,16 +188,19 @@ exports.create = async (req, res, next) => {
       }
     }
 
+    safePayload.company_id = req.companyId
     const kind = parseKind(payload.kind)
     const bomComponents = payload.bom_components
     delete safePayload.bom_components
     delete safePayload.kind
     if (kind === 'KIT') {
       safePayload.kind = 'KIT'
-      safePayload.stock = 0
     } else {
       safePayload.kind = 'STANDARD'
     }
+    // El espejo products.stock arranca en 0; setBranchStock lo sube con el
+    // stock inicial de la sucursal (si no, se duplicaría).
+    safePayload.stock = 0
 
     // create product and, if initial stock > 0, create a purchase log in the same transaction
     // Use prismaTransaction (DIRECT_URL) for transactions as pooled connections don't support them
@@ -184,6 +233,13 @@ exports.create = async (req, res, next) => {
         }
         await replaceProductBom(tx, product.id, bomComponents)
       }
+
+      // El stock inicial vive en la sucursal donde se creó el producto
+      const branchStock = await setBranchStock(tx, product.id, branchId, {
+        stock: kind === 'KIT' ? 0 : stock,
+        minStock: Number(product.min_stock || 0),
+      })
+      product.stock = branchStock.stock
 
       let purchaseLog = null
 
@@ -234,7 +290,7 @@ exports.create = async (req, res, next) => {
     try {
       const { product } = result
       if (product && product.min_stock != null && Number(product.stock) < Number(product.min_stock)) {
-        await ensureStockAlert(prisma, product.id, product.stock, product.min_stock)
+        await ensureStockAlert(prisma, product.id, product.stock, product.min_stock, branchId)
       }
     } catch (e) {
       console.error('post-create ensureStockAlert error', e.message)
@@ -247,11 +303,15 @@ exports.create = async (req, res, next) => {
 
 exports.getOne = async (req, res, next) => {
   try {
-    const item = await prisma.product.findUnique({
-      where: { id: req.params.id },
+    const item = await prisma.product.findFirst({
+      where: { id: req.params.id, company_id: req.companyId },
       include: BOM_INCLUDE,
     })
     if (!item || item.deleted) return res.status(404).json({ message: 'No encontrado' })
+    if (req.branchId) {
+      const [withBranch] = await overlayBranchStock([item], req.branchId)
+      return res.json(withBranch)
+    }
     res.json(item)
   } catch (e) { next(e) }
 }
@@ -316,9 +376,10 @@ exports.assembleKit = async (req, res, next) => {
   try {
     const { id } = req.params
     const { qty } = req.body || {}
+    const branchId = requireBranch(req)
     const result = await prismaTransaction.$transaction(async (tx) => {
-      const out = await assembleKit(tx, id, qty)
-      await ensureStockAlert(tx, out.product.id, out.product.stock, out.product.min_stock)
+      const out = await assembleKit(tx, id, qty, branchId)
+      await ensureStockAlert(tx, out.product.id, out.product.stock, out.product.min_stock, branchId)
       return out
     })
     res.json(result)
@@ -342,7 +403,7 @@ exports.availability = async (req, res, next) => {
     if (ids.length > 200) {
       return res.status(400).json({ message: 'Máximo 200 productos por consulta' })
     }
-    const availability = await getAvailabilityBatchWithKits(ids)
+    const availability = await getAvailabilityBatchWithKits(ids, null, requireBranch(req))
     res.json({ availability })
   } catch (e) {
     next(e)
@@ -355,10 +416,11 @@ exports.update = async (req, res, next) => {
     const payload = req.body || {}
 
     // Get current product to detect stock changes
-    const current = await prisma.product.findUnique({ where: { id } })
+    const current = await prisma.product.findFirst({ where: { id, company_id: req.companyId } })
     if (!current || current.deleted) {
       return res.status(404).json({ message: 'Producto no encontrado' })
     }
+    const branchId = requireBranch(req)
 
     // Preparar payload seguro: normalizar campos y validar
     const safePayload = {}
@@ -471,9 +533,10 @@ exports.update = async (req, res, next) => {
       if (!uuidRegex.test(supplierId)) {
         // Si no es un UUID válido, intentar buscar el proveedor por nombre
         const supplier = await prisma.supplier.findFirst({
-          where: { 
+          where: {
             name: { equals: supplierId, mode: 'insensitive' },
-            deleted: false
+            deleted: false,
+            company_id: req.companyId
           }
         })
         if (supplier) {
@@ -486,14 +549,30 @@ exports.update = async (req, res, next) => {
       }
     }
 
+    // stock y min_stock del formulario aplican a LA SUCURSAL activa, no al espejo global
+    const branchStockValue = safePayload.stock !== undefined ? Number(safePayload.stock) : undefined
+    const branchMinValue = safePayload.min_stock !== undefined ? Number(safePayload.min_stock) : undefined
+    delete safePayload.stock
+    // min_stock del producto se mantiene como default para sucursales nuevas
+    if (branchMinValue !== undefined) safePayload.min_stock = branchMinValue
+
     let updated
+    let branchRow = null
     try {
-      updated = await prisma.product.update({ where: { id }, data: safePayload })
+      const out = await prismaTransaction.$transaction(async (tx) => {
+        const prod = await tx.product.update({ where: { id }, data: safePayload })
+        const row = (branchStockValue !== undefined || branchMinValue !== undefined)
+          ? await setBranchStock(tx, id, branchId, { stock: branchStockValue, minStock: branchMinValue })
+          : null
+        return { prod, row }
+      })
+      updated = out.prod
+      branchRow = out.row
     } catch (prismaError) {
       // Si el error es porque image_url no existe en la base de datos (migración no ejecutada)
       // Remover image_url y reintentar
       if (prismaError.message && (
-        prismaError.message.includes('image_url') || 
+        prismaError.message.includes('image_url') ||
         prismaError.message.includes('Unknown argument') ||
         prismaError.message.includes('Unknown field')
       )) {
@@ -505,21 +584,17 @@ exports.update = async (req, res, next) => {
       }
     }
 
-    // If stock or min_stock changed, trigger alert logic
-    const stockChanged = payload.stock !== undefined && Number(payload.stock) !== Number(current.stock)
-    const minStockChanged = payload.min_stock !== undefined && Number(payload.min_stock) !== Number(current.min_stock)
-
-    if (stockChanged || minStockChanged) {
+    // If stock or min_stock changed, trigger alert logic (valores de la sucursal)
+    if (branchRow) {
       try {
-        const newStock = Number(updated.stock)
-        const newMinStock = Number(updated.min_stock)
-        await ensureStockAlert(prisma, id, newStock, newMinStock)
+        await ensureStockAlert(prisma, id, Number(branchRow.stock), Number(branchRow.min_stock), branchId)
       } catch (e) {
         console.error('post-update ensureStockAlert error', e.message)
       }
     }
 
-    res.json(updated)
+    const [withBranch] = await overlayBranchStock([updated], req.branchId)
+    res.json(withBranch || updated)
   } catch (e) { next(e) }
 }
 
@@ -879,11 +954,12 @@ exports.reportPdf = async (req, res, next) => {
 // Return products that are below their minimum stock (critical)
 exports.critical = async (req, res, next) => {
   try {
-    const products = await prisma.product.findMany({
-      where: { deleted: false },
+    const rows = await prisma.product.findMany({
+      where: { deleted: false, company_id: req.companyId },
       include: { category: true, supplier: true, status: true },
       orderBy: { name: 'asc' },
     })
+    const products = await overlayBranchStock(rows, req.branchId)
 
     // filter server-side for products where stock < min_stock
     const critical = products.filter((p) => {
@@ -906,7 +982,11 @@ exports.getLots = async (req, res, next) => {
   try {
     const { id } = req.params
     const lots = await prisma.productLot.findMany({
-      where: { product_id: id, qty_remaining: { gt: 0 } },
+      where: {
+        product_id: id,
+        qty_remaining: { gt: 0 },
+        ...(req.branchId ? { branch_id: req.branchId } : { branch: { company_id: req.companyId } }),
+      },
       orderBy: [{ expiry_date: { sort: 'asc', nulls: 'last' } }, { received_at: 'asc' }],
     })
     res.json({ lots })
@@ -947,13 +1027,12 @@ exports.updateLot = async (req, res, next) => {
         data.qty_received = newQty
         data.qty_remaining = lot.qty_remaining + delta
         if (delta !== 0) {
-          const newStock = lot.product.stock + delta
-          const updatedProduct = await tx.product.update({
-            where: { id: lot.product_id },
-            data: { stock: newStock },
-            select: { id: true, min_stock: true },
-          })
-          await ensureStockAlert(tx, updatedProduct.id, newStock, updatedProduct.min_stock)
+          // Ajusta la sucursal del lote (y el espejo global) por la diferencia
+          const map = new Map([[String(lot.product_id), Math.abs(delta)]])
+          const [row] = delta > 0
+            ? await restoreStockMap(tx, map, lot.branch_id)
+            : await deductStockMap(tx, map, lot.branch_id)
+          if (row) await ensureStockAlert(tx, row.id, row.stock, row.min_stock, lot.branch_id)
         }
       }
 
@@ -995,13 +1074,9 @@ exports.deleteLot = async (req, res, next) => {
       if (!lot) { const e = new Error('Lote no encontrado'); e.status = 404; throw e }
 
       if (lot.qty_remaining > 0) {
-        const newStock = lot.product.stock - lot.qty_remaining
-        const updatedProduct = await tx.product.update({
-          where: { id: lot.product_id },
-          data: { stock: newStock < 0 ? 0 : newStock },
-          select: { id: true, stock: true, min_stock: true },
-        })
-        await ensureStockAlert(tx, updatedProduct.id, updatedProduct.stock, updatedProduct.min_stock)
+        const map = new Map([[String(lot.product_id), lot.qty_remaining]])
+        const [row] = await deductStockMap(tx, map, lot.branch_id)
+        if (row) await ensureStockAlert(tx, row.id, row.stock, row.min_stock, lot.branch_id)
       }
 
       await tx.productLot.delete({ where: { id: lotId } })
@@ -1159,8 +1234,9 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
       }
     }
 
-    const supplierWithTerms = await prisma.supplier.findUnique({
-      where: { id: supplier_id },
+    const branchId = requireBranch(req)
+    const supplierWithTerms = await prisma.supplier.findFirst({
+      where: { id: supplier_id, company_id: req.companyId },
       include: { supplier_payment_terms: true },
     })
     if (!supplierWithTerms || supplierWithTerms.deleted) {
@@ -1247,6 +1323,7 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
       // Create incoming merchandise audit record
       const incomingMerchandise = await tx.incomingMerchandise.create({
         data: {
+          branch_id: branchId,
           supplier_id,
           registered_by,
           date: dateAsUtcWithGtClock,
@@ -1276,14 +1353,9 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
 
         const quantity = Number(item.quantity)
         const unitCost = Number(item.unit_cost)
-        const newStock = product.stock + quantity
 
-        // Update product stock
-        const updated = await tx.product.update({
-          where: { id: product.id },
-          data: { stock: newStock },
-          select: { id: true, name: true, stock: true, min_stock: true }
-        })
+        // La mercancía entra al stock de la sucursal (y al espejo global)
+        const [updated] = await restoreStockMap(tx, new Map([[String(product.id), quantity]]), branchId)
         updatedProducts.push(updated)
 
         // Create purchase log
@@ -1317,6 +1389,7 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
           await tx.productLot.create({
             data: {
               product_id: product.id,
+              branch_id: branchId,
               lot_code: lotCode,
               expiry_date: hasExpiry ? new Date(item.expiry_date) : null,
               qty_received: quantity,
@@ -1330,8 +1403,8 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
           lotsCreated++
         }
 
-        // Update stock alerts
-        await ensureStockAlert(tx, product.id, newStock, product.min_stock)
+        // Update stock alerts (valores de la sucursal)
+        await ensureStockAlert(tx, product.id, updated.stock, updated.min_stock, branchId)
 
         totalPurchaseValue += quantity * unitCost
       }
