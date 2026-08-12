@@ -18,8 +18,9 @@ exports.list = async (req, res, next) => {
     // By default only show unresolved alerts (resolved = 0), unless ?all=true
     const showAll = req.query.all === 'true'
 
+    const { branchWhere } = require('../middlewares/tenant')
     const alerts = await prisma.alert.findMany({
-      where: showAll ? {} : { resolved: 0 },
+      where: { ...(showAll ? {} : { resolved: 0 }), ...branchWhere(req) },
       include: { 
         type: true, 
         priority: true, 
@@ -52,7 +53,10 @@ exports.list = async (req, res, next) => {
 
 exports.create = async (req, res, next) => {
   try {
-    const created = await prisma.alert.create({ data: req.body })
+    const { requireBranch } = require('../middlewares/tenant')
+    const created = await prisma.alert.create({
+      data: { ...req.body, branch_id: requireBranch(req) },
+    })
     res.status(201).json(created)
   } catch (e) { next(e) }
 }

@@ -128,14 +128,21 @@ function seededShuffleIds(ids, seedStr) {
   return a
 }
 
-async function resolveProductsForCountStart(session) {
+async function resolveProductsForCountStart(session, companyId) {
   const scope = session.scope_json || {}
   const where = buildProductWhereFromScope(scope)
+  if (companyId) where.company_id = companyId
   const rows = await prisma.product.findMany({
     where,
-    select: { id: true, stock: true, cost: true, category_id: true },
+    select: { id: true, cost: true, category_id: true },
   })
-  let list = rows
+  // El snapshot es el stock de LA SUCURSAL de la sesión, no el espejo global
+  const branchRows = await prisma.productStock.findMany({
+    where: { branch_id: session.branch_id, product_id: { in: rows.map((p) => p.id) } },
+    select: { product_id: true, stock: true },
+  })
+  const stockByProduct = new Map(branchRows.map((r) => [r.product_id, r.stock]))
+  let list = rows.map((p) => ({ ...p, stock: stockByProduct.get(p.id) ?? 0 }))
   const abc = scopeAbcClasses(scope)
   if (abc) {
     const tagged = assignAbcByInventoryValue(list)
@@ -174,10 +181,11 @@ function buildProductWhereFromScope(scope) {
   return where
 }
 
-async function assertNoBlockingSession(exceptId) {
+async function assertNoBlockingSession(exceptId, branchId) {
   const blocking = await prisma.inventoryCountSession.findFirst({
     where: {
       status: { in: ['IN_PROGRESS', 'IN_REVIEW', 'PENDING_SECOND_APPROVAL'] },
+      ...(branchId ? { branch_id: branchId } : {}),
       ...(exceptId ? { id: { not: exceptId } } : {}),
     },
     select: { id: true, name: true, status: true },
@@ -195,7 +203,7 @@ async function assertNoBlockingSession(exceptId) {
  * Aplica qty_counted al stock de productos dentro de una transacción.
  * @returns {Promise<string[]>} IDs de productos afectados
  */
-async function applyStockTransaction(tx, sessionId) {
+async function applyStockTransaction(tx, sessionId, branchId) {
   const lines = await tx.inventoryCountLine.findMany({
     where: { session_id: sessionId, qty_counted: { not: null } },
     include: { product: { select: { min_stock: true, kind: true, stock_assembled: true } } },
@@ -210,23 +218,43 @@ async function applyStockTransaction(tx, sessionId) {
     err.statusCode = 500
     throw err
   }
+
+  // El conteo fija el stock DE LA SUCURSAL; el espejo global se ajusta por el delta
+  const { ensureBranchStockRows } = require('../services/stockAvailability')
+  const productIds = lines.map((l) => l.product_id)
+  await ensureBranchStockRows(tx, productIds, branchId)
+  const branchRows = await tx.productStock.findMany({
+    where: { branch_id: branchId, product_id: { in: productIds } },
+    select: { product_id: true, stock: true },
+  })
+  const currentByProduct = new Map(branchRows.map((r) => [r.product_id, Number(r.stock)]))
+
   await Promise.all(
     lines.map((L) => {
-      if (L.product.kind === 'KIT' && !L.product.stock_assembled) {
-        return tx.product.update({
-          where: { id: L.product_id },
-          data: { stock: 0 },
-        })
-      }
-      const stock = L.qty_counted
+      const isVirtualKit = L.product.kind === 'KIT' && !L.product.stock_assembled
+      const target = isVirtualKit ? 0 : Number(L.qty_counted)
+      const current = currentByProduct.get(L.product_id) ?? 0
+      const delta = target - current
+
       const minStock = Number(L.product.min_stock) || 0
       let status_id = idDisponible
-      if (stock === 0 && idAgotado) status_id = idAgotado
-      else if (stock < minStock && idBajo) status_id = idBajo
-      return tx.product.update({
-        where: { id: L.product_id },
-        data: { stock, status_id },
-      })
+      if (target === 0 && idAgotado) status_id = idAgotado
+      else if (target < minStock && idBajo) status_id = idBajo
+
+      const ops = [
+        tx.productStock.update({
+          where: { product_id_branch_id: { product_id: L.product_id, branch_id: branchId } },
+          data: { stock: target },
+        }),
+        tx.product.update({
+          where: { id: L.product_id },
+          data: {
+            ...(delta !== 0 ? { stock: { increment: delta } } : {}),
+            ...(isVirtualKit ? {} : { status_id }),
+          },
+        }),
+      ]
+      return Promise.all(ops)
     })
   )
   return lines.map((l) => l.product_id)
@@ -247,7 +275,8 @@ exports.list = async (req, res, next) => {
     const status = req.query.status
     const take = Math.min(Number(req.query.limit) || 50, 100)
     const skip = Number(req.query.offset) || 0
-    const where = {}
+    const { branchWhere } = require('../middlewares/tenant')
+    const where = { ...branchWhere(req) }
     if (status && String(status).trim()) {
       where.status = String(status).toUpperCase()
     }
@@ -295,8 +324,8 @@ exports.list = async (req, res, next) => {
 exports.getById = async (req, res, next) => {
   try {
     const { id } = req.params
-    const session = await prisma.inventoryCountSession.findUnique({
-      where: { id },
+    const session = await prisma.inventoryCountSession.findFirst({
+      where: { id, branch: { company_id: req.companyId } },
       include: {
         ...sessionIncludeSummary,
       },
@@ -460,8 +489,10 @@ exports.create = async (req, res, next) => {
     ) {
       return res.status(400).json({ message: 'Clases ABC inválidas. Use A, B y/o C.' })
     }
+    const { requireBranch } = require('../middlewares/tenant')
     const session = await prisma.inventoryCountSession.create({
       data: {
+        branch_id: requireBranch(req),
         name: name ? String(name).slice(0, 200) : null,
         scope_json: scopeClean,
         notes: notes ? String(notes).slice(0, 2000) : null,
@@ -494,9 +525,9 @@ exports.start = async (req, res, next) => {
       return res.status(400).json({ message: 'La sesión ya tiene líneas generadas' })
     }
 
-    await assertNoBlockingSession(id)
+    await assertNoBlockingSession(id, session.branch_id)
 
-    const products = await resolveProductsForCountStart(session)
+    const products = await resolveProductsForCountStart(session, req.companyId)
     if (!products.length) {
       return res.status(400).json({
         message:
@@ -828,7 +859,7 @@ exports.approve = async (req, res, next) => {
       } else {
         await prismaTransaction.$transaction(
           async (tx) => {
-            affectedProductIds = await applyStockTransaction(tx, id)
+            affectedProductIds = await applyStockTransaction(tx, id, session.branch_id)
             await tx.inventoryCountSession.update({
               where: { id },
               data: {
@@ -850,7 +881,7 @@ exports.approve = async (req, res, next) => {
       }
       await prismaTransaction.$transaction(
         async (tx) => {
-          affectedProductIds = await applyStockTransaction(tx, id)
+          affectedProductIds = await applyStockTransaction(tx, id, session.branch_id)
           await tx.inventoryCountSession.update({
             where: { id },
             data: {
@@ -867,11 +898,13 @@ exports.approve = async (req, res, next) => {
 
     if (affectedProductIds.length) {
       try {
-        const refreshed = await prisma.product.findMany({
-          where: { id: { in: affectedProductIds } },
-          select: { id: true, stock: true, min_stock: true },
+        // Alertas con el stock/min de la sucursal de la sesión
+        const branchRows = await prisma.productStock.findMany({
+          where: { branch_id: session.branch_id, product_id: { in: affectedProductIds } },
+          select: { product_id: true, stock: true, min_stock: true },
         })
-        await ensureStockAlertsBatch(prisma, refreshed)
+        const refreshed = branchRows.map((r) => ({ id: r.product_id, stock: r.stock, min_stock: r.min_stock }))
+        await ensureStockAlertsBatch(prisma, refreshed, session.branch_id)
       } catch (alertErr) {
         console.error('[inventoryCounts.approve] alertas stock:', alertErr.message)
       }

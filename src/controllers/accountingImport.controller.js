@@ -99,7 +99,7 @@ exports.accountsTemplate = (req, res, next) => {
 }
 
 /** Valida cuentas y calcula orden de creación (padres antes que hijas). */
-async function validateAccounts(items) {
+async function validateAccounts(items, companyId) {
   const rows = items.map((it, i) => ({
     rowIndex: i,
     code: norm(it.code),
@@ -111,11 +111,11 @@ async function validateAccounts(items) {
 
   const codesInFile = new Map() // code → primera fila que lo usa
   const existing = await prisma.account.findMany({
-    where: { code: { in: rows.map((r) => r.code).filter(Boolean) } },
+    where: { code: { in: rows.map((r) => r.code).filter(Boolean) }, company_id: companyId },
     select: { id: true, code: true },
   })
   const existingByCode = new Map(existing.map((a) => [a.code, a]))
-  const allDbCodes = new Set((await prisma.account.findMany({ select: { code: true } })).map((a) => a.code))
+  const allDbCodes = new Set((await prisma.account.findMany({ where: { company_id: companyId }, select: { code: true } })).map((a) => a.code))
 
   const invalidRows = []
   for (const r of rows) {
@@ -170,7 +170,7 @@ exports.validateAccountsImport = async (req, res, next) => {
   try {
     const items = checkItems(req, res)
     if (!items) return
-    const v = await validateAccounts(items)
+    const v = await validateAccounts(items, req.companyId)
     res.json({
       ok: true,
       totals: { total: items.length, valid: items.length - v.invalidRows.length, invalid: v.invalidRows.length },
@@ -185,7 +185,7 @@ exports.bulkImportAccounts = async (req, res, next) => {
   try {
     const items = checkItems(req, res)
     if (!items) return
-    const v = await validateAccounts(items)
+    const v = await validateAccounts(items, req.companyId)
     if (v.invalidRows.length > 0) {
       return res.status(400).json({
         message: `${v.invalidRows.length} filas tienen errores`,
@@ -196,11 +196,12 @@ exports.bulkImportAccounts = async (req, res, next) => {
 
     await prisma.$transaction(async (tx) => {
       const idByCode = new Map(
-        (await tx.account.findMany({ select: { id: true, code: true } })).map((a) => [a.code, a.id]),
+        (await tx.account.findMany({ where: { company_id: req.companyId }, select: { id: true, code: true } })).map((a) => [a.code, a.id]),
       )
       for (const r of v.ordered) {
         const created = await tx.account.create({
           data: {
+            company_id: req.companyId,
             code: r.code,
             name: r.name,
             type: r.type,
@@ -243,7 +244,7 @@ exports.journalTemplate = (req, res, next) => {
 }
 
 /** Valida filas de asientos: cuentas, montos y cuadre por referencia. */
-async function validateJournal(items) {
+async function validateJournal(items, companyId) {
   const rows = items.map((it, i) => ({
     rowIndex: i,
     reference: norm(it.reference),
@@ -256,7 +257,7 @@ async function validateJournal(items) {
   }))
 
   const accounts = await prisma.account.findMany({
-    where: { code: { in: [...new Set(rows.map((r) => r.accountCode).filter(Boolean))] } },
+    where: { code: { in: [...new Set(rows.map((r) => r.accountCode).filter(Boolean))] }, company_id: companyId },
   })
   const accByCode = new Map(accounts.map((a) => [a.code, a]))
 
@@ -319,7 +320,7 @@ exports.validateJournalImport = async (req, res, next) => {
   try {
     const items = checkItems(req, res)
     if (!items) return
-    const v = await validateJournal(items)
+    const v = await validateJournal(items, req.companyId)
     res.json({
       ok: true,
       totals: { total: items.length, valid: items.length - v.invalidRows.length, invalid: v.invalidRows.length },
@@ -334,7 +335,7 @@ exports.bulkImportJournal = async (req, res, next) => {
   try {
     const items = checkItems(req, res)
     if (!items) return
-    const v = await validateJournal(items)
+    const v = await validateJournal(items, req.companyId)
     if (v.invalidRows.length > 0) {
       return res.status(400).json({
         message: `${v.invalidRows.length} filas tienen errores`,
@@ -348,6 +349,7 @@ exports.bulkImportJournal = async (req, res, next) => {
     await prisma.$transaction(async (tx) => {
       for (const [ref, group] of v.groups) {
         const entry = await createEntry(tx, {
+          company_id: req.companyId,
           date: group[0].date,
           description: group.find((r) => r.description)?.description || `Asiento importado ${ref}`,
           source_type: 'MANUAL',

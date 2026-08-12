@@ -25,6 +25,7 @@ const {
 exports.getAll = async (req, res, next) => {
   try {
     const rows = await prisma.systemSetting.findMany({
+      where: { company_id: req.companyId },
       orderBy: { key: 'asc' }
     })
     const settings = {}
@@ -53,7 +54,7 @@ exports.getPublic = async (req, res, next) => {
   try {
     const keys = ['timezone', 'currency_code', 'currency_name', 'company_name', 'company_logo_url', 'date_format', 'locale', 'cash_closure_max_diff_pct', 'vat_affiliation', 'iva_rate']
     const rows = await prisma.systemSetting.findMany({
-      where: { key: { in: keys } }
+      where: { key: { in: keys }, company_id: req.companyId }
     })
     const out = {
       timezone: 'America/Guatemala',
@@ -83,7 +84,7 @@ exports.getPublic = async (req, res, next) => {
 exports.getCompanyName = async (req, res, next) => {
   try {
     const rows = await prisma.systemSetting.findMany({
-      where: { key: { in: ['company_name', 'company_logo_url'] } },
+      where: { key: { in: ['company_name', 'company_logo_url'] }, ...(req.companyId ? { company_id: req.companyId } : {}) },
     })
     const map = Object.fromEntries(rows.map((r) => [r.key, r.value]))
     const company_name = (map.company_name && String(map.company_name).trim()) || 'Deposito'
@@ -100,7 +101,7 @@ exports.getCompanyName = async (req, res, next) => {
  */
 exports.getCompanyLogo = async (req, res, next) => {
   try {
-    const row = await prisma.systemSetting.findUnique({ where: { key: 'company_logo_url' } })
+    const row = await prisma.systemSetting.findFirst({ where: { key: 'company_logo_url', ...(req.companyId ? { company_id: req.companyId } : {}) } })
     const logoUrl = row?.value?.trim()
     if (!logoUrl) return res.status(404).end()
 
@@ -142,7 +143,7 @@ exports.uploadLogo = async (req, res, next) => {
       }
     }
 
-    const prev = await prisma.systemSetting.findUnique({ where: { key: 'company_logo_url' } })
+    const prev = await prisma.systemSetting.findFirst({ where: { key: 'company_logo_url', company_id: req.companyId } })
     const prevUrl = prev?.value?.trim()
 
     const imageUrl = await uploadImageBuffer({
@@ -152,9 +153,10 @@ exports.uploadLogo = async (req, res, next) => {
     })
 
     await prisma.systemSetting.upsert({
-      where: { key: 'company_logo_url' },
+      where: { company_id_key: { company_id: req.companyId, key: 'company_logo_url' } },
       update: { value: imageUrl, type: 'string' },
       create: {
+        company_id: req.companyId,
         key: 'company_logo_url',
         value: imageUrl,
         type: 'string',
@@ -180,13 +182,14 @@ exports.uploadLogo = async (req, res, next) => {
  */
 exports.removeLogo = async (req, res, next) => {
   try {
-    const prev = await prisma.systemSetting.findUnique({ where: { key: 'company_logo_url' } })
+    const prev = await prisma.systemSetting.findFirst({ where: { key: 'company_logo_url', company_id: req.companyId } })
     const prevUrl = prev?.value?.trim()
 
     await prisma.systemSetting.upsert({
-      where: { key: 'company_logo_url' },
+      where: { company_id_key: { company_id: req.companyId, key: 'company_logo_url' } },
       update: { value: '', type: 'string' },
       create: {
+        company_id: req.companyId,
         key: 'company_logo_url',
         value: '',
         type: 'string',
@@ -211,8 +214,8 @@ exports.removeLogo = async (req, res, next) => {
  */
 exports.getDenominations = async (req, res, next) => {
   try {
-    const row = await prisma.systemSetting.findUnique({
-      where: { key: 'cash_closure_denominations' }
+    const row = await prisma.systemSetting.findFirst({
+      where: { key: 'cash_closure_denominations', company_id: req.companyId }
     })
     if (!row) {
       return res.json([])
@@ -325,15 +328,15 @@ exports.update = async (req, res, next) => {
       const valueStr = typeof value === 'object' ? JSON.stringify(value) : String(value)
       const type = key === 'cash_closure_denominations' ? 'json' : 'string'
       await prisma.systemSetting.upsert({
-        where: { key },
+        where: { company_id_key: { company_id: req.companyId, key } },
         update: { value: valueStr, type },
-        create: { key, value: valueStr, type }
+        create: { company_id: req.companyId, key, value: valueStr, type }
       })
     }
 
     invalidateSystemConfigCache()
 
-    const rows = await prisma.systemSetting.findMany({ orderBy: { key: 'asc' } })
+    const rows = await prisma.systemSetting.findMany({ where: { company_id: req.companyId }, orderBy: { key: 'asc' } })
     const settings = {}
     for (const row of rows) {
       if (row.type === 'json') {

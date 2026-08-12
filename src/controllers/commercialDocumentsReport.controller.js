@@ -4,11 +4,13 @@
 
 const { prisma } = require('../models/prisma')
 const { getAvailabilityBatch } = require('../services/stockAvailability')
+const { requireBranch, branchWhere } = require('../middlewares/tenant')
 
 exports.committedStockReport = async (req, res, next) => {
   try {
+    const branchId = requireBranch(req)
     const activeReservations = await prisma.stockReservation.findMany({
-      where: { status: 'ACTIVE' },
+      where: { status: 'ACTIVE', branch_id: branchId },
       include: {
         product: { select: { id: true, name: true, barcode: true, stock: true } },
         document: {
@@ -53,7 +55,7 @@ exports.committedStockReport = async (req, res, next) => {
     }
 
     const productIds = [...byProduct.keys()]
-    const availability = await getAvailabilityBatch(productIds)
+    const availability = await getAvailabilityBatch(productIds, null, { branchId })
 
     const products = [...byProduct.values()].map((p) => ({
       ...p,
@@ -65,6 +67,7 @@ exports.committedStockReport = async (req, res, next) => {
       where: {
         doc_type: 'ORDER',
         status: { in: ['DRAFT', 'CONFIRMED'] },
+        ...branchWhere(req),
       },
       select: {
         id: true,

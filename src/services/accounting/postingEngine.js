@@ -18,9 +18,9 @@ const { splitIva, round2 } = require('./logic')
 const { createEntry, getDefaultAccounts, getTaxConfig, AccountingError } = require('./core')
 
 /** ids ya contabilizados para un source_type. */
-async function postedIds(prisma, sourceType) {
+async function postedIds(prisma, sourceType, companyId) {
   const rows = await prisma.journalEntry.findMany({
-    where: { source_type: sourceType, source_id: { not: null } },
+    where: { source_type: sourceType, source_id: { not: null }, company_id: companyId },
     select: { source_id: true },
   })
   return new Set(rows.map((r) => r.source_id))
@@ -49,11 +49,12 @@ async function tryPost(prisma, build) {
   }
 }
 
-async function postPendingOperations(prisma, userId) {
-  const defaults = await getDefaultAccounts(prisma)
+async function postPendingOperations(prisma, userId, companyId) {
+  if (!companyId) throw new AccountingError('companyId es obligatorio para contabilizar')
+  const defaults = await getDefaultAccounts(prisma, companyId)
   // GENERAL: desglosa IVA débito/crédito. PEQUENO: registra por totales (sin
   // crédito fiscal) y acumula la tarifa fija sobre ventas (gasto vs. pasivo).
-  const { regime, ivaRate, pequenoRate } = await getTaxConfig(prisma)
+  const { regime, ivaRate, pequenoRate } = await getTaxConfig(prisma, companyId)
   const splitVat = regime === 'GENERAL'
   // Los costos (product.cost, unit_cost) se capturan a precio de factura (con IVA);
   // en régimen general el costo contable es la base para cuadrar con el inventario.
@@ -67,9 +68,9 @@ async function postPendingOperations(prisma, userId) {
   }
 
   // ---- Ventas completadas ----
-  const doneSales = await postedIds(prisma, 'SALE')
+  const doneSales = await postedIds(prisma, 'SALE', companyId)
   const sales = await prisma.sale.findMany({
-    where: { status: { name: 'Completada' } },
+    where: { status: { name: 'Completada' }, branch: { company_id: companyId } },
     select: {
       id: true, reference: true, date: true, total: true, customer: true,
       customerContact: { select: { name: true } },
@@ -111,6 +112,7 @@ async function postPendingOperations(prisma, userId) {
       lines.push({ account_id: defaults.inventory.id, debit: 0, credit: cost })
     }
     const reason = await tryPost(prisma, () => ({
+      company_id: companyId,
       date: sale.date,
       description: label,
       source_type: 'SALE',
@@ -122,9 +124,9 @@ async function postPendingOperations(prisma, userId) {
   }
 
   // ---- Devoluciones aprobadas/completadas ----
-  const doneReturns = await postedIds(prisma, 'RETURN')
+  const doneReturns = await postedIds(prisma, 'RETURN', companyId)
   const returns = await prisma.return.findMany({
-    where: { status: { name: { in: ['Aprobada', 'Completada'] } } },
+    where: { status: { name: { in: ['Aprobada', 'Completada'] } }, sale: { branch: { company_id: companyId } } },
     select: {
       id: true, return_date: true, total_refund: true,
       sale: {
@@ -173,6 +175,7 @@ async function postPendingOperations(prisma, userId) {
       lines.push({ account_id: defaults.cogs.id, debit: 0, credit: cost })
     }
     const reason = await tryPost(prisma, () => ({
+      company_id: companyId,
       date: ret.return_date,
       description: label,
       source_type: 'RETURN',
@@ -184,8 +187,9 @@ async function postPendingOperations(prisma, userId) {
   }
 
   // ---- Compras (ingresos de mercancía) ----
-  const donePurchases = await postedIds(prisma, 'PURCHASE')
+  const donePurchases = await postedIds(prisma, 'PURCHASE', companyId)
   const purchases = await prisma.incomingMerchandise.findMany({
+    where: { branch: { company_id: companyId } },
     select: {
       id: true, date: true, payment_status: true, paid_at: true,
       supplier: { select: { name: true } },
@@ -201,6 +205,7 @@ async function postPendingOperations(prisma, userId) {
     if (total <= 0) { track(label, 'total 0'); continue }
     const { base, iva } = splitIva(total, ivaRate)
     const reason = await tryPost(prisma, () => ({
+      company_id: companyId,
       date: purchase.date,
       description: `Compra a ${purchase.supplier?.name || 'proveedor'}`,
       source_type: 'PURCHASE',
@@ -221,8 +226,9 @@ async function postPendingOperations(prisma, userId) {
   }
 
   // ---- Abonos a proveedores ----
-  const donePayments = await postedIds(prisma, 'PURCHASE_PAYMENT')
+  const donePayments = await postedIds(prisma, 'PURCHASE_PAYMENT', companyId)
   const payments = await prisma.incomingMerchandisePaymentEntry.findMany({
+    where: { incomingMerchandise: { branch: { company_id: companyId } } },
     select: {
       id: true, amount: true, paid_at: true,
       incomingMerchandise: { select: { supplier: { select: { name: true } } } },
@@ -235,6 +241,7 @@ async function postPendingOperations(prisma, userId) {
     const amount = round2(pay.amount)
     if (amount <= 0) { track(label, 'monto 0'); continue }
     const reason = await tryPost(prisma, () => ({
+      company_id: companyId,
       date: pay.paid_at,
       description: `Abono a ${pay.incomingMerchandise?.supplier?.name || 'proveedor'}`,
       source_type: 'PURCHASE_PAYMENT',
@@ -257,6 +264,7 @@ async function postPendingOperations(prisma, userId) {
     if (total <= 0) continue
     const label = `Pago compra a ${purchase.supplier?.name || 'proveedor'} (${purchase.id.slice(0, 8)})`
     const reason = await tryPost(prisma, () => ({
+      company_id: companyId,
       date: purchase.paid_at || purchase.date,
       description: `Pago compra a ${purchase.supplier?.name || 'proveedor'}`,
       source_type: 'PURCHASE_PAYMENT',

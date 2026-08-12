@@ -148,7 +148,7 @@ exports.list = async (req, res, next) => {
       })
     }
 
-    const where = { deleted: false, party_type: { in: lt.types } }
+    const where = { deleted: false, party_type: { in: lt.types }, company_id: req.companyId }
 
     if (search) {
       const q = String(search)
@@ -302,6 +302,7 @@ exports.create = async (req, res, next) => {
     }
 
     createData.estado = data.estado !== undefined && data.estado !== null ? Number(data.estado) : 1
+    createData.company_id = req.companyId
 
     const created = await prisma.supplier.create({
       data: createData,
@@ -315,8 +316,8 @@ exports.create = async (req, res, next) => {
 
 exports.getOne = async (req, res, next) => {
   try {
-    const item = await prisma.supplier.findUnique({
-      where: { id: req.params.id },
+    const item = await prisma.supplier.findFirst({
+      where: { id: req.params.id, company_id: req.companyId },
       include: {
         categories: {
           include: {
@@ -362,8 +363,8 @@ exports.getOne = async (req, res, next) => {
 
 exports.update = async (req, res, next) => {
   try {
-    const existing = await prisma.supplier.findUnique({
-      where: { id: req.params.id },
+    const existing = await prisma.supplier.findFirst({
+      where: { id: req.params.id, company_id: req.companyId },
       include: { productsList: { select: { id: true } } },
     })
     if (!existing || existing.deleted) {
@@ -485,7 +486,7 @@ exports.update = async (req, res, next) => {
 
 exports.remove = async (req, res, next) => {
   try {
-    const row = await prisma.supplier.findUnique({ where: { id: req.params.id } })
+    const row = await prisma.supplier.findFirst({ where: { id: req.params.id, company_id: req.companyId } })
     if (!row || row.deleted) return res.status(404).json({ message: 'No encontrado' })
     try {
       assertPartyAction(req.user, row.party_type, 'delete')
@@ -515,8 +516,8 @@ const SALE_CHANNELS = new Set(['POS', 'WHOLESALE', 'ONLINE'])
 
 exports.listCustomerPriceRules = async (req, res, next) => {
   try {
-    const row = await prisma.supplier.findUnique({
-      where: { id: req.params.id },
+    const row = await prisma.supplier.findFirst({
+      where: { id: req.params.id, company_id: req.companyId },
       select: { id: true, deleted: true, party_type: true },
     })
     if (!row || row.deleted) return res.status(404).json({ message: 'No encontrado' })
@@ -541,8 +542,8 @@ exports.listCustomerPriceRules = async (req, res, next) => {
 exports.replaceCustomerPriceRules = async (req, res, next) => {
   try {
     const { randomUUID } = require('crypto')
-    const row = await prisma.supplier.findUnique({
-      where: { id: req.params.id },
+    const row = await prisma.supplier.findFirst({
+      where: { id: req.params.id, company_id: req.companyId },
       select: { id: true, deleted: true, party_type: true },
     })
     if (!row || row.deleted) return res.status(404).json({ message: 'No encontrado' })

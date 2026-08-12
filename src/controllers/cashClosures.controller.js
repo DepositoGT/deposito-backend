@@ -263,6 +263,8 @@ exports.calculateTheoretical = async (req, res, next) => {
     }
 
     // Obtener ventas completadas en el período (opcionalmente filtradas por cajero)
+    const { branchWhere } = require('../middlewares/tenant')
+    Object.assign(salesWhere, branchWhere(req))
     const sales = await prisma.sale.findMany({
       where: salesWhere,
       include: {
@@ -490,6 +492,7 @@ exports.create = async (req, res, next) => {
 
       const cashClosure = await tx.cashClosure.create({
         data: {
+          branch_id: require('../middlewares/tenant').requireBranch(req),
           date: dateUTC,
           opening_float: isOwnClosure && linkedSession ? linkedSession.opening_float : null,
           start_date: startDateUTC,
@@ -628,7 +631,7 @@ exports.list = async (req, res, next) => {
   try {
     const { page = 1, pageSize = 20, status, startDate, endDate } = req.query
 
-    const where = {}
+    const where = { ...require('../middlewares/tenant').branchWhere(req) }
     
     if (status) {
       where.status = status
@@ -694,8 +697,8 @@ exports.getById = async (req, res, next) => {
   try {
     const { id } = req.params
 
-    const closure = await prisma.cashClosure.findUnique({
-      where: { id },
+    const closure = await prisma.cashClosure.findFirst({
+      where: { id, branch: { company_id: req.companyId } },
       include: {
         payment_breakdowns: {
           include: {
@@ -840,8 +843,8 @@ exports.updateStatus = async (req, res, next) => {
     }
 
     // Buscar el cierre
-    const closure = await prisma.cashClosure.findUnique({
-      where: { id }
+    const closure = await prisma.cashClosure.findFirst({
+      where: { id, branch: { company_id: req.companyId } }
     })
 
     if (!closure) {

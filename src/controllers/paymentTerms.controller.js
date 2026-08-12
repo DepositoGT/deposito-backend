@@ -35,6 +35,7 @@ exports.list = async (req, res, next) => {
     const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 20)))
     const { includeDeleted } = req.query
     const where = includeDeleted === 'true' ? {} : { deleted: false }
+    where.company_id = req.companyId
     
     const totalItems = await prisma.paymentTerm.count({ where })
     const totalPages = Math.max(1, Math.ceil(totalItems / pageSize))
@@ -105,7 +106,7 @@ exports.create = async (req, res, next) => {
       netDaysVal = Math.floor(n)
     }
     const created = await prisma.paymentTerm.create({
-      data: { name: name.trim(), net_days: netDaysVal },
+      data: { name: name.trim(), net_days: netDaysVal, company_id: req.companyId },
     })
     res.status(201).json(created)
   } catch (e) {

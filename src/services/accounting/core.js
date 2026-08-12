@@ -48,24 +48,24 @@ function periodKeyForDate(date) {
   return { year: dt.year, month: dt.month }
 }
 
-/** Auto-crea el período OPEN si no existe; lanza si está CLOSED. */
-async function assertPeriodOpen(tx, date) {
+/** Auto-crea el período OPEN si no existe; lanza si está CLOSED. Por empresa. */
+async function assertPeriodOpen(tx, date, companyId) {
   const { year, month } = periodKeyForDate(date)
   const period = await tx.accountingPeriod.upsert({
-    where: { year_month: { year, month } },
+    where: { company_id_year_month: { company_id: companyId, year, month } },
     update: {},
-    create: { year, month },
+    create: { company_id: companyId, year, month },
   })
   if (period.status === 'CLOSED') {
     throw new AccountingError(`El período ${String(month).padStart(2, '0')}/${year} está cerrado`)
   }
 }
 
-/** Número secuencial A-000001 (lock transaccional para evitar duplicados). */
-async function nextEntryNumber(tx) {
-  await tx.$executeRaw`SELECT pg_advisory_xact_lock(${ENTRY_LOCK_KEY})`
+/** Número secuencial A-000001 por empresa (lock transaccional para evitar duplicados). */
+async function nextEntryNumber(tx, companyId) {
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(${ENTRY_LOCK_KEY}, hashtext(${companyId}))`
   const last = await tx.journalEntry.findFirst({
-    where: { entry_number: { startsWith: 'A-' } },
+    where: { company_id: companyId, entry_number: { startsWith: 'A-' } },
     orderBy: { entry_number: 'desc' },
     select: { entry_number: true },
   })
@@ -78,12 +78,13 @@ async function nextEntryNumber(tx) {
  * Crea un asiento validado dentro de una transacción.
  * lines: [{ account_id, debit, credit, description? }]
  */
-async function createEntry(tx, { date, description, source_type = 'MANUAL', source_id = null, created_by = null, reversal_of_id = null, lines }) {
+async function createEntry(tx, { company_id, date, description, source_type = 'MANUAL', source_id = null, created_by = null, reversal_of_id = null, lines }) {
+  if (!company_id) throw new AccountingError('company_id es obligatorio para crear asientos')
   const check = validateLines(lines)
   if (!check.ok) throw new AccountingError(check.error)
 
   const accountIds = [...new Set(lines.map((l) => Number(l.account_id)))]
-  const accounts = await tx.account.findMany({ where: { id: { in: accountIds } } })
+  const accounts = await tx.account.findMany({ where: { id: { in: accountIds }, company_id } })
   const byId = new Map(accounts.map((a) => [a.id, a]))
   for (const id of accountIds) {
     const acc = byId.get(id)
@@ -92,11 +93,12 @@ async function createEntry(tx, { date, description, source_type = 'MANUAL', sour
     if (acc.is_group) throw new AccountingError(`La cuenta ${acc.code} ${acc.name} es agrupadora y no recibe movimientos`)
   }
 
-  await assertPeriodOpen(tx, date)
-  const entry_number = await nextEntryNumber(tx)
+  await assertPeriodOpen(tx, date, company_id)
+  const entry_number = await nextEntryNumber(tx, company_id)
 
   return tx.journalEntry.create({
     data: {
+      company_id,
       entry_number,
       date: toEntryDate(date),
       description: String(description || '').slice(0, 255),
@@ -123,9 +125,9 @@ async function createEntry(tx, { date, description, source_type = 'MANUAL', sour
  *   PEQUENO no acredita IVA y paga una tarifa fija sobre ingresos brutos.
  * - `iva_rate` / `pequeno_rate`: tasas en % (defaults legales GT: 12 y 5).
  */
-async function getTaxConfig(tx) {
+async function getTaxConfig(tx, companyId) {
   const rows = await tx.systemSetting.findMany({
-    where: { key: { in: ['vat_affiliation', 'iva_rate', 'pequeno_rate'] } },
+    where: { key: { in: ['vat_affiliation', 'iva_rate', 'pequeno_rate'] }, company_id: companyId },
   })
   const map = Object.fromEntries(rows.map((r) => [r.key, r.value]))
   const pct = (v, fallback) => {
@@ -140,13 +142,13 @@ async function getTaxConfig(tx) {
 }
 
 /** Mapeo de cuentas por defecto (SystemSetting JSON { key: code }) resuelto a cuentas. */
-async function getDefaultAccounts(tx) {
-  const setting = await tx.systemSetting.findUnique({ where: { key: SETTING_KEY } })
+async function getDefaultAccounts(tx, companyId) {
+  const setting = await tx.systemSetting.findFirst({ where: { key: SETTING_KEY, company_id: companyId } })
   if (!setting) throw new AccountingError('Falta configurar las cuentas por defecto de contabilidad')
   let map
   try { map = JSON.parse(setting.value) } catch { throw new AccountingError('Configuración de cuentas por defecto inválida') }
   const codes = DEFAULT_ACCOUNT_KEYS.map((k) => map[k]).filter(Boolean)
-  const accounts = await tx.account.findMany({ where: { code: { in: codes }, active: true, is_group: false } })
+  const accounts = await tx.account.findMany({ where: { code: { in: codes }, active: true, is_group: false, company_id: companyId } })
   const byCode = new Map(accounts.map((a) => [a.code, a]))
   const result = {}
   for (const key of DEFAULT_ACCOUNT_KEYS) {

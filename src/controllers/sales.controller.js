@@ -529,6 +529,7 @@ exports.create = async (req, res, next) => {
         const promotionCodeRows = await tx.promotionCode.findMany({
           where: {
             code: { in: requestedCodes },
+            company_id: req.companyId,
             active: true,
             promotion: {
               active: true,

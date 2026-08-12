@@ -37,7 +37,7 @@ async function sumsByAccount(where) {
 exports.ledger = async (req, res, next) => {
   try {
     const accountId = Number(req.params.accountId)
-    const account = await prisma.account.findUnique({ where: { id: accountId } })
+    const account = await prisma.account.findFirst({ where: { id: accountId, company_id: req.companyId } })
     if (!account) return res.status(404).json({ error: 'Cuenta no encontrada' })
     const from = parseDate(req.query.from)
     const to = parseDate(req.query.to, true)
@@ -45,7 +45,7 @@ exports.ledger = async (req, res, next) => {
     let initialBalance = 0
     if (from) {
       const prev = await prisma.journalLine.aggregate({
-        where: { account_id: accountId, entry: { date: { lt: from } } },
+        where: { account_id: accountId, entry: { date: { lt: from }, company_id: req.companyId } },
         _sum: { debit: true, credit: true },
       })
       initialBalance = accountBalance(account.type, prev._sum.debit || 0, prev._sum.credit || 0)
@@ -54,7 +54,10 @@ exports.ledger = async (req, res, next) => {
     const lines = await prisma.journalLine.findMany({
       where: {
         account_id: accountId,
-        ...(from || to ? { entry: { date: { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) } } } : {}),
+        entry: {
+          company_id: req.companyId,
+          ...(from || to ? { date: { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) } } : {}),
+        },
       },
       include: { entry: { select: { id: true, date: true, entry_number: true, description: true } } },
       orderBy: [{ entry: { date: 'asc' } }, { id: 'asc' }],
@@ -93,10 +96,13 @@ exports.trialBalance = async (req, res, next) => {
     const from = parseDate(req.query.from)
     const to = parseDate(req.query.to, true)
 
-    const accounts = await prisma.account.findMany({ where: { is_group: false }, orderBy: { code: 'asc' } })
-    const initial = from ? await sumsByAccount({ entry: { date: { lt: from } } }) : new Map()
+    const accounts = await prisma.account.findMany({ where: { is_group: false, company_id: req.companyId }, orderBy: { code: 'asc' } })
+    const initial = from ? await sumsByAccount({ entry: { date: { lt: from }, company_id: req.companyId } }) : new Map()
     const period = await sumsByAccount({
-      ...(from || to ? { entry: { date: { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) } } } : {}),
+      entry: {
+        company_id: req.companyId,
+        ...(from || to ? { date: { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) } } : {}),
+      },
     })
 
     const rows = []
@@ -124,10 +130,10 @@ exports.trialBalance = async (req, res, next) => {
 }
 
 /** Filas { code, name, type, amount } por tipo de cuenta, con saldo según naturaleza. */
-async function balancesByType(types, where) {
+async function balancesByType(types, where, companyId) {
   const sums = await sumsByAccount(where)
   const accounts = await prisma.account.findMany({
-    where: { is_group: false, type: { in: types } },
+    where: { is_group: false, type: { in: types }, company_id: companyId },
     orderBy: { code: 'asc' },
   })
   const rows = []
@@ -147,11 +153,12 @@ exports.incomeStatement = async (req, res, next) => {
     const to = parseDate(req.query.to, true)
     const where = {
       entry: {
+        company_id: req.companyId,
         ...(from || to ? { date: { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) } } : {}),
         source_type: { not: 'CLOSING' }, // el cierre no distorsiona el P&L del rango
       },
     }
-    const rows = await balancesByType(['INCOME', 'COST', 'EXPENSE'], where)
+    const rows = await balancesByType(['INCOME', 'COST', 'EXPENSE'], where, req.companyId)
     const income = rows.filter((r) => r.type === 'INCOME')
     const costs = rows.filter((r) => r.type === 'COST')
     const expenses = rows.filter((r) => r.type === 'EXPENSE')
@@ -170,9 +177,9 @@ exports.incomeStatement = async (req, res, next) => {
 exports.balanceSheet = async (req, res, next) => {
   try {
     const asOf = parseDate(req.query.asOf, true) || new Date()
-    const whereUpTo = { entry: { date: { lte: asOf } } }
+    const whereUpTo = { entry: { date: { lte: asOf }, company_id: req.companyId } }
 
-    const rows = await balancesByType(['ASSET', 'LIABILITY', 'EQUITY'], whereUpTo)
+    const rows = await balancesByType(['ASSET', 'LIABILITY', 'EQUITY'], whereUpTo, req.companyId)
     const assets = rows.filter((r) => r.type === 'ASSET')
     const liabilities = rows.filter((r) => r.type === 'LIABILITY')
     const equity = rows.filter((r) => r.type === 'EQUITY')
@@ -180,7 +187,7 @@ exports.balanceSheet = async (req, res, next) => {
     // Resultado no cerrado: INCOME − COST − EXPENSE acumulado hasta asOf.
     // Los asientos CLOSING ya saldan las cuentas de resultados de años cerrados,
     // así que este acumulado solo contiene el resultado pendiente de cierre.
-    const resultRows = await balancesByType(['INCOME', 'COST', 'EXPENSE'], whereUpTo)
+    const resultRows = await balancesByType(['INCOME', 'COST', 'EXPENSE'], whereUpTo, req.companyId)
     const currentResult = round2(resultRows.reduce(
       (s, r) => s + (r.type === 'INCOME' ? r.amount : -r.amount), 0,
     ))
@@ -207,14 +214,15 @@ exports.balanceSheet = async (req, res, next) => {
 exports.taxesReport = async (req, res, next) => {
   try {
     const year = Number(req.query.year) || DateTime.now().setZone(GT_ZONE).year
-    const defaults = await getDefaultAccounts(prisma)
-    const { regime, ivaRate, pequenoRate } = await getTaxConfig(prisma)
+    const defaults = await getDefaultAccounts(prisma, req.companyId)
+    const { regime, ivaRate, pequenoRate } = await getTaxConfig(prisma, req.companyId)
 
     const salesIds = new Set([defaults.sales.id, defaults.salesReturns.id])
     const lines = await prisma.journalLine.findMany({
       where: {
         account_id: { in: [defaults.ivaDebit.id, defaults.ivaCredit.id, defaults.pequenoTax.id, ...salesIds] },
         entry: {
+          company_id: req.companyId,
           date: {
             gte: new Date(`${year}-01-01T00:00:00-06:00`),
             lte: new Date(`${year}-12-31T23:59:59.999-06:00`),
