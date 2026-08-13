@@ -243,9 +243,13 @@ exports.list = async (req, res, next) => {
     const searchTerm = String(search || '').trim()
 
     const where = { doc_type: ORDER_DOC_TYPE, ...branchWhere(req) }
-    // Filtrar por una sucursal solo tiene sentido en la vista consolidada; parado
-    // en una sucursal, honrarlo ensancharía el alcance.
-    if (!req.branchId && req.query.branch_id) where.branch_id = String(req.query.branch_id)
+    // Filtrar por una sucursal solo tiene sentido en la vista consolidada, y solo
+    // dentro de las que esa vista ya alcanza: un id suelto ensancharía el alcance
+    // a otra empresa.
+    const wantedBranch = req.query.branch_id ? String(req.query.branch_id) : null
+    if (!req.branchId && wantedBranch && (req.branchIds || []).includes(wantedBranch)) {
+      where.branch_id = wantedBranch
+    }
     let searchMeta = null
     if (status && String(status).toUpperCase() !== 'ALL' && !searchTerm) {
       where.status = String(status).toUpperCase()
@@ -464,7 +468,9 @@ exports.update = async (req, res, next) => {
 // PUT /api/orders/:id/branch — reasigna un pedido en borrador a otra sucursal
 exports.changeBranch = async (req, res, next) => {
   try {
-    const where = { ...orderWhereIdOrReference(req.params.id), branch: { company_id: req.companyId } }
+    // Solo se mueve un pedido de la sucursal en la que se está parado: con el
+    // alcance de empresa cualquiera podría jalarse los pedidos de otra sucursal.
+    const where = { ...orderWhereIdOrReference(req.params.id), ...branchWhere(req) }
     const order = await prisma.commercialDocument.findFirst({ where })
     if (!order) return res.status(404).json({ message: 'Pedido no encontrado' })
     if (order.status !== 'DRAFT') {

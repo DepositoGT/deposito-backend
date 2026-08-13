@@ -289,12 +289,13 @@ async function syncLotExpiryAlerts(tx, opts = {}) {
         type_id: alertType.id,
       }
 
-      const existingId = existingByProduct.get(productId)
+      const existingId = existingByKey.get(key)
       if (existingId) {
         updates.push(client.alert.update({ where: { id: existingId }, data: alertData }))
       } else {
         createData.push({
           product_id: productId,
+          branch_id: branchId,
           ...alertData,
           status_id: statusActive.id,
           assigned_to: null,

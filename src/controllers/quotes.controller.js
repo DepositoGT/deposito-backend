@@ -331,9 +331,13 @@ exports.list = async (req, res, next) => {
     const searchTerm = String(search || '').trim()
 
     const where = { doc_type: QUOTE_DOC_TYPE, ...branchWhere(req) }
-    // Filtrar por una sucursal solo tiene sentido en la vista consolidada; parado
-    // en una sucursal, honrarlo ensancharía el alcance.
-    if (!req.branchId && req.query.branch_id) where.branch_id = String(req.query.branch_id)
+    // Filtrar por una sucursal solo tiene sentido en la vista consolidada, y solo
+    // dentro de las que esa vista ya alcanza: un id suelto ensancharía el alcance
+    // a otra empresa.
+    const wantedBranch = req.query.branch_id ? String(req.query.branch_id) : null
+    if (!req.branchId && wantedBranch && (req.branchIds || []).includes(wantedBranch)) {
+      where.branch_id = wantedBranch
+    }
     let searchMeta = null
     if (status && String(status).toUpperCase() !== 'ALL' && !searchTerm) {
       where.status = String(status).toUpperCase()
