@@ -567,6 +567,38 @@ async function main() {
   assert(enCentro && enCentro.stock === 3, 'Centro conserva su stock')
   assert(sigueVivo.deleted === false, 'el producto sigue existiendo en la empresa')
 
+  // 14. Cambio de empresa: el header de empresa manda aunque la sucursal guardada
+  // sea de la anterior (si no, /configuracion mostraba los datos de la otra).
+  console.log('\n--- 14. Header de empresa sin sucursal ---')
+  const { resolveTenant } = require('../src/middlewares/tenant')
+  const jwt = require('jwt-simple')
+  const moment = require('moment')
+  const { secret } = require('../src/config/security')
+  const token = jwt.encode(
+    { sub: user.id, role: { name: role.name }, permissions: [], exp: moment().add(1, 'h').unix() },
+    secret
+  )
+  const resolver = (headers) => new Promise((resolve) => {
+    const req = { path: '/settings', method: 'GET', cookies: {}, headers: { authorization: `Bearer ${token}`, ...headers } }
+    const res = {
+      status(code) { this._s = code; return this },
+      json(body) { resolve({ status: this._s || 200, body }) },
+      send(body) { resolve({ status: this._s || 200, body }) },
+    }
+    resolveTenant(req, res, () => resolve({ req }))
+  })
+
+  const soloEmpresa = await resolver({ 'x-company-id': globex.id })
+  assert(soloEmpresa.req && soloEmpresa.req.companyId === globex.id,
+    'con solo el header de empresa se usa la sucursal del usuario en esa empresa')
+  assert(soloEmpresa.req.branchId === globexUno.id, 'y esa sucursal es la suya, no la heredada')
+
+  const sucursalAjena = await resolver({ 'x-company-id': globex.id, 'x-branch-id': acmeCentro.id })
+  assert(sucursalAjena.status === 400, 'una sucursal explícita de otra empresa sigue siendo error')
+
+  const sinHeaders = await resolver({})
+  assert(sinHeaders.req.branchId === acmeCentro.id, 'sin headers se usa la sucursal por defecto')
+
   console.log('\nTODAS LAS PRUEBAS PASARON')
 }
 

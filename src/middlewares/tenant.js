@@ -128,7 +128,14 @@ async function resolveTenant(req, res, next) {
       return fail(400, 'Selecciona una sucursal (header X-Branch-Id)')
     }
     if (headerCompany && headerCompany !== branch.company_id) {
-      return fail(400, 'La sucursal no pertenece a esa empresa')
+      // Con sucursal explícita el desajuste es un error del cliente. Sin ella la
+      // heredada es de otra empresa (acaba de cambiarse): se usa la suya en la
+      // empresa pedida, si no /configuracion mostraría los datos de la anterior.
+      if (headerBranch) return fail(400, 'La sucursal no pertenece a esa empresa')
+      const enEmpresa = branches.filter((b) => b.company_id === headerCompany)
+      const alterna = enEmpresa.find((b) => b.is_default) || enEmpresa[0]
+      if (!alterna) return fail(403, 'Sin acceso a esa empresa')
+      branch = alterna
     }
 
     req.companyId = branch.company_id
