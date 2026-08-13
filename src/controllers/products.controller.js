@@ -628,6 +628,33 @@ exports.remove = async (req, res, next) => {
   } catch (e) { next(e) }
 }
 
+/**
+ * DELETE /api/products/:id/branch-stock — deja de manejar el producto en la
+ * sucursal activa. El producto es de la empresa, así que esto solo borra su
+ * fila de product_stocks; en las demás sucursales sigue igual.
+ */
+exports.removeFromBranch = async (req, res, next) => {
+  try {
+    const branchId = requireBranch(req)
+    const owned = await prisma.product.findFirst({
+      where: { id: req.params.id, company_id: req.companyId },
+      select: { id: true },
+    })
+    if (!owned) return res.status(404).json({ message: 'Producto no encontrado' })
+
+    const key = { product_id_branch_id: { product_id: owned.id, branch_id: branchId } }
+    const row = await prisma.productStock.findUnique({ where: key })
+    if (!row) return res.status(404).json({ message: 'El producto no se maneja en esta sucursal' })
+    // Borrar con existencias perdería el inventario: primero trasladarlo o ajustarlo.
+    if (Number(row.stock) !== 0) {
+      return res.status(400).json({ message: 'Deja el stock en 0 en esta sucursal antes de quitarlo (traslada o ajusta)' })
+    }
+
+    await prisma.productStock.delete({ where: key })
+    res.json({ ok: true })
+  } catch (e) { next(e) }
+}
+
 exports.reportPdf = async (req, res, next) => {
   try {
     const branding = await getBrandingForPdf(prisma, req.companyId)

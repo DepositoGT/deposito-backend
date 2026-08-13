@@ -537,6 +537,36 @@ async function main() {
   })
   assert(bloqueado.status === 400, 'un pedido confirmado ya no se puede mover (tiene reservas)')
 
+  // 13. Quitar un producto de una sucursal no lo quita de las demás.
+  console.log('\n--- 13. Producto fuera de una sola sucursal ---')
+  const products = require('../src/controllers/products.controller')
+  const soloCentro = await mk('Solo Centro', acme, catA, supA, 'ONLY-CENTRO')
+  await prisma.productStock.createMany({
+    data: [
+      { product_id: soloCentro.id, branch_id: acmeCentro.id, stock: 3 },
+      { product_id: soloCentro.id, branch_id: acmeNorte.id, stock: 0 },
+    ],
+  })
+
+  const conStock = await callController(products.removeFromBranch, {
+    params: { id: soloCentro.id }, companyId: acme.id, branchId: acmeCentro.id,
+  })
+  assert(conStock.status === 400, 'con existencias no se puede quitar de la sucursal')
+
+  const quitado = await callController(products.removeFromBranch, {
+    params: { id: soloCentro.id }, companyId: acme.id, branchId: acmeNorte.id,
+  })
+  assert(quitado.body.ok === true, 'con stock en 0 sí se quita de la sucursal')
+
+  const [enCentro, enNorte, sigueVivo] = await Promise.all([
+    prisma.productStock.findUnique({ where: { product_id_branch_id: { product_id: soloCentro.id, branch_id: acmeCentro.id } } }),
+    prisma.productStock.findUnique({ where: { product_id_branch_id: { product_id: soloCentro.id, branch_id: acmeNorte.id } } }),
+    prisma.product.findUnique({ where: { id: soloCentro.id }, select: { deleted: true } }),
+  ])
+  assert(enNorte === null, 'la fila de Norte se borró')
+  assert(enCentro && enCentro.stock === 3, 'Centro conserva su stock')
+  assert(sigueVivo.deleted === false, 'el producto sigue existiendo en la empresa')
+
   console.log('\nTODAS LAS PRUEBAS PASARON')
 }
 

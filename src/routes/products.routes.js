@@ -356,6 +356,24 @@ router.delete('/:id', Auth, hasPermission('products.delete'), Products.remove)
 
 /**
  * @openapi
+ * /products/{id}/branch-stock:
+ *   delete:
+ *     tags: [Products]
+ *     summary: Quitar el producto de la sucursal activa (sigue existiendo en las demás)
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         schema: { type: string }
+ *         required: true
+ *     responses:
+ *       200: { description: OK }
+ */
+router.delete('/:id/branch-stock', Auth, hasPermission('products.delete'), Products.removeFromBranch)
+
+/**
+ * @openapi
  * /products/register-incoming:
  *   post:
  *     tags: [Products]
