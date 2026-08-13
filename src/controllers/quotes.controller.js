@@ -15,7 +15,7 @@ const {
   VALID_CHANNELS,
 } = require('../services/priceResolution')
 const { nextDocumentReference } = require('../services/referenceGenerator')
-const { requireBranch, branchWhere } = require('../middlewares/tenant')
+const { targetBranch, branchWhere } = require('../middlewares/tenant')
 
 async function loadBranch(tx, branchId) {
   return tx.branch.findUnique({ where: { id: branchId }, select: { id: true, code: true, seq: true } })
@@ -33,13 +33,17 @@ const {
 const QUOTE_DOC_TYPE = 'QUOTE'
 const ORDER_DOC_TYPE = 'ORDER'
 
+const BRANCH_SELECT = { select: { id: true, name: true, code: true } }
+
 const QUOTE_LIST_INCLUDE = {
+  branch: BRANCH_SELECT,
   customerContact: { select: { id: true, name: true, tax_id: true } },
   createdBy: { select: { id: true, name: true } },
   _count: { select: { lines: true } },
 }
 
 const QUOTE_DETAIL_INCLUDE = {
+  branch: BRANCH_SELECT,
   customerContact: {
     select: { id: true, name: true, tax_id: true, email: true, phone: true },
   },
@@ -327,6 +331,9 @@ exports.list = async (req, res, next) => {
     const searchTerm = String(search || '').trim()
 
     const where = { doc_type: QUOTE_DOC_TYPE, ...branchWhere(req) }
+    // Filtrar por una sucursal solo tiene sentido en la vista consolidada; parado
+    // en una sucursal, honrarlo ensancharía el alcance.
+    if (!req.branchId && req.query.branch_id) where.branch_id = String(req.query.branch_id)
     let searchMeta = null
     if (status && String(status).toUpperCase() !== 'ALL' && !searchTerm) {
       where.status = String(status).toUpperCase()
@@ -413,7 +420,7 @@ exports.create = async (req, res, next) => {
       customerContactId = String(customerContactIdRaw).trim()
     }
 
-    const branchId = requireBranch(req)
+    const branchId = targetBranch(req, req.body?.branch_id)
 
     const created = await prismaTransaction.$transaction(async (tx) => {
       await validateCustomerContact(tx, customerContactId)

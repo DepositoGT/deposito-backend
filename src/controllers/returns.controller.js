@@ -113,7 +113,8 @@ exports.list = async (req, res, next) => {
         sale: {
           include: {
             status: true,
-            payment_method: true
+            payment_method: true,
+            branch: { select: { id: true, name: true, code: true } }
           }
         },
         status: true,
@@ -178,6 +179,7 @@ exports.getById = async (req, res, next) => {
           include: {
             status: true,
             payment_method: true,
+            branch: { select: { id: true, name: true, code: true } },
             sale_items: {
               include: {
                 product: true
@@ -452,7 +454,8 @@ exports.create = async (req, res, next) => {
         sale: {
           include: {
             status: true,
-            payment_method: true
+            payment_method: true,
+            branch: { select: { id: true, name: true, code: true } }
           }
         },
         status: true,

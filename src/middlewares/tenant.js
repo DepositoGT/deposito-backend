@@ -133,6 +133,9 @@ async function resolveTenant(req, res, next) {
 
     req.companyId = branch.company_id
     req.branchId = branch.id
+    // Sucursales del usuario en esta empresa: para escrituras dirigidas a otra
+    // sucursal (crear un pedido "de Zona 11" estando parado en Zona 10).
+    req.userBranchIds = branches.filter((b) => b.company_id === branch.company_id).map((b) => b.id)
     next()
   } catch (e) {
     next(e)
@@ -162,9 +165,21 @@ function requireCompany(req) {
   return req.companyId
 }
 
+/** Sucursal explícita del body (debe ser del usuario) o la activa. */
+function targetBranch(req, raw) {
+  if (raw == null || String(raw).trim() === '') return requireBranch(req)
+  const id = String(raw).trim()
+  if (!(req.userBranchIds || []).includes(id)) {
+    const err = new Error('Sin acceso a esa sucursal')
+    err.status = 403
+    throw err
+  }
+  return id
+}
+
 /** Where de sucursal: una concreta o todas las de la empresa (consolidada). */
 function branchWhere(req) {
   return req.branchId ? { branch_id: req.branchId } : { branch_id: { in: req.branchIds || [] } }
 }
 
-module.exports = { resolveTenant, requireBranch, requireCompany, branchWhere, hasPerm }
+module.exports = { resolveTenant, requireBranch, requireCompany, targetBranch, branchWhere, hasPerm }

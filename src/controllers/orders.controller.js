@@ -12,7 +12,7 @@ const { ensureStockAlertsBatch } = require('../services/stockAlerts')
 const { expandLinesToStockMap, deductStockMap } = require('../services/bomStock')
 const { resolvePriceTierForContext, resolveUnitPriceFromProduct, VALID_CHANNELS } = require('../services/priceResolution')
 const { nextDocumentReference } = require('../services/referenceGenerator')
-const { requireBranch, branchWhere } = require('../middlewares/tenant')
+const { targetBranch, branchWhere } = require('../middlewares/tenant')
 
 async function loadBranch(tx, branchId) {
   return tx.branch.findUnique({ where: { id: branchId }, select: { id: true, code: true, seq: true } })
@@ -37,7 +37,10 @@ const ORDER_DOC_TYPE = 'ORDER'
 /** Transacciones con reservas/stock (Supabase puede superar 5s con round-trips). */
 const ORDER_TX_OPTIONS = { maxWait: 15_000, timeout: 30_000 }
 
+const BRANCH_SELECT = { select: { id: true, name: true, code: true } }
+
 const ORDER_LIST_INCLUDE = {
+  branch: BRANCH_SELECT,
   customerContact: { select: { id: true, name: true, tax_id: true } },
   createdBy: { select: { id: true, name: true } },
   convertedFrom: { select: { id: true, reference: true, doc_type: true } },
@@ -53,6 +56,7 @@ const ORDER_LIST_INCLUDE = {
 }
 
 const ORDER_DETAIL_INCLUDE = {
+  branch: BRANCH_SELECT,
   customerContact: {
     select: { id: true, name: true, tax_id: true, email: true, phone: true },
   },
@@ -239,6 +243,9 @@ exports.list = async (req, res, next) => {
     const searchTerm = String(search || '').trim()
 
     const where = { doc_type: ORDER_DOC_TYPE, ...branchWhere(req) }
+    // Filtrar por una sucursal solo tiene sentido en la vista consolidada; parado
+    // en una sucursal, honrarlo ensancharía el alcance.
+    if (!req.branchId && req.query.branch_id) where.branch_id = String(req.query.branch_id)
     let searchMeta = null
     if (status && String(status).toUpperCase() !== 'ALL' && !searchTerm) {
       where.status = String(status).toUpperCase()
@@ -326,7 +333,7 @@ exports.create = async (req, res, next) => {
       customerContactId = String(customerContactIdRaw).trim()
     }
 
-    const branchId = requireBranch(req)
+    const branchId = targetBranch(req, req.body?.branch_id)
 
     const created = await prismaTransaction.$transaction(async (tx) => {
       await validateCustomerContact(tx, customerContactId)
@@ -447,6 +454,40 @@ exports.update = async (req, res, next) => {
         include: ORDER_DETAIL_INCLUDE,
       })
     })
+
+    res.json(updated)
+  } catch (e) {
+    next(e)
+  }
+}
+
+// PUT /api/orders/:id/branch — reasigna un pedido en borrador a otra sucursal
+exports.changeBranch = async (req, res, next) => {
+  try {
+    const where = { ...orderWhereIdOrReference(req.params.id), branch: { company_id: req.companyId } }
+    const order = await prisma.commercialDocument.findFirst({ where })
+    if (!order) return res.status(404).json({ message: 'Pedido no encontrado' })
+    if (order.status !== 'DRAFT') {
+      return res.status(400).json({ message: 'Solo se puede cambiar de sucursal un pedido en borrador' })
+    }
+
+    const branchId = targetBranch(req, req.body?.branch_id)
+    if (branchId === order.branch_id) {
+      const same = await prisma.commercialDocument.findFirst({ where, include: ORDER_DETAIL_INCLUDE })
+      return res.json(same)
+    }
+
+    const updated = await prismaTransaction.$transaction(async (tx) => {
+      const branch = await loadBranch(tx, branchId)
+      // El correlativo es por sucursal (@@unique([branch_id, reference])): al mudarse
+      // toma un número de la serie nueva, arrastrar el viejo rompería la numeración.
+      const reference = await nextDocumentReference(tx, 'P', branch)
+      return tx.commercialDocument.update({
+        where: { id: order.id },
+        data: { branch_id: branchId, reference },
+        include: ORDER_DETAIL_INCLUDE,
+      })
+    }, ORDER_TX_OPTIONS)
 
     res.json(updated)
   } catch (e) {

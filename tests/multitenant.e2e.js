@@ -429,6 +429,114 @@ async function main() {
   assert(sinEmpresa.company_name === 'Depósito' && sinEmpresa.timezone === 'America/Guatemala',
     'sin empresa se responden los valores por defecto, no los de otra empresa')
 
+  console.log('\n== 12. Promociones y documentos por sucursal ==')
+  // Llama un controller con req/res falsos: devuelve { status, body }.
+  const callController = (fn, req) => new Promise((resolve, reject) => {
+    let status = 200
+    const res = {
+      status(code) { status = code; return res },
+      json(body) { resolve({ status, body }) },
+    }
+    Promise.resolve(fn(req, res, reject)).catch(reject)
+  })
+
+  const promoType = await prisma.promotionType.upsert({
+    where: { name: 'PERCENTAGE' }, update: {}, create: { name: 'PERCENTAGE' },
+  })
+  const promoTodas = await prisma.promotion.create({
+    data: {
+      company_id: acme.id, name: 'Diez por ciento', type_id: promoType.id,
+      discount_percentage: 10, applies_to_all: true, applies_to_all_branches: true,
+      codes: { create: { company_id: acme.id, code: 'TODAS10' } },
+    },
+  })
+  const promoNorte = await prisma.promotion.create({
+    data: {
+      company_id: acme.id, name: 'Solo Norte', type_id: promoType.id,
+      discount_percentage: 20, applies_to_all: true, applies_to_all_branches: false,
+      branches: { create: { branch_id: acmeNorte.id } },
+      codes: { create: { company_id: acme.id, code: 'NORTE20' } },
+    },
+  })
+  await prisma.promotion.create({
+    data: {
+      company_id: globex.id, name: 'Ajena', type_id: promoType.id,
+      discount_percentage: 50, applies_to_all: true,
+      codes: { create: { company_id: globex.id, code: 'AJENA50' } },
+    },
+  })
+
+  const promos = require('../src/controllers/promotions.controller')
+  const listaCentro = await callController(promos.list, {
+    companyId: acme.id, branchId: acmeCentro.id, query: {},
+  })
+  const idsCentro = listaCentro.body.items.map((p) => p.id)
+  assert(idsCentro.includes(promoTodas.id) && !idsCentro.includes(promoNorte.id),
+    'en Centro solo se ven las promos que aplican ahí')
+
+  const listaNorte = await callController(promos.list, {
+    companyId: acme.id, branchId: acmeNorte.id, query: {},
+  })
+  const idsNorte = listaNorte.body.items.map((p) => p.id)
+  assert(idsNorte.includes(promoTodas.id) && idsNorte.includes(promoNorte.id),
+    'en Norte se ven la general y la suya')
+
+  const consolidada = await callController(promos.list, {
+    companyId: acme.id, branchId: null, branchIds: [acmeCentro.id, acmeNorte.id], query: {},
+  })
+  assert(consolidada.body.items.length === 2, 'la vista consolidada ve las dos promos de la empresa')
+
+  const carrito = [{ product_id: (await prisma.product.findFirst({ where: { company_id: acme.id } })).id, price: 100, qty: 1 }]
+  const valNorteEnCentro = await callController(promos.validateCode, {
+    companyId: acme.id, branchId: acmeCentro.id, body: { code: 'NORTE20', items: carrito },
+  })
+  assert(valNorteEnCentro.body.valid === false, 'un código de otra sucursal no valida en Centro')
+
+  const valNorteEnNorte = await callController(promos.validateCode, {
+    companyId: acme.id, branchId: acmeNorte.id, body: { code: 'NORTE20', items: carrito },
+  })
+  assert(valNorteEnNorte.body.valid === true && valNorteEnNorte.body.discount === 20,
+    'el mismo código sí valida en su sucursal (20% de 100)')
+
+  const valAjena = await callController(promos.validateCode, {
+    companyId: acme.id, branchId: acmeCentro.id, body: { code: 'AJENA50', items: carrito },
+  })
+  assert(valAjena.status === 404 && valAjena.body.valid === false,
+    'un código de otra empresa no valida (fuga cerrada)')
+
+  // Pedidos: sucursal explícita al crear y reasignación en borrador.
+  const { targetBranch } = require('../src/middlewares/tenant')
+  const reqCentro = { branchId: acmeCentro.id, userBranchIds: [acmeCentro.id, acmeNorte.id] }
+  assert(targetBranch(reqCentro, null) === acmeCentro.id, 'sin sucursal explícita se usa la activa')
+  assert(targetBranch(reqCentro, acmeNorte.id) === acmeNorte.id, 'se puede dirigir a otra sucursal propia')
+  let denied = false
+  try { targetBranch(reqCentro, globexUno.id) } catch (e) { denied = e.status === 403 }
+  assert(denied, 'una sucursal ajena se rechaza con 403')
+
+  const pedido = await prisma.commercialDocument.create({
+    data: {
+      branch_id: acmeCentro.id, reference: 'P-CEN-000001', doc_type: 'ORDER',
+      status: 'DRAFT', total: 100, created_by: user.id,
+    },
+  })
+  const orders = require('../src/controllers/orders.controller')
+  const movido = await callController(orders.changeBranch, {
+    params: { id: pedido.id }, body: { branch_id: acmeNorte.id },
+    companyId: acme.id, branchId: acmeCentro.id,
+    userBranchIds: [acmeCentro.id, acmeNorte.id],
+  })
+  assert(movido.body.branch_id === acmeNorte.id, 'el pedido en borrador se mueve de sucursal')
+  assert(movido.body.reference.startsWith('P-NOR-'),
+    `al mudarse toma el correlativo de la sucursal nueva (${movido.body.reference})`)
+
+  await prisma.commercialDocument.update({ where: { id: pedido.id }, data: { status: 'CONFIRMED' } })
+  const bloqueado = await callController(orders.changeBranch, {
+    params: { id: pedido.id }, body: { branch_id: acmeCentro.id },
+    companyId: acme.id, branchId: acmeNorte.id,
+    userBranchIds: [acmeCentro.id, acmeNorte.id],
+  })
+  assert(bloqueado.status === 400, 'un pedido confirmado ya no se puede mover (tiene reservas)')
+
   console.log('\nTODAS LAS PRUEBAS PASARON')
 }
 

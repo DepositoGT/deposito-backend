@@ -19,6 +19,49 @@ const { DateTime } = require('luxon')
 const { applyPromotion, applyMultiplePromotions, PROMOTION_TYPES } = require('../services/promotionCalculator')
 
 /**
+ * Una promo se ve donde aplica: en toda la empresa o solo en sus sucursales.
+ * Sin branchId (vista consolidada) no se filtra: se ven todas las de la empresa.
+ */
+function branchScope(req) {
+    if (!req.branchId) return {}
+    return {
+        OR: [
+            { applies_to_all_branches: true },
+            { branches: { some: { branch_id: req.branchId } } },
+        ],
+    }
+}
+
+const BRANCH_INCLUDE = { include: { branch: { select: { id: true, name: true, code: true } } } }
+
+/**
+ * Sucursales elegidas en el body. Devuelve null si el body no toca el tema
+ * (para que update no borre lo que ya había).
+ */
+async function parseBranchIds(req) {
+    const { applies_to_all_branches, branch_ids } = req.body || {}
+    if (applies_to_all_branches === undefined && branch_ids === undefined) return null
+    if (applies_to_all_branches !== false) return { all: true, ids: [] }
+
+    const ids = Array.isArray(branch_ids) ? branch_ids.map(String) : []
+    if (ids.length === 0) {
+        const err = new Error('Indica al menos una sucursal o marca que aplica a todas')
+        err.status = 400
+        throw err
+    }
+    const found = await prisma.branch.findMany({
+        where: { id: { in: ids }, company_id: req.companyId },
+        select: { id: true },
+    })
+    if (found.length !== ids.length) {
+        const err = new Error('Alguna sucursal no pertenece a esta empresa')
+        err.status = 400
+        throw err
+    }
+    return { all: false, ids }
+}
+
+/**
  * Generate random promotion code
  * Format: PREFIX + 6 random alphanumeric characters
  */
@@ -64,7 +107,7 @@ exports.list = async (req, res, next) => {
         const page = Math.max(1, Number(req.query.page ?? 1))
         const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 20)))
 
-        const where = { deleted: false, company_id: req.companyId }
+        const where = { deleted: false, company_id: req.companyId, ...branchScope(req) }
 
         if (active !== undefined) {
             where.active = active === 'true'
@@ -91,7 +134,8 @@ exports.list = async (req, res, next) => {
                 },
                 applicable_categories: {
                     include: { category: { select: { id: true, name: true } } }
-                }
+                },
+                branches: BRANCH_INCLUDE
             },
             orderBy: { created_at: 'desc' },
             skip: (safePage - 1) * pageSize,
@@ -117,7 +161,7 @@ exports.getById = async (req, res, next) => {
         const { id } = req.params
 
         const promotion = await prisma.promotion.findFirst({
-            where: { id, company_id: req.companyId },
+            where: { id, company_id: req.companyId, ...branchScope(req) },
             include: {
                 type: true,
                 codes: { orderBy: { created_at: 'desc' } },
@@ -127,6 +171,7 @@ exports.getById = async (req, res, next) => {
                 applicable_categories: {
                     include: { category: { select: { id: true, name: true } } }
                 },
+                branches: BRANCH_INCLUDE,
                 _count: { select: { sale_promotions: true } }
             }
         })
@@ -152,7 +197,7 @@ exports.getByCode = async (req, res, next) => {
                 code: code.toUpperCase(),
                 company_id: req.companyId,
                 active: true,
-                promotion: { deleted: false }
+                promotion: { deleted: false, ...branchScope(req) }
             },
             include: {
                 promotion: {
@@ -316,6 +361,8 @@ exports.create = async (req, res, next) => {
             allCodes.push(...generatedCodes)
         }
 
+        const branchTarget = await parseBranchIds(req)
+
         const promotion = await prisma.$transaction(async (tx) => {
             // Create promotion
             const newPromotion = await tx.promotion.create({
@@ -337,9 +384,20 @@ exports.create = async (req, res, next) => {
                     max_uses: max_uses ? Number(max_uses) : null,
                     max_uses_per_customer: max_uses_per_customer ? Number(max_uses_per_customer) : null,
                     min_purchase_amount: min_purchase_amount ? Number(min_purchase_amount) : null,
-                    active: active ?? true
+                    active: active ?? true,
+                    applies_to_all_branches: branchTarget ? branchTarget.all : true
                 }
             })
+
+            // Sucursales donde aplica (vacío = todas)
+            if (branchTarget && !branchTarget.all) {
+                await tx.promotionBranch.createMany({
+                    data: branchTarget.ids.map(bid => ({
+                        promotion_id: newPromotion.id,
+                        branch_id: bid
+                    }))
+                })
+            }
 
             // Create promotion codes
             if (allCodes.length > 0) {
@@ -378,7 +436,8 @@ exports.create = async (req, res, next) => {
                     type: true,
                     codes: true,
                     applicable_products: { include: { product: { select: { id: true, name: true } } } },
-                    applicable_categories: { include: { category: { select: { id: true, name: true } } } }
+                    applicable_categories: { include: { category: { select: { id: true, name: true } } } },
+                    branches: BRANCH_INCLUDE
                 }
             })
         })
@@ -504,7 +563,7 @@ exports.update = async (req, res, next) => {
         } = body
 
         const existing = await prisma.promotion.findFirst({
-            where: { id, company_id: req.companyId },
+            where: { id, company_id: req.companyId, ...branchScope(req) },
             include: { type: true },
         })
         if (!existing || existing.deleted) {
@@ -581,9 +640,21 @@ exports.update = async (req, res, next) => {
             })
         }
 
+        const branchTarget = await parseBranchIds(req)
+        if (branchTarget) data.applies_to_all_branches = branchTarget.all
+
         await prisma.$transaction(async (tx) => {
             if (Object.keys(data).length > 0) {
                 await tx.promotion.update({ where: { id }, data })
+            }
+
+            if (branchTarget) {
+                await tx.promotionBranch.deleteMany({ where: { promotion_id: id } })
+                if (!branchTarget.all) {
+                    await tx.promotionBranch.createMany({
+                        data: branchTarget.ids.map((bid) => ({ promotion_id: id, branch_id: bid })),
+                    })
+                }
             }
 
             if (supportsRestrictedScope && nextAppliesAll) {
@@ -617,6 +688,7 @@ exports.update = async (req, res, next) => {
                 codes: { orderBy: { created_at: 'desc' } },
                 applicable_products: { include: { product: { select: { id: true, name: true } } } },
                 applicable_categories: { include: { category: { select: { id: true, name: true } } } },
+                branches: BRANCH_INCLUDE,
             },
         })
 
@@ -632,7 +704,9 @@ exports.delete = async (req, res, next) => {
     try {
         const { id } = req.params
 
-        const existing = await prisma.promotion.findFirst({ where: { id, company_id: req.companyId } })
+        const existing = await prisma.promotion.findFirst({
+            where: { id, company_id: req.companyId, ...branchScope(req) }
+        })
         if (!existing || existing.deleted) {
             return res.status(404).json({ message: 'Promoción no encontrada' })
         }
@@ -666,6 +740,7 @@ exports.validateCode = async (req, res, next) => {
         const promotionCode = await prisma.promotionCode.findFirst({
             where: {
                 code: code.toUpperCase(),
+                company_id: req.companyId,
                 active: true
             },
             include: {
@@ -673,7 +748,8 @@ exports.validateCode = async (req, res, next) => {
                     include: {
                         type: true,
                         applicable_products: { include: { product: { select: { id: true, name: true, price: true } } } },
-                        applicable_categories: { include: { category: { select: { id: true, name: true } } } }
+                        applicable_categories: { include: { category: { select: { id: true, name: true } } } },
+                        branches: { select: { branch_id: true } }
                     }
                 }
             }
@@ -684,6 +760,12 @@ exports.validateCode = async (req, res, next) => {
         }
 
         const promotion = promotionCode.promotion
+
+        // La promo puede estar limitada a otras sucursales
+        if (req.branchId && !promotion.applies_to_all_branches
+            && !promotion.branches.some((b) => b.branch_id === req.branchId)) {
+            return res.json({ valid: false, message: 'Esta promoción no aplica a esta sucursal' })
+        }
 
         // Check date validity
         if (promotion.start_date && now < promotion.start_date) {
@@ -761,7 +843,7 @@ exports.calculateDiscount = async (req, res, next) => {
         }
 
         const promotion = await prisma.promotion.findFirst({
-            where: { id: promotion_id, company_id: req.companyId },
+            where: { id: promotion_id, company_id: req.companyId, ...branchScope(req) },
             include: {
                 type: true,
                 applicable_products: true,

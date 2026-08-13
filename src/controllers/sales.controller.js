@@ -534,6 +534,11 @@ exports.create = async (req, res, next) => {
             promotion: {
               active: true,
               deleted: false,
+              // Un código de otra sucursal no se puede cobrar aquí
+              OR: [
+                { applies_to_all_branches: true },
+                { branches: { some: { branch_id: branchId } } },
+              ],
             },
           },
           include: {
