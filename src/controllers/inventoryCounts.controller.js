@@ -257,6 +257,24 @@ async function applyStockTransaction(tx, sessionId, branchId) {
       return Promise.all(ops)
     })
   )
+
+  // El mismo ajuste, en las ubicaciones. ponytail: el conteo todavía es por
+  // sucursal, así que la diferencia entra a la ubicación de recepción y sale
+  // por prioridad; el conteo por ubicación es la fase 5 del plan.
+  const { applyBranchDelta } = require('../services/stockLocations')
+  const countCtx = { reason: 'COUNT_ADJUST', refType: 'inventory_count', refId: String(sessionId) }
+  const ups = []
+  const downs = []
+  for (const L of lines) {
+    const isVirtualKit = L.product.kind === 'KIT' && !L.product.stock_assembled
+    const target = isVirtualKit ? 0 : Number(L.qty_counted)
+    const delta = target - (currentByProduct.get(L.product_id) ?? 0)
+    if (delta > 0) ups.push([String(L.product_id), delta])
+    else if (delta < 0) downs.push([String(L.product_id), -delta])
+  }
+  if (ups.length) await applyBranchDelta(tx, ups, branchId, 1, countCtx)
+  if (downs.length) await applyBranchDelta(tx, downs, branchId, -1, { ...countCtx, adjust: true })
+
   return lines.map((l) => l.product_id)
 }
 

@@ -75,9 +75,16 @@ async function main() {
   assert(acmeProducts === 1, 'el catálogo de Acme no ve productos de Globex')
 
   console.log('\n== 3. Stock por sucursal ==')
+  // Entra por la puerta normal para que también aterrice en una ubicación real.
   const setStock = async (product, branch, stock, min = 5) => {
-    await prisma.productStock.create({ data: { product_id: product.id, branch_id: branch.id, stock, min_stock: min } })
-    await prisma.product.update({ where: { id: product.id }, data: { stock: { increment: stock } } })
+    const { restoreStockMap } = require('../src/services/bomStock')
+    await prisma.$transaction(async (tx) => {
+      await restoreStockMap(tx, new Map([[product.id, stock]]), branch.id, { reason: 'INITIAL' })
+      await tx.productStock.update({
+        where: { product_id_branch_id: { product_id: product.id, branch_id: branch.id } },
+        data: { min_stock: min },
+      })
+    })
   }
   await setStock(ron, acmeCentro, 100)
   await setStock(ron, acmeNorte, 20)
@@ -541,12 +548,8 @@ async function main() {
   console.log('\n--- 13. Producto fuera de una sola sucursal ---')
   const products = require('../src/controllers/products.controller')
   const soloCentro = await mk('Solo Centro', acme, catA, supA, 'ONLY-CENTRO')
-  await prisma.productStock.createMany({
-    data: [
-      { product_id: soloCentro.id, branch_id: acmeCentro.id, stock: 3 },
-      { product_id: soloCentro.id, branch_id: acmeNorte.id, stock: 0 },
-    ],
-  })
+  await setStock(soloCentro, acmeCentro, 3, 0)
+  await prisma.productStock.create({ data: { product_id: soloCentro.id, branch_id: acmeNorte.id, stock: 0 } })
 
   const conStock = await callController(products.removeFromBranch, {
     params: { id: soloCentro.id }, companyId: acme.id, branchId: acmeCentro.id,

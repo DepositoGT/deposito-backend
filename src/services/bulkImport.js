@@ -14,6 +14,7 @@
  */
 const XLSX = require('xlsx')
 const { prisma } = require('../models/prisma')
+const { applyBranchDelta } = require('./stockLocations')
 
 function normalizeImportOptions(raw) {
     const o = raw && typeof raw === 'object' ? raw : {}
@@ -464,6 +465,10 @@ async function bulkCreateProducts(validRows, ctx = {}) {
                 await prisma.product.update({
                     where: { id: prod.id },
                     data: { stock: { increment: initialStock } },
+                })
+                // El stock inicial también aterriza en una ubicación real.
+                await applyBranchDelta(prisma, [[prod.id, initialStock]], branchId, 1, {
+                    reason: 'INITIAL', refType: 'product', refId: prod.id,
                 })
             }
             created++

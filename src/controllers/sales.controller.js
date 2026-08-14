@@ -692,7 +692,9 @@ exports.create = async (req, res, next) => {
         tx,
         resolvedItems.map((it) => ({ product_id: it.product_id, qty: it.qty }))
       )
-      const updatedProducts = await deductStockMap(tx, stockMap, branchId)
+      const updatedProducts = await deductStockMap(tx, stockMap, branchId, {
+        reason: 'SALE', refType: 'sale', refId: String(sale.id), userId: user.sub,
+      })
       await consumeLotsFEFO(tx, stockMap, branchId) // advisory: descuenta lotes por caducidad
       await ensureStockAlertsBatch(tx, updatedProducts, branchId)
 
@@ -799,7 +801,9 @@ exports.updateStatus = async (req, res, next) => {
             tx,
             current.sale_items.map((si) => ({ product_id: si.product_id, qty: si.qty }))
           )
-          const updatedProducts = await deductStockMap(tx, stockMap, saleBranchId)
+          const updatedProducts = await deductStockMap(tx, stockMap, saleBranchId, {
+            reason: 'SALE', refType: 'sale', refId: String(id), userId: req.user?.sub || null,
+          })
           await consumeLotsFEFO(tx, stockMap, saleBranchId) // advisory: descuenta lotes por caducidad
 
           updatedProducts.forEach(p => {
@@ -819,7 +823,9 @@ exports.updateStatus = async (req, res, next) => {
             tx,
             current.sale_items.map((si) => ({ product_id: si.product_id, qty: si.qty }))
           )
-          const updatedProducts = await restoreStockMap(tx, stockMap, saleBranchId)
+          const updatedProducts = await restoreStockMap(tx, stockMap, saleBranchId, {
+            reason: 'SALE_RETURN', refType: 'sale', refId: String(id), userId: req.user?.sub || null,
+          })
           await restoreLotsFEFO(tx, stockMap, saleBranchId) // advisory: devuelve cantidad a los lotes
 
           updatedProducts.forEach(p => {

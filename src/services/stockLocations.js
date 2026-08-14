@@ -1,0 +1,251 @@
+/**
+ * Stock por UBICACIÓN dentro de una sucursal.
+ *
+ * Niveles: products.stock (espejo empresa) → product_stocks (espejo sucursal)
+ * → product_stock_locations (la verdad física). Este archivo es el único que
+ * escribe el tercer nivel y el libro append-only `stock_movements`.
+ *
+ * Todo el stock que entra o sale de una sucursal pasa por `applyStockDelta`
+ * (services/bomStock.js), que llama aquí. Los llamadores no eligen ubicación:
+ * sale por prioridad de despacho y entra a la de recepción.
+ */
+
+const { Prisma } = require('@prisma/client')
+const { requireBranchId } = require('./stockAvailability')
+
+/** Orden de despacho: almacén, luego ubicación, luego código (desempate estable). */
+const DISPATCH_ORDER = Prisma.sql`w.dispatch_priority, l.dispatch_priority, l.code`
+
+/**
+ * Ubicación por defecto de la sucursal. Si la sucursal se creó después de la
+ * migración de almacenes, se le arma aquí su almacén "Principal" — así ni el
+ * alta de sucursales ni el seed ni las pruebas tienen que acordarse.
+ * @param {boolean} receiving prefiere el almacén marcado como de recepción
+ */
+async function defaultLocationId(tx, branchId, { receiving = false } = {}) {
+  const b = requireBranchId(branchId)
+  const preferReceiving = receiving ? Prisma.sql`w.is_receiving DESC,` : Prisma.empty
+  const pick = async () => {
+    const rows = await tx.$queryRaw`
+      SELECT l.id
+      FROM stock_locations l
+      JOIN warehouses w ON w.id = l.warehouse_id
+      WHERE w.branch_id = ${b}::uuid AND w.active AND l.active
+      ORDER BY ${preferReceiving} w.is_default DESC, l.is_default DESC, ${DISPATCH_ORDER}
+      LIMIT 1
+    `
+    return rows[0] ? String(rows[0].id) : null
+  }
+
+  const found = await pick()
+  if (found) return found
+
+  await tx.$executeRaw`
+    WITH w AS (
+      INSERT INTO warehouses (id, branch_id, name, code, kind, is_default, is_receiving, dispatch_priority, active, created_at, updated_at)
+      VALUES (gen_random_uuid(), ${b}::uuid, 'Principal', 'PRIN', 'BODEGA', true, true, 10, true, now(), now())
+      ON CONFLICT (branch_id, code) DO NOTHING
+      RETURNING id
+    )
+    INSERT INTO stock_locations (id, warehouse_id, code, name, is_default, pickable, dispatch_priority, active, created_at)
+    SELECT gen_random_uuid(), w.id, 'GENERAL', 'General', true, true, 10, true, now()
+    FROM w
+    ON CONFLICT (warehouse_id, code) DO NOTHING
+  `
+  const created = await pick()
+  if (created) return created
+  const err = new Error('La sucursal no tiene ninguna ubicación activa donde guardar existencias')
+  err.status = 500
+  throw err
+}
+
+/**
+ * Reparte una salida entre las ubicaciones que despachan, por prioridad.
+ * Una sola consulta para todos los productos de la operación.
+ * @param {Array<[string, number]>} entries [productId, cantidad a sacar]
+ * @param {boolean} adjust corrección (merma, conteo, edición manual): empieza por
+ *   la ubicación menos accesible y sí puede tocar las que no despachan —
+ *   `pickable` frena las ventas, no el corregir lo que hay.
+ * @returns {Promise<Array<{ product_id, location_id, qty }>>} qty NEGATIVA
+ */
+async function planDispatch(tx, branchId, entries, { adjust = false } = {}) {
+  const b = requireBranchId(branchId)
+  const ids = entries.map(([id]) => String(id))
+  if (ids.length === 0) return []
+
+  const onlyPickable = adjust ? Prisma.empty : Prisma.sql`AND l.pickable`
+  const rows = await tx.$queryRaw`
+    SELECT psl.product_id, psl.location_id, psl.stock
+    FROM product_stock_locations psl
+    JOIN stock_locations l ON l.id = psl.location_id
+    JOIN warehouses w ON w.id = l.warehouse_id
+    WHERE w.branch_id = ${b}::uuid AND w.active AND l.active ${onlyPickable}
+      AND psl.stock > 0
+      AND psl.product_id IN (${Prisma.join(ids.map((id) => Prisma.sql`${id}::uuid`))})
+    ORDER BY ${DISPATCH_ORDER}
+  `
+  const byProduct = new Map()
+  for (const row of rows) {
+    const key = String(row.product_id)
+    if (!byProduct.has(key)) byProduct.set(key, [])
+    byProduct.get(key).push(row)
+  }
+
+  const out = []
+  for (const [productId, qty] of entries) {
+    let pending = Number(qty)
+    const available = byProduct.get(String(productId)) || []
+    for (const row of adjust ? [...available].reverse() : available) {
+      if (pending <= 0) break
+      const take = Math.min(pending, Number(row.stock))
+      if (take <= 0) continue
+      out.push({ product_id: String(productId), location_id: String(row.location_id), qty: -take })
+      pending -= take
+    }
+    if (pending > 0) {
+      // El total de la sucursal ya se validó antes: si aquí falta, los espejos
+      // están descuadrados y se reporta en vez de "arreglarlo" callado.
+      const err = new Error(
+        `Descuadre de existencias: faltan ${pending} unidades del producto ${productId} en las ubicaciones de la sucursal`
+      )
+      err.status = 409
+      err.code = 'LOCATION_STOCK_MISMATCH'
+      throw err
+    }
+  }
+  return out
+}
+
+function aggregate(deltas) {
+  const map = new Map()
+  for (const d of deltas) {
+    const key = `${d.product_id}|${d.location_id}`
+    map.set(key, (map.get(key) || 0) + Number(d.qty || 0))
+  }
+  return [...map.entries()]
+    .map(([key, qty]) => {
+      const [product_id, location_id] = key.split('|')
+      return { product_id, location_id, qty }
+    })
+    .filter((d) => d.qty !== 0)
+}
+
+/**
+ * Aplica deltas por ubicación y escribe el libro. NO toca product_stocks ni
+ * products.stock: de eso sigue encargándose applyStockDelta.
+ * @param {Array<{ product_id, location_id, qty }>} deltas qty con signo
+ */
+async function applyLocationDeltas(tx, deltas, ctx = {}) {
+  const rows = aggregate(deltas)
+  if (rows.length === 0) return []
+  const b = requireBranchId(ctx.branchId)
+
+  const pairs = Prisma.join(
+    rows.map((d) => Prisma.sql`(${d.product_id}::uuid, ${d.location_id}::uuid)`)
+  )
+  await tx.$executeRaw`
+    INSERT INTO product_stock_locations (id, product_id, location_id, stock, min_stock)
+    SELECT gen_random_uuid(), v.product_id, v.location_id, 0, 0
+    FROM (VALUES ${pairs}) AS v(product_id, location_id)
+    ON CONFLICT (product_id, location_id) DO NOTHING
+  `
+  // Bloqueo en orden fijo (ubicación, producto) en todas las rutas: sin deadlocks cruzados.
+  await tx.$executeRaw`
+    SELECT 1 FROM product_stock_locations
+    WHERE (product_id, location_id) IN (${pairs})
+    ORDER BY location_id, product_id
+    FOR UPDATE
+  `
+
+  const values = Prisma.join(
+    rows.map((d) => Prisma.sql`(${d.product_id}::uuid, ${d.location_id}::uuid, ${d.qty}::int)`)
+  )
+  const updated = await tx.$queryRaw`
+    WITH v(product_id, location_id, qty) AS (VALUES ${values})
+    UPDATE product_stock_locations psl
+    SET stock = psl.stock + v.qty
+    FROM v
+    WHERE psl.product_id = v.product_id AND psl.location_id = v.location_id
+    RETURNING psl.product_id, psl.location_id, psl.stock AS balance, v.qty
+  `
+
+  const negative = updated.find((r) => Number(r.balance) < 0)
+  if (negative) {
+    const err = new Error(`Una ubicación quedaría en negativo para el producto ${negative.product_id}`)
+    err.status = 409
+    err.code = 'LOCATION_STOCK_MISMATCH'
+    throw err
+  }
+
+  await tx.stockMovement.createMany({
+    data: updated.map((r) => ({
+      branch_id: b,
+      location_id: String(r.location_id),
+      product_id: String(r.product_id),
+      qty: Number(r.qty),
+      balance: Number(r.balance),
+      reason: ctx.reason || 'MANUAL_ADJUST',
+      ref_type: ctx.refType || null,
+      ref_id: ctx.refId || null,
+      group_id: ctx.groupId || null,
+      notes: ctx.notes || null,
+      created_by: ctx.userId || null,
+    })),
+  })
+  return updated
+}
+
+/**
+ * El delta de sucursal, repartido por ubicación: sale por prioridad de
+ * despacho, entra a la ubicación de recepción (o a `ctx.locationId`).
+ * @param {Array<[string, number]>} entries [productId, cantidad positiva]
+ */
+async function applyBranchDelta(tx, entries, branchId, sign, ctx = {}) {
+  const b = requireBranchId(branchId)
+  let deltas
+  if (sign < 0) {
+    deltas = await planDispatch(tx, b, entries, { adjust: ctx.adjust })
+  } else {
+    const locationId = ctx.locationId || (await defaultLocationId(tx, b, { receiving: true }))
+    deltas = entries.map(([id, qty]) => ({
+      product_id: String(id),
+      location_id: locationId,
+      qty: Number(qty),
+    }))
+  }
+  return applyLocationDeltas(tx, deltas, { ...ctx, branchId: b })
+}
+
+/** Existencias del producto en la sucursal, sumando sus ubicaciones. */
+async function branchLocationStock(tx, productId, branchId) {
+  const b = requireBranchId(branchId)
+  const rows = await tx.$queryRaw`
+    SELECT COALESCE(SUM(psl.stock), 0)::int AS total
+    FROM product_stock_locations psl
+    JOIN stock_locations l ON l.id = psl.location_id
+    JOIN warehouses w ON w.id = l.warehouse_id
+    WHERE w.branch_id = ${b}::uuid AND psl.product_id = ${String(productId)}::uuid
+  `
+  return Number(rows[0]?.total || 0)
+}
+
+/** Borra las filas de ubicación del producto en la sucursal (solo si están en 0). */
+async function clearBranchLocations(tx, productId, branchId) {
+  const b = requireBranchId(branchId)
+  await tx.$executeRaw`
+    DELETE FROM product_stock_locations psl
+    USING stock_locations l, warehouses w
+    WHERE psl.location_id = l.id AND l.warehouse_id = w.id
+      AND w.branch_id = ${b}::uuid AND psl.product_id = ${String(productId)}::uuid
+      AND psl.stock = 0
+  `
+}
+
+module.exports = {
+  defaultLocationId,
+  planDispatch,
+  applyLocationDeltas,
+  applyBranchDelta,
+  branchLocationStock,
+  clearBranchLocations,
+}

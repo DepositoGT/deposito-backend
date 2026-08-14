@@ -702,7 +702,9 @@ exports.convertToSale = async (req, res, next) => {
         tx,
         fulfillments.map(({ line, qty }) => ({ product_id: line.product_id, qty }))
       )
-      const updatedProducts = await deductStockMap(tx, stockMap, order.branch_id)
+      const updatedProducts = await deductStockMap(tx, stockMap, order.branch_id, {
+        reason: 'ORDER_FULFILL', refType: 'commercial_document', refId: String(order.id), userId: user.sub,
+      })
       await ensureStockAlertsBatch(tx, updatedProducts, order.branch_id)
 
       await consumePartialByDocument(

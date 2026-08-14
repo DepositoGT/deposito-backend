@@ -18,12 +18,13 @@ const { createClient } = require('@supabase/supabase-js')
 const { ensureStockAlert } = require('../services/stockAlerts')
 const { requireBranch, branchWhere } = require('../middlewares/tenant')
 const { ensureBranchStockRows } = require('../services/stockAvailability')
+const { applyBranchDelta, branchLocationStock, clearBranchLocations } = require('../services/stockLocations')
 
 /**
  * Fija stock/min_stock del producto EN LA SUCURSAL dada y ajusta el espejo
  * products.stock por el delta. Devuelve la fila de la sucursal actualizada.
  */
-async function setBranchStock(tx, productId, branchId, { stock, minStock }) {
+async function setBranchStock(tx, productId, branchId, { stock, minStock }, ctx = {}) {
   await ensureBranchStockRows(tx, [productId], branchId)
   const key = { product_id_branch_id: { product_id: productId, branch_id: branchId } }
   const row = await tx.productStock.findUnique({ where: key })
@@ -35,6 +36,11 @@ async function setBranchStock(tx, productId, branchId, { stock, minStock }) {
     const delta = Number(stock) - Number(row?.stock || 0)
     if (delta !== 0) {
       await tx.product.update({ where: { id: productId }, data: { stock: { increment: delta } } })
+      // La misma diferencia por ubicación: entra a la de recepción y, si baja,
+      // sale primero de la menos accesible.
+      await applyBranchDelta(tx, [[String(productId), Math.abs(delta)]], branchId, Math.sign(delta), {
+        reason: 'MANUAL_ADJUST', refType: 'product', refId: String(productId), adjust: true, ...ctx,
+      })
     }
   }
   return updated
@@ -244,7 +250,7 @@ exports.create = async (req, res, next) => {
       const branchStock = await setBranchStock(tx, product.id, branchId, {
         stock: kind === 'KIT' ? 0 : stock,
         minStock: Number(product.min_stock || 0),
-      })
+      }, { reason: 'INITIAL', userId: req.user?.sub || null })
       product.stock = branchStock.stock
 
       let purchaseLog = null
@@ -568,7 +574,7 @@ exports.update = async (req, res, next) => {
       const out = await prismaTransaction.$transaction(async (tx) => {
         const prod = await tx.product.update({ where: { id }, data: safePayload })
         const row = (branchStockValue !== undefined || branchMinValue !== undefined)
-          ? await setBranchStock(tx, id, branchId, { stock: branchStockValue, minStock: branchMinValue })
+          ? await setBranchStock(tx, id, branchId, { stock: branchStockValue, minStock: branchMinValue }, { userId: req.user?.sub || null })
           : null
         return { prod, row }
       })
@@ -646,10 +652,13 @@ exports.removeFromBranch = async (req, res, next) => {
     const row = await prisma.productStock.findUnique({ where: key })
     if (!row) return res.status(404).json({ message: 'El producto no se maneja en esta sucursal' })
     // Borrar con existencias perdería el inventario: primero trasladarlo o ajustarlo.
-    if (Number(row.stock) !== 0) {
+    // Se exige 0 en la sucursal Y en cada una de sus ubicaciones.
+    const inLocations = await branchLocationStock(prisma, owned.id, branchId)
+    if (Number(row.stock) !== 0 || inLocations !== 0) {
       return res.status(400).json({ message: 'Deja el stock en 0 en esta sucursal antes de quitarlo (traslada o ajusta)' })
     }
 
+    await clearBranchLocations(prisma, owned.id, branchId)
     await prisma.productStock.delete({ where: key })
     res.json({ ok: true })
   } catch (e) { next(e) }
@@ -1068,9 +1077,10 @@ exports.updateLot = async (req, res, next) => {
         if (delta !== 0) {
           // Ajusta la sucursal del lote (y el espejo global) por la diferencia
           const map = new Map([[String(lot.product_id), Math.abs(delta)]])
+          const lotCtx = { reason: 'MANUAL_ADJUST', refType: 'product_lot', refId: String(lotId), userId: req.user?.sub || null }
           const [row] = delta > 0
-            ? await restoreStockMap(tx, map, lot.branch_id)
-            : await deductStockMap(tx, map, lot.branch_id)
+            ? await restoreStockMap(tx, map, lot.branch_id, lotCtx)
+            : await deductStockMap(tx, map, lot.branch_id, lotCtx)
           if (row) await ensureStockAlert(tx, row.id, row.stock, row.min_stock, lot.branch_id)
         }
       }
@@ -1114,7 +1124,9 @@ exports.deleteLot = async (req, res, next) => {
 
       if (lot.qty_remaining > 0) {
         const map = new Map([[String(lot.product_id), lot.qty_remaining]])
-        const [row] = await deductStockMap(tx, map, lot.branch_id)
+        const [row] = await deductStockMap(tx, map, lot.branch_id, {
+          reason: 'MANUAL_ADJUST', refType: 'product_lot', refId: String(lotId), userId: req.user?.sub || null,
+        })
         if (row) await ensureStockAlert(tx, row.id, row.stock, row.min_stock, lot.branch_id)
       }
 
@@ -1405,7 +1417,9 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
         const unitCost = Number(item.unit_cost)
 
         // La mercancía entra al stock de la sucursal (y al espejo global)
-        const [updated] = await restoreStockMap(tx, new Map([[String(product.id), quantity]]), branchId)
+        const [updated] = await restoreStockMap(tx, new Map([[String(product.id), quantity]]), branchId, {
+          reason: 'PURCHASE', refType: 'incoming_merchandise', refId: String(incomingMerchandise.id), userId: registered_by,
+        })
         updatedProducts.push(updated)
 
         // Create purchase log

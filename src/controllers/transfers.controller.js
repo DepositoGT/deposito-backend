@@ -178,7 +178,9 @@ exports.create = async (req, res, next) => {
 
       // Sale del origen ahora; entra al destino al recibir
       const stockMap = await expandLinesToStockMap(tx, lines)
-      const updated = await deductStockMap(tx, stockMap, fromBranchId)
+      const updated = await deductStockMap(tx, stockMap, fromBranchId, {
+        reason: 'TRANSFER_OUT', refType: 'transfer', refId: String(transfer.id), userId: req.user.sub,
+      })
       await ensureStockAlertsBatch(tx, updated, fromBranchId)
 
       // Los lotes viajan con la mercancía: salen del origen y se guardan en la
@@ -265,7 +267,9 @@ exports.receive = async (req, res, next) => {
       }
 
       if (stockMap.size > 0) {
-        const updated = await restoreStockMap(tx, stockMap, branchId)
+        const updated = await restoreStockMap(tx, stockMap, branchId, {
+          reason: 'TRANSFER_IN', refType: 'transfer', refId: String(transfer.id), userId: req.user?.sub || null,
+        })
         await ensureStockAlertsBatch(tx, updated, branchId)
       }
 
@@ -319,7 +323,9 @@ exports.cancel = async (req, res, next) => {
           tx, String(line.product_id), transfer.from_branch_id, line.lots_snapshot, line.qty_sent,
         )
       }
-      const updated = await restoreStockMap(tx, stockMap, transfer.from_branch_id)
+      const updated = await restoreStockMap(tx, stockMap, transfer.from_branch_id, {
+        reason: 'TRANSFER_CANCEL', refType: 'transfer', refId: String(transfer.id), userId: req.user?.sub || null,
+      })
       await ensureStockAlertsBatch(tx, updated, transfer.from_branch_id)
 
       return tx.stockTransfer.update({

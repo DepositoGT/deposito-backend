@@ -21,23 +21,23 @@ const { branchWhere } = require('../middlewares/tenant')
 
 // El stock de una devolución/cambio se mueve en la sucursal DONDE SE VENDIÓ
 // (sale.branch_id), no en la del request.
-async function restoreReturnItemsStock(tx, returnItems, branchId) {
+async function restoreReturnItemsStock(tx, returnItems, branchId, ctx) {
   const stockMap = await expandLinesToStockMap(
     tx,
     returnItems.map((item) => ({ product_id: item.product_id, qty: item.qty_returned }))
   )
-  const updatedProducts = await restoreStockMap(tx, stockMap, branchId)
+  const updatedProducts = await restoreStockMap(tx, stockMap, branchId, { reason: 'SALE_RETURN', ...ctx })
   await ensureStockAlertsBatch(tx, updatedProducts, branchId)
   return updatedProducts
 }
 
 /** Descuenta stock de los productos que el cliente se lleva en un cambio (EXCHANGE). */
-async function deductReplacementStock(tx, replacementItems, branchId) {
+async function deductReplacementStock(tx, replacementItems, branchId, ctx) {
   const stockMap = await expandLinesToStockMap(
     tx,
     replacementItems.map((item) => ({ product_id: item.product_id, qty: item.qty }))
   )
-  const updatedProducts = await deductStockMap(tx, stockMap, branchId)
+  const updatedProducts = await deductStockMap(tx, stockMap, branchId, { reason: 'SALE_RETURN', ...ctx })
   await ensureStockAlertsBatch(tx, updatedProducts, branchId)
   return updatedProducts
 }
@@ -539,6 +539,7 @@ exports.updateStatus = async (req, res, next) => {
       const prevStatusName = currentReturn.status.name
       const newStatusName = newStatus.name
       const saleBranchId = currentReturn.sale?.branch_id
+      const ledgerCtx = { refType: 'return', refId: String(id), userId: req.user?.sub || null }
 
       // 3. Validar transición de estados
       if (prevStatusName === 'Completada' || prevStatusName === 'Rechazada') {
@@ -576,20 +577,20 @@ exports.updateStatus = async (req, res, next) => {
         }
 
         console.log(`[RETURN STOCK RESTORE] Return ${id}: restaurando stock de devueltos al completar...`)
-        const restored = await restoreReturnItemsStock(tx, currentReturn.return_items, saleBranchId)
+        const restored = await restoreReturnItemsStock(tx, currentReturn.return_items, saleBranchId, ledgerCtx)
         restored.forEach((p) => console.log(`[RETURN STOCK RESTORE] ${p.name}: stock = ${p.stock}`))
       }
 
       // Cambios: al completar, descontar el stock de los productos de reemplazo.
       if (isExchange && (isCompletingFromApproved || isCompletingFromPending)) {
-        const deducted = await deductReplacementStock(tx, currentReturn.replacement_items, saleBranchId)
+        const deducted = await deductReplacementStock(tx, currentReturn.replacement_items, saleBranchId, ledgerCtx)
         deducted.forEach((p) => console.log(`[EXCHANGE STOCK] ${p.name}: stock = ${p.stock}`))
       }
 
       // CASO 3: Si se aprueba desde "Pendiente", restaurar stock solo si restore_stock es true
       if (isApproving && shouldRestoreStock) {
         console.log(`[RETURN STOCK RESTORE] Return ${id}: ${prevStatusName} -> ${newStatusName}. Restaurando stock solamente...`)
-        const updatedProducts = await restoreReturnItemsStock(tx, currentReturn.return_items, saleBranchId)
+        const updatedProducts = await restoreReturnItemsStock(tx, currentReturn.return_items, saleBranchId, ledgerCtx)
         updatedProducts.forEach((p) => {
           console.log(`[RETURN STOCK RESTORE] ${p.name}: stock restaurado = ${p.stock}`)
         })

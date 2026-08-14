@@ -168,14 +168,20 @@ async function stockMapToLines(stockMap) {
  * products.stock como espejo (total de todas las sucursales).
  * Devuelve filas { id, name, stock, min_stock } con los valores DE LA SUCURSAL
  * (para alertas de mínimo por sucursal).
+ *
+ * `ctx` describe la operación para el libro por ubicación
+ * ({ reason, refType, refId, userId, locationId }); ver services/stockLocations.js.
  */
-async function applyStockDelta(tx, stockMap, branchId, sign) {
+async function applyStockDelta(tx, stockMap, branchId, sign, ctx = {}) {
   const client = dbClient(tx)
   const { requireBranchId, ensureBranchStockRows } = require('./stockAvailability')
+  const { applyBranchDelta } = require('./stockLocations')
   const b = requireBranchId(branchId)
   const entries = Array.from(stockMap.entries()).filter(([, qty]) => Number(qty) > 0)
   if (entries.length === 0) return []
   await ensureBranchStockRows(client, entries.map(([id]) => id), b)
+  // El mismo delta, repartido por ubicación (y anotado en el kardex).
+  await applyBranchDelta(client, entries, b, sign, ctx)
   const values = Prisma.join(
     entries.map(([id, qty]) => Prisma.sql`(${id}::uuid, ${sign * Number(qty)}::int)`)
   )
@@ -199,12 +205,12 @@ async function applyStockDelta(tx, stockMap, branchId, sign) {
   `
 }
 
-async function deductStockMap(tx, stockMap, branchId) {
-  return applyStockDelta(tx, stockMap, branchId, -1)
+async function deductStockMap(tx, stockMap, branchId, ctx) {
+  return applyStockDelta(tx, stockMap, branchId, -1, ctx)
 }
 
-async function restoreStockMap(tx, stockMap, branchId) {
-  return applyStockDelta(tx, stockMap, branchId, 1)
+async function restoreStockMap(tx, stockMap, branchId, ctx) {
+  return applyStockDelta(tx, stockMap, branchId, 1, ctx)
 }
 
 /**
@@ -281,11 +287,12 @@ async function assembleKit(tx, kitProductId, requestedQty, branchId) {
     }
   }
 
+  const kitCtx = { reason: 'KIT_ASSEMBLE', refType: 'product', refId: String(kitProductId) }
   const deductionMap = buildComponentDeductionMap(kit.kit_components, qty)
-  await deductStockMap(tx, deductionMap, b)
+  await deductStockMap(tx, deductionMap, b, kitCtx)
 
   // Stock propio del kit en esta sucursal (+ espejo global en products.stock)
-  const [kitRow] = await restoreStockMap(tx, new Map([[String(kitProductId), qty]]), b)
+  const [kitRow] = await restoreStockMap(tx, new Map([[String(kitProductId), qty]]), b, kitCtx)
   const product = await client.product.update({
     where: { id: kitProductId },
     data: { stock_assembled: true },
