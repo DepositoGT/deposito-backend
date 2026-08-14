@@ -59,6 +59,22 @@ async function defaultLocationId(tx, branchId, { receiving = false } = {}) {
   throw err
 }
 
+/** Motivos que usan la ubicación de venta de la sucursal (el "TPV"). */
+const SALES_REASONS = new Set(['SALE', 'SALE_RETURN'])
+
+/** Ubicación de venta configurada en la sucursal, si sigue activa. */
+async function salesLocationId(tx, branchId) {
+  const rows = await tx.$queryRaw`
+    SELECT l.id
+    FROM branches b
+    JOIN stock_locations l ON l.id = b.sales_location_id
+    JOIN warehouses w ON w.id = l.warehouse_id
+    WHERE b.id = ${requireBranchId(branchId)}::uuid AND w.active AND l.active
+    LIMIT 1
+  `
+  return rows[0] ? String(rows[0].id) : null
+}
+
 /**
  * Reparte una salida entre las ubicaciones que despachan, por prioridad.
  * Una sola consulta para todos los productos de la operación.
@@ -68,12 +84,16 @@ async function defaultLocationId(tx, branchId, { receiving = false } = {}) {
  *   `pickable` frena las ventas, no el corregir lo que hay.
  * @returns {Promise<Array<{ product_id, location_id, qty }>>} qty NEGATIVA
  */
-async function planDispatch(tx, branchId, entries, { adjust = false } = {}) {
+async function planDispatch(tx, branchId, entries, { adjust = false, preferLocationId = null } = {}) {
   const b = requireBranchId(branchId)
   const ids = entries.map(([id]) => String(id))
   if (ids.length === 0) return []
 
   const onlyPickable = adjust ? Prisma.empty : Prisma.sql`AND l.pickable`
+  // La ubicación del punto de venta va primero; si no alcanza, sigue el resto.
+  const order = preferLocationId
+    ? Prisma.sql`CASE WHEN l.id = ${preferLocationId}::uuid THEN 0 ELSE 1 END, ${DISPATCH_ORDER}`
+    : DISPATCH_ORDER
   const rows = await tx.$queryRaw`
     SELECT psl.product_id, psl.location_id, psl.stock
     FROM product_stock_locations psl
@@ -82,7 +102,7 @@ async function planDispatch(tx, branchId, entries, { adjust = false } = {}) {
     WHERE w.branch_id = ${b}::uuid AND w.active AND l.active ${onlyPickable}
       AND psl.stock > 0
       AND psl.product_id IN (${Prisma.join(ids.map((id) => Prisma.sql`${id}::uuid`))})
-    ORDER BY ${DISPATCH_ORDER}
+    ORDER BY ${order}
   `
   const byProduct = new Map()
   for (const row of rows) {
@@ -202,15 +222,18 @@ async function applyLocationDeltas(tx, deltas, ctx = {}) {
  */
 async function applyBranchDelta(tx, entries, branchId, sign, ctx = {}) {
   const b = requireBranchId(branchId)
+  // Lo que se vende sale de la ubicación del punto de venta, y lo devuelto
+  // vuelve ahí: el mostrador no despacha desde la bodega que más tenga.
+  const pos = !ctx.locationId && SALES_REASONS.has(ctx.reason) ? await salesLocationId(tx, b) : null
   let deltas
   if (sign < 0) {
     // Con ubicación explícita (ajuste de una ubicación concreta) sale de ahí y
     // de ningún otro lado; si no alcanza, applyLocationDeltas lo rechaza.
     deltas = ctx.locationId
       ? entries.map(([id, qty]) => ({ product_id: String(id), location_id: ctx.locationId, qty: -Number(qty) }))
-      : await planDispatch(tx, b, entries, { adjust: ctx.adjust })
+      : await planDispatch(tx, b, entries, { adjust: ctx.adjust, preferLocationId: pos })
   } else {
-    const locationId = ctx.locationId || (await defaultLocationId(tx, b, { receiving: true }))
+    const locationId = ctx.locationId || pos || (await defaultLocationId(tx, b, { receiving: true }))
     deltas = entries.map(([id, qty]) => ({
       product_id: String(id),
       location_id: locationId,

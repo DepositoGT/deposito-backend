@@ -292,6 +292,33 @@ async function main() {
   assert(libro.body[0].reason === 'MANUAL_ADJUST' && libro.body[0].notes === 'Botella quebrada',
     'el libro conserva el motivo y la nota del ajuste')
 
+  console.log('\n== 11. El punto de venta despacha de su ubicación, no de la que más tenga ==')
+  // Hoy SALA-01 tiene prioridad sobre GENERAL: si la venta sale de GENERAL es
+  // porque mandó la ubicación del punto de venta y no la prioridad.
+  const marcada = await callController(warehouses.setSalesLocation, { ...req10, params: { locationId: generalId } })
+  assert(marcada.body.sales_location_id === generalId, 'la sucursal quedó vendiendo desde GENERAL')
+
+  await prisma.$transaction((tx) => deductStockMap(tx, new Map([[vino.id, 2]]), suc.id, { reason: 'SALE' }))
+  const trasPos = await stockByLocation(suc.id, vino.id)
+  assert(trasPos.GENERAL === 4 && trasPos['SALA-01'] === 1,
+    'la venta salió del mostrador (6 → 4) y no tocó la ubicación prioritaria')
+
+  await prisma.$transaction((tx) => restoreStockMap(tx, new Map([[vino.id, 1]]), suc.id, { reason: 'SALE_RETURN' }))
+  assert((await stockByLocation(suc.id, vino.id)).GENERAL === 5, 'y la devolución vuelve al mismo mostrador')
+
+  // Si al mostrador no le alcanza, la venta sigue en vez de trabarse.
+  await prisma.$transaction((tx) => deductStockMap(tx, new Map([[vino.id, 6]]), suc.id, { reason: 'SALE' }))
+  const conDesborde = await stockByLocation(suc.id, vino.id)
+  assert(conDesborde.GENERAL === 0 && conDesborde['SALA-01'] === 0,
+    'agotado el mostrador, el resto salió de las demás ubicaciones')
+
+  const listado = await callController(warehouses.list, req10)
+  const generalRow = listado.body.flatMap((w) => w.locations).find((l) => l.id === generalId)
+  assert(generalRow.is_sales === true, 'el listado dice cuál ubicación es la del punto de venta')
+
+  const desmarcada = await callController(warehouses.setSalesLocation, { ...req10, params: { locationId: generalId } })
+  assert(desmarcada.body.sales_location_id === null, 'volver a marcarla deja la sucursal sin ubicación de venta fija')
+
   console.log('\nTODAS LAS PRUEBAS PASARON')
 }
 

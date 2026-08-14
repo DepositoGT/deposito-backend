@@ -19,6 +19,7 @@ const canManage = hasPermission('warehouses.manage')
 router.get('/', Auth, canView, Warehouses.list)
 router.post('/', Auth, canManage, Warehouses.create)
 // Las rutas de ubicación van antes de /:id para que "locations" no se lea como un id.
+router.put('/locations/:locationId/sales', Auth, canManage, Warehouses.setSalesLocation)
 router.patch('/locations/:locationId', Auth, canManage, Warehouses.updateLocation)
 router.delete('/locations/:locationId', Auth, canManage, Warehouses.removeLocation)
 router.post('/:id/locations', Auth, canManage, Warehouses.createLocation)

@@ -58,12 +58,36 @@ async function unitsIn(where) {
 // GET /api/warehouses
 exports.list = async (req, res, next) => {
   try {
-    const rows = await prisma.warehouse.findMany({
-      where: { branch_id: requireBranch(req) },
-      include: WAREHOUSE_INCLUDE,
-      orderBy: [{ dispatch_priority: 'asc' }, { name: 'asc' }],
-    })
+    const branchId = requireBranch(req)
+    const [rows, branch] = await Promise.all([
+      prisma.warehouse.findMany({
+        where: { branch_id: branchId },
+        include: WAREHOUSE_INCLUDE,
+        orderBy: [{ dispatch_priority: 'asc' }, { name: 'asc' }],
+      }),
+      prisma.branch.findUnique({ where: { id: branchId }, select: { sales_location_id: true } }),
+    ])
+    // Marca de dónde despacha el punto de venta, para no exponer otra ruta.
+    for (const w of rows) {
+      for (const l of w.locations) l.is_sales = l.id === branch?.sales_location_id
+    }
     res.json(rows)
+  } catch (e) { next(e) }
+}
+
+// PUT /api/warehouses/locations/:locationId/sales — alterna la ubicación desde
+// la que vende esta sucursal. Volver a marcarla la deja sin ubicación fija.
+exports.setSalesLocation = async (req, res, next) => {
+  try {
+    const branchId = requireBranch(req)
+    const { locationId } = req.params
+    const location = await ownLocation(req, locationId)
+    if (!location) return res.status(404).json({ message: 'Ubicación no encontrada' })
+
+    const current = await prisma.branch.findUnique({ where: { id: branchId }, select: { sales_location_id: true } })
+    const next_ = current?.sales_location_id === locationId ? null : locationId
+    await prisma.branch.update({ where: { id: branchId }, data: { sales_location_id: next_ } })
+    res.json({ sales_location_id: next_ })
   } catch (e) { next(e) }
 }
 

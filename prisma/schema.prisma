@@ -68,18 +68,23 @@ model UserCompany {
 /// Sucursal. Toda entidad transaccional lleva branch_id; la empresa se deriva
 /// de la sucursal.
 model Branch {
-  id         String   @id @default(uuid()) @db.Uuid
-  company_id String   @db.Uuid
-  company    Company  @relation(fields: [company_id], references: [id], onDelete: Restrict)
-  name       String   @db.VarChar(150)
+  id                String         @id @default(uuid()) @db.Uuid
+  company_id        String         @db.Uuid
+  company           Company        @relation(fields: [company_id], references: [id], onDelete: Restrict)
+  name              String         @db.VarChar(150)
   /// Código corto para referencias de documentos: "SUC1"
-  code       String   @db.VarChar(10)
+  code              String         @db.VarChar(10)
   /// Secuencia global estable para derivar advisory lock keys de numeración
-  seq        Int      @unique @default(autoincrement())
-  address    String?  @db.Text
-  phone      String?  @db.VarChar(50)
-  active     Boolean  @default(true)
-  is_default Boolean  @default(false)
+  seq               Int            @unique @default(autoincrement())
+  address           String?        @db.Text
+  phone             String?        @db.VarChar(50)
+  active            Boolean        @default(true)
+  is_default        Boolean        @default(false)
+  /// Ubicación de la que despacha el punto de venta de esta sucursal. Si es
+  /// null, la venta sale por prioridad de despacho como cualquier otra salida.
+  sales_location_id String?        @db.Uuid
+  sales_location    StockLocation? @relation("BranchSalesLocation", fields: [sales_location_id], references: [id], onDelete: SetNull)
+
   created_at DateTime @default(now())
   updated_at DateTime @updatedAt
 
@@ -183,9 +188,11 @@ model StockLocation {
   dispatch_priority Int       @default(100)
   active            Boolean   @default(true)
 
-  stocks     ProductStockLocation[]
-  movements  StockMovement[]
-  created_at DateTime               @default(now())
+  stocks         ProductStockLocation[]
+  movements      StockMovement[]
+  /// Sucursales que venden desde aquí (su punto de venta despacha de esta ubicación).
+  sales_branches Branch[]               @relation("BranchSalesLocation")
+  created_at     DateTime               @default(now())
 
   @@unique([warehouse_id, code])
   @@index([warehouse_id, active])
