@@ -1049,7 +1049,16 @@ async function inventoryReport(req,res,next){
     const logoBuffer = branding.logoBuffer
     const money = makeMoney(branding.currency_code)
     const { format='pdf' } = req.query
-    const products = await prisma.product.findMany({ where:{ deleted_at: null, company_id: req.companyId }, include:{ category:true } })
+    // Solo lo que se maneja en el alcance: el catálogo es de la empresa, pero el
+    // reporte de inventario es de sucursal(es) y no debe listar productos ajenos.
+    const products = await prisma.product.findMany({
+      where: {
+        deleted_at: null,
+        company_id: req.companyId,
+        branch_stocks: { some: { branch_id: { in: scopeBranchIds(req) } } },
+      },
+      include:{ category:true },
+    })
     await overlayReportBranchStock(products, req)
     const scope = await reportScope(req)
     const byBranch = await stockByBranch(req, scope)

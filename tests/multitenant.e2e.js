@@ -599,6 +599,30 @@ async function main() {
   const sinHeaders = await resolver({})
   assert(sinHeaders.req.branchId === acmeCentro.id, 'sin headers se usa la sucursal por defecto')
 
+  // 15. El reporte de inventario es del alcance pedido, no del catálogo entero.
+  console.log('\n--- 15. Reporte de inventario por sucursal ---')
+  const { inventoryReport } = require('../src/controllers/reports.controller')
+  const csvReporte = (req) => new Promise((resolve, reject) => {
+    const res = { setHeader() {}, status() { return res }, send: resolve, json: resolve }
+    Promise.resolve(inventoryReport(req, res, reject)).catch(reject)
+  })
+
+  const csvCentro = await csvReporte({
+    companyId: acme.id, branchId: acmeCentro.id, query: { format: 'csv' },
+  })
+  assert(csvCentro.includes('Solo Centro'), 'Centro sí lista el producto que maneja')
+
+  const csvNorte = await csvReporte({
+    companyId: acme.id, branchId: acmeNorte.id, query: { format: 'csv' },
+  })
+  assert(!csvNorte.includes('Solo Centro'), 'Norte no lista un producto que no maneja')
+
+  const csvTodas = await csvReporte({
+    companyId: acme.id, branchId: null, branchIds: [acmeCentro.id, acmeNorte.id], query: { format: 'csv' },
+  })
+  assert(csvTodas.includes('Solo Centro') && csvTodas.includes('Inventario por Sucursal'),
+    'el consolidado lo incluye y desglosa por sucursal')
+
   console.log('\nTODAS LAS PRUEBAS PASARON')
 }
 
