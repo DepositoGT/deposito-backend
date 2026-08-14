@@ -27,6 +27,8 @@ router.use('/branches', require('./branches.routes'))
 router.use('/transfers', require('./transfers.routes'))
 // Almacenes y ubicaciones dentro de la sucursal
 router.use('/warehouses', require('./warehouses.routes'))
+// Movimientos internos, ajustes y kardex por ubicación
+router.use('/stock', require('./stock.routes'))
 
 // Mount products routes
 router.use('/products', require('./products.routes'))

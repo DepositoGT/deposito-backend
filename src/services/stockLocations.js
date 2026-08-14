@@ -204,7 +204,11 @@ async function applyBranchDelta(tx, entries, branchId, sign, ctx = {}) {
   const b = requireBranchId(branchId)
   let deltas
   if (sign < 0) {
-    deltas = await planDispatch(tx, b, entries, { adjust: ctx.adjust })
+    // Con ubicación explícita (ajuste de una ubicación concreta) sale de ahí y
+    // de ningún otro lado; si no alcanza, applyLocationDeltas lo rechaza.
+    deltas = ctx.locationId
+      ? entries.map(([id, qty]) => ({ product_id: String(id), location_id: ctx.locationId, qty: -Number(qty) }))
+      : await planDispatch(tx, b, entries, { adjust: ctx.adjust })
   } else {
     const locationId = ctx.locationId || (await defaultLocationId(tx, b, { receiving: true }))
     deltas = entries.map(([id, qty]) => ({
@@ -214,6 +218,69 @@ async function applyBranchDelta(tx, entries, branchId, sign, ctx = {}) {
     }))
   }
   return applyLocationDeltas(tx, deltas, { ...ctx, branchId: b })
+}
+
+/**
+ * Movimiento interno entre dos ubicaciones de la MISMA sucursal, en un solo
+ * paso: mover de un anaquel a otro es instantáneo, no hay tránsito que bloquear.
+ * No toca product_stocks ni products.stock — el total de la sucursal es idéntico.
+ * @param {Array<{ product_id, qty }>} lines
+ * @returns {Promise<string>} group_id que agrupa las líneas del movimiento
+ */
+async function moveBetweenLocations(tx, { branchId, fromLocationId, toLocationId, lines, userId, notes }) {
+  const b = requireBranchId(branchId)
+  if (!fromLocationId || !toLocationId) {
+    const err = new Error('Origen y destino son obligatorios'); err.status = 400; throw err
+  }
+  if (String(fromLocationId) === String(toLocationId)) {
+    const err = new Error('El origen y el destino son la misma ubicación'); err.status = 400; throw err
+  }
+
+  const rows = (lines || [])
+    .map((l) => ({ product_id: String(l.product_id || ''), qty: Math.floor(Number(l.qty || 0)) }))
+    .filter((l) => l.product_id && l.qty > 0)
+  if (rows.length === 0) {
+    const err = new Error('Indica al menos un producto con cantidad mayor a 0'); err.status = 400; throw err
+  }
+
+  // Ambas ubicaciones tienen que ser de esta sucursal y estar activas.
+  const valid = await tx.$queryRaw`
+    SELECT l.id FROM stock_locations l
+    JOIN warehouses w ON w.id = l.warehouse_id
+    WHERE w.branch_id = ${b}::uuid AND w.active AND l.active
+      AND l.id IN (${String(fromLocationId)}::uuid, ${String(toLocationId)}::uuid)
+  `
+  if (valid.length !== 2) {
+    const err = new Error('Origen o destino no pertenecen a esta sucursal (o están inactivos)')
+    err.status = 403
+    throw err
+  }
+
+  // Se valida antes para poder decir qué falta y cuánto hay, no solo "negativo".
+  const have = await tx.productStockLocation.findMany({
+    where: { location_id: String(fromLocationId), product_id: { in: rows.map((r) => r.product_id) } },
+    select: { product_id: true, stock: true, product: { select: { name: true } } },
+  })
+  const byProduct = new Map(have.map((h) => [String(h.product_id), h]))
+  for (const line of rows) {
+    const current = Number(byProduct.get(line.product_id)?.stock || 0)
+    if (line.qty > current) {
+      const name = byProduct.get(line.product_id)?.product?.name || line.product_id
+      const err = new Error(`En el origen solo hay ${current} de ${name}, y se piden ${line.qty}`)
+      err.status = 400
+      throw err
+    }
+  }
+
+  const groupId = require('crypto').randomUUID()
+  const deltas = rows.flatMap((l) => [
+    { product_id: l.product_id, location_id: String(fromLocationId), qty: -l.qty },
+    { product_id: l.product_id, location_id: String(toLocationId), qty: l.qty },
+  ])
+  await applyLocationDeltas(tx, deltas, {
+    branchId: b, reason: 'INTERNAL_MOVE', refType: 'internal_move', groupId, userId, notes,
+  })
+  return groupId
 }
 
 /** Existencias del producto en la sucursal, sumando sus ubicaciones. */
@@ -246,6 +313,7 @@ module.exports = {
   planDispatch,
   applyLocationDeltas,
   applyBranchDelta,
+  moveBetweenLocations,
   branchLocationStock,
   clearBranchLocations,
 }

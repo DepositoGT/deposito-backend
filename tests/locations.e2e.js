@@ -230,6 +230,68 @@ async function main() {
   })
   assert(limpio.body?.ok === true, 'uno vacío y sin historial sí se borra')
 
+  console.log('\n== 10. Movimientos internos y ajustes ==')
+  const stockMoves = require('../src/controllers/stockMoves.controller')
+  const vino = await prisma.product.create({
+    data: {
+      name: 'Vino', company_id: co.id, category_id: cat.id, supplier_id: sup.id,
+      status_id: stockStatus.id, price: 80, cost: 40, stock: 0, min_stock: 1,
+    },
+  })
+  await prisma.$transaction((tx) => restoreStockMap(tx, new Map([[vino.id, 10]]), suc.id, { reason: 'PURCHASE' }))
+
+  const req10 = { companyId: co.id, branchId: suc.id, user: { sub: user.id } }
+  const movido = await callController(stockMoves.createMove, {
+    ...req10,
+    body: { from_location_id: generalId, to_location_id: salaLoc.id, lines: [{ product_id: vino.id, qty: 4 }] },
+  })
+  assert(movido.status === 201 && movido.body.movements.length === 2,
+    'el movimiento interno deja una salida y una entrada con el mismo grupo')
+  const trasInterno = await stockByLocation(suc.id, vino.id)
+  assert(trasInterno.GENERAL === 6 && trasInterno['SALA-01'] === 4, 'la mercancía cambió de ubicación')
+  const totalSuc = await prisma.productStock.findUnique({
+    where: { product_id_branch_id: { product_id: vino.id, branch_id: suc.id } },
+  })
+  assert(totalSuc.stock === 10, 'y el total de la sucursal no se movió')
+
+  let sinExistencias = null
+  try {
+    await callController(stockMoves.createMove, {
+      ...req10,
+      body: { from_location_id: salaLoc.id, to_location_id: generalId, lines: [{ product_id: vino.id, qty: 99 }] },
+    })
+  } catch (e) { sinExistencias = e }
+  assert(sinExistencias?.status === 400, 'no se puede mover más de lo que hay en el origen')
+
+  let ajena = null
+  try {
+    await callController(stockMoves.createMove, {
+      ...req10,
+      body: {
+        from_location_id: generalId, to_location_id: enAnexo.body.locations[0].id,
+        lines: [{ product_id: vino.id, qty: 1 }],
+      },
+    })
+  } catch (e) { ajena = e }
+  assert(ajena?.status === 403, 'ni mover mercancía a una ubicación de otra sucursal')
+
+  const ajuste = await callController(stockMoves.createAdjustment, {
+    ...req10,
+    body: { location_id: salaLoc.id, lines: [{ product_id: vino.id, qty: -3 }], notes: 'Botella quebrada' },
+  })
+  assert(ajuste.status === 201, 'el ajuste por merma se aplica')
+  const trasAjuste = await stockByLocation(suc.id, vino.id)
+  const [sucAjuste, empresaAjuste] = await Promise.all([
+    prisma.productStock.findUnique({ where: { product_id_branch_id: { product_id: vino.id, branch_id: suc.id } } }),
+    prisma.product.findUnique({ where: { id: vino.id }, select: { stock: true } }),
+  ])
+  assert(trasAjuste['SALA-01'] === 1, 'la merma salió de la ubicación indicada, no de otra')
+  assert(sucAjuste.stock === 7 && empresaAjuste.stock === 7, 'y los tres niveles bajaron juntos (10 → 7)')
+
+  const libro = await callController(stockMoves.list, { ...req10, query: { product_id: vino.id } })
+  assert(libro.body[0].reason === 'MANUAL_ADJUST' && libro.body[0].notes === 'Botella quebrada',
+    'el libro conserva el motivo y la nota del ajuste')
+
   console.log('\nTODAS LAS PRUEBAS PASARON')
 }
 
