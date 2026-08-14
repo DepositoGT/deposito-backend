@@ -2219,7 +2219,7 @@ async function inventoryCountSessionReport(req, res, next) {
 
     const lines = await prisma.inventoryCountLine.findMany({
       where: { session_id: id },
-      orderBy: { product: { name: 'asc' } },
+      orderBy: [{ location: { code: 'asc' } }, { product: { name: 'asc' } }],
       include: {
         product: {
           select: {
@@ -2229,6 +2229,7 @@ async function inventoryCountSessionReport(req, res, next) {
             category: { select: { name: true } },
           },
         },
+        location: { select: { code: true, warehouse: { select: { name: true } } } },
       },
     })
 
@@ -2247,6 +2248,7 @@ async function inventoryCountSessionReport(req, res, next) {
         return [
           L.product.name,
           L.product.barcode || '—',
+          `${L.location.warehouse.name} · ${L.location.code}`,
           L.product.category?.name || '—',
           L.stock_snapshot,
           L.qty_counted ?? '—',
@@ -2279,7 +2281,7 @@ async function inventoryCountSessionReport(req, res, next) {
         [
           {
             title: 'Líneas',
-            columns: ['Producto', 'Código', 'Categoría', 'Teórico', 'Contado', '2.ª lectura', 'Diferencia', 'Valor diff.', 'Nota'],
+            columns: ['Producto', 'Código', 'Ubicación', 'Categoría', 'Teórico', 'Contado', '2.ª lectura', 'Diferencia', 'Valor diff.', 'Nota'],
             rows,
           },
         ]
@@ -2331,7 +2333,8 @@ async function inventoryCountSessionReport(req, res, next) {
       return [
         String(L.product.name).slice(0, 22),
         L.product.barcode || '—',
-        String(L.product.category?.name || '—').slice(0, 10),
+        // En un conteo físico importa más dónde está que de qué categoría es.
+        String(L.location.code).slice(0, 10),
         L.stock_snapshot,
         L.qty_counted ?? '—',
         L.qty_counted_secondary ?? '—',
@@ -2343,7 +2346,7 @@ async function inventoryCountSessionReport(req, res, next) {
     sectionTitle(doc, 'Detalle de líneas')
     drawTable(
       doc,
-      ['Producto', 'Cód.', 'Cat.', 'Teór.', 'C1', 'C2', 'Diff.', 'Valor'],
+      ['Producto', 'Cód.', 'Ubic.', 'Teór.', 'C1', 'C2', 'Diff.', 'Valor'],
       tableRows.slice(0, 100),
       [102, 54, 48, 30, 28, 28, 28, 48],
       {
