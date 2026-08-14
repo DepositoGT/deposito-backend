@@ -25,6 +25,8 @@ router.use('/companies', require('./companies.routes'))
 router.use('/branches', require('./branches.routes'))
 // Traslados de mercancía entre sucursales
 router.use('/transfers', require('./transfers.routes'))
+// Almacenes y ubicaciones dentro de la sucursal
+router.use('/warehouses', require('./warehouses.routes'))
 
 // Mount products routes
 router.use('/products', require('./products.routes'))

@@ -109,6 +109,11 @@ async function main() {
     { code: 'transfers.create', name: 'Crear traslados', description: 'Puede enviar mercancía a otra sucursal' },
     { code: 'transfers.receive', name: 'Recibir traslados', description: 'Puede confirmar la recepción de traslados' },
     { code: 'transfers.cancel', name: 'Cancelar traslados', description: 'Puede cancelar traslados en tránsito' },
+    { code: 'warehouses.view', name: 'Ver almacenes', description: 'Puede ver almacenes y ubicaciones' },
+    { code: 'warehouses.manage', name: 'Gestionar almacenes', description: 'Puede crear y editar almacenes y ubicaciones' },
+    { code: 'stock_moves.view', name: 'Ver movimientos', description: 'Puede ver movimientos internos y kardex' },
+    { code: 'stock_moves.create', name: 'Mover mercancía', description: 'Puede mover mercancía entre ubicaciones' },
+    { code: 'stock_moves.adjust', name: 'Ajustar existencias', description: 'Puede corregir existencias sin documento (merma, daño)' },
 
     // Productos e inventario
     { code: 'products.view', name: 'Ver productos', description: 'Puede ver el catálogo de productos' },

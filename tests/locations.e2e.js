@@ -183,6 +183,53 @@ async function main() {
   const quedan = await stockByLocation(suc.id, ron.id)
   assert(Object.keys(quedan).length === 0, 'y sus filas de ubicación se fueron con él')
 
+  console.log('\n== 9. CRUD de almacenes, siempre dentro de la sucursal ==')
+  const warehouses = require('../src/controllers/warehouses.controller')
+  const otraSuc = await prisma.branch.create({ data: { company_id: co.id, name: 'Anexo', code: 'ANX' } })
+
+  const nuevo = await callController(warehouses.create, {
+    body: { name: 'Vitrina', code: 'vit', kind: 'VITRINA', dispatch_priority: 1 },
+    companyId: co.id, branchId: suc.id, user: { sub: user.id },
+  })
+  assert(nuevo.status === 201 && nuevo.body.code === 'VIT', 'el código del almacén se guarda en mayúsculas')
+  assert(nuevo.body.is_default === false, 'no se roba el predeterminado, ya había uno')
+  assert(nuevo.body.locations.length === 1, 'nace con su ubicación GENERAL: nunca hay un almacén sin dónde guardar')
+
+  const repetido = await callController(warehouses.create, {
+    body: { name: 'Otra vitrina', code: 'VIT' }, companyId: co.id, branchId: suc.id, user: { sub: user.id },
+  })
+  assert(repetido.status === 409, 'dos almacenes de la sucursal no comparten código')
+
+  const enAnexo = await callController(warehouses.create, {
+    body: { name: 'Vitrina', code: 'VIT' }, companyId: co.id, branchId: otraSuc.id, user: { sub: user.id },
+  })
+  assert(enAnexo.status === 201, 'pero otra sucursal sí puede reusar el mismo código')
+
+  const desdeSuc = await callController(warehouses.list, { companyId: co.id, branchId: suc.id, user: { sub: user.id } })
+  assert(!desdeSuc.body.some((w) => w.id === enAnexo.body.id), 'el almacén del Anexo no se ve desde Central')
+
+  const ajeno = await callController(warehouses.update, {
+    params: { id: enAnexo.body.id }, body: { name: 'Robada' },
+    companyId: co.id, branchId: suc.id, user: { sub: user.id },
+  })
+  assert(ajeno.status === 404, 'y tampoco se puede editar desde otra sucursal')
+
+  const principal = desdeSuc.body.find((w) => w.is_default)
+  const borrarPrincipal = await callController(warehouses.remove, {
+    params: { id: principal.id }, companyId: co.id, branchId: suc.id, user: { sub: user.id },
+  })
+  assert(borrarPrincipal.status === 400, 'el almacén predeterminado no se borra')
+
+  const conHistorial = await callController(warehouses.remove, {
+    params: { id: sala.id }, companyId: co.id, branchId: suc.id, user: { sub: user.id },
+  })
+  assert(conHistorial.status === 400, 'un almacén con movimientos se desactiva, no se borra')
+
+  const limpio = await callController(warehouses.remove, {
+    params: { id: nuevo.body.id }, companyId: co.id, branchId: suc.id, user: { sub: user.id },
+  })
+  assert(limpio.body?.ok === true, 'uno vacío y sin historial sí se borra')
+
   console.log('\nTODAS LAS PRUEBAS PASARON')
 }
 
