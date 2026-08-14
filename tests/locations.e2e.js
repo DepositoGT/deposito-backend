@@ -319,6 +319,73 @@ async function main() {
   const desmarcada = await callController(warehouses.setSalesLocation, { ...req10, params: { locationId: generalId } })
   assert(desmarcada.body.sales_location_id === null, 'volver a marcarla deja la sucursal sin ubicación de venta fija')
 
+  console.log('\n== 12. El conteo físico se hace y se aplica ubicación por ubicación ==')
+  const counts = require('../src/controllers/inventoryCounts.controller')
+  // Whisky solo en dos ubicaciones de la sucursal: 6 en GENERAL y 2 en SALA-01.
+  const whisky = await prisma.product.create({
+    data: {
+      name: 'Whisky', company_id: co.id, category_id: cat.id, supplier_id: sup.id,
+      status_id: stockStatus.id, price: 200, cost: 120, stock: 0, min_stock: 1,
+    },
+  })
+  await prisma.$transaction((tx) => restoreStockMap(tx, new Map([[whisky.id, 8]]), suc.id, { reason: 'PURCHASE' }))
+  await callController(stockMoves.createMove, {
+    ...req10,
+    body: { from_location_id: generalId, to_location_id: salaLoc.id, lines: [{ product_id: whisky.id, qty: 2 }] },
+  })
+
+  const sesion = await callController(counts.create, {
+    ...req10, body: { name: 'Conteo por ubicación', scope: { categoryIds: [cat.id] } },
+  })
+  assert(sesion.status === 201, 'la sesión de conteo se crea')
+  const iniciada = await callController(counts.start, { ...req10, params: { id: sesion.body.id } })
+  assert(iniciada.status === 200, 'y se inicia generando sus líneas')
+
+  const lineas = await callController(counts.listLines, {
+    ...req10, params: { id: sesion.body.id }, query: { limit: 200 },
+  })
+  const delWhisky = lineas.body.data.filter((L) => L.product.id === whisky.id)
+  assert(delWhisky.length === 2, 'el whisky se cuenta dos veces: una por ubicación donde está')
+  const enGeneral = delWhisky.find((L) => L.location.id === generalId)
+  const enSala = delWhisky.find((L) => L.location.id === salaLoc.id)
+  assert(enGeneral.stock_snapshot === 6 && enSala.stock_snapshot === 2,
+    'y cada línea trae la existencia de SU ubicación (6 y 2)')
+
+  const porUbicacion = await callController(counts.listLines, {
+    ...req10, params: { id: sesion.body.id }, query: { location_id: salaLoc.id, limit: 200 },
+  })
+  assert(porUbicacion.body.data.every((L) => L.location.id === salaLoc.id),
+    'el listado se puede acotar a la ubicación que se está contando')
+
+  // Faltan 2 en la bodega y aparecen 2 en la sala: la sucursal no cambia.
+  // El resto de líneas se cuentan tal cual, que enviar exige contarlas todas.
+  for (const L of lineas.body.data) {
+    const qty = L.product.id === whisky.id ? 4 : L.stock_snapshot
+    await callController(counts.updateLine, {
+      ...req10, params: { id: sesion.body.id, lineId: L.id }, body: { qty_counted: qty },
+    })
+  }
+  await callController(counts.submit, {
+    ...req10, params: { id: sesion.body.id }, body: { reason: 'Conteo mensual' },
+  })
+  const aprobado = await callController(counts.approve, {
+    ...req10, params: { id: sesion.body.id }, body: { reason: 'Revisado y correcto' },
+  })
+  assert(aprobado.status === 200, 'el conteo se aprueba y se aplica')
+
+  const trasConteo = await stockByLocation(suc.id, whisky.id)
+  assert(trasConteo.GENERAL === 4 && trasConteo['SALA-01'] === 4,
+    'cada ubicación quedó con lo que se contó ahí (4 y 4)')
+  const [sucConteo, empresaConteo] = await Promise.all([
+    prisma.productStock.findUnique({ where: { product_id_branch_id: { product_id: whisky.id, branch_id: suc.id } } }),
+    prisma.product.findUnique({ where: { id: whisky.id }, select: { stock: true } }),
+  ])
+  assert(sucConteo.stock === 8 && empresaConteo.stock === 8,
+    'lo que faltó en un anaquel y sobró en otro dejó el total de la sucursal igual (8)')
+
+  const kardex = await callController(stockMoves.list, { ...req10, query: { product_id: whisky.id, reason: 'COUNT_ADJUST' } })
+  assert(kardex.body.length === 2, 'y el libro anotó el ajuste en las dos ubicaciones')
+
   console.log('\nTODAS LAS PRUEBAS PASARON')
 }
 

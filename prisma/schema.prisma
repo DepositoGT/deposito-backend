@@ -165,9 +165,10 @@ model Warehouse {
   active            Boolean       @default(true)
   notes             String?       @db.Text
 
-  locations  StockLocation[]
-  created_at DateTime        @default(now())
-  updated_at DateTime        @updatedAt
+  locations      StockLocation[]
+  count_sessions InventoryCountSession[]
+  created_at     DateTime                @default(now())
+  updated_at     DateTime                @updatedAt
 
   @@unique([branch_id, code])
   @@index([branch_id, active])
@@ -190,6 +191,7 @@ model StockLocation {
 
   stocks         ProductStockLocation[]
   movements      StockMovement[]
+  count_lines    InventoryCountLine[]
   /// Sucursales que venden desde aquí (su punto de venta despacha de esta ubicación).
   sales_branches Branch[]               @relation("BranchSalesLocation")
   created_at     DateTime               @default(now())
@@ -1427,6 +1429,9 @@ model InventoryCountSession {
   id                    String                      @id @default(uuid()) @db.Uuid
   branch_id             String                      @db.Uuid
   branch                Branch                      @relation(fields: [branch_id], references: [id], onDelete: Restrict)
+  /// Acota el conteo a un almacén. Sin él, la sesión cubre toda la sucursal.
+  warehouse_id          String?                     @db.Uuid
+  warehouse             Warehouse?                  @relation(fields: [warehouse_id], references: [id], onDelete: SetNull)
   name                  String?                     @db.VarChar(200)
   status                InventoryCountSessionStatus @default(DRAFT)
   /// Alcance y opciones: categoryIds?, supplierIds?, abcClasses? (A|B|C por valor en bodega),
@@ -1469,6 +1474,9 @@ model InventoryCountLine {
   session                 InventoryCountSession @relation(fields: [session_id], references: [id], onDelete: Cascade)
   product_id              String                @db.Uuid
   product                 Product               @relation(fields: [product_id], references: [id])
+  /// Se cuenta ubicación por ubicación: un producto en dos anaqueles son dos líneas.
+  location_id             String                @db.Uuid
+  location                StockLocation         @relation(fields: [location_id], references: [id], onDelete: Restrict)
   stock_snapshot          Int
   qty_counted             Int?
   counted_at              DateTime?
@@ -1480,7 +1488,7 @@ model InventoryCountLine {
   countedSecondaryBy      User?                 @relation("InventoryCountLineSecondaryCountedBy", fields: [counted_secondary_by_id], references: [id])
   note                    String?               @db.VarChar(500)
 
-  @@unique([session_id, product_id])
+  @@unique([session_id, product_id, location_id])
   @@index([session_id])
   @@index([product_id])
   @@map("inventory_count_lines")
