@@ -99,6 +99,8 @@ model Branch {
   transfers_in             StockTransfer[]         @relation("TransferToBranch")
   journal_entries          JournalEntry[]
   promotions               PromotionBranch[]
+  warehouses               Warehouse[]
+  stock_movements          StockMovement[]
 
   @@unique([company_id, code])
   @@map("branches")
@@ -131,6 +133,129 @@ model ProductStock {
   @@unique([product_id, branch_id])
   @@index([branch_id])
   @@map("product_stocks")
+}
+
+enum WarehouseKind {
+  BODEGA
+  SALA_VENTAS
+  VITRINA
+  TRANSITO
+  OTRO
+}
+
+/// Espacio físico dentro de una sucursal: bodega, sala de ventas, vitrina, tránsito.
+model Warehouse {
+  id                String        @id @default(uuid()) @db.Uuid
+  branch_id         String        @db.Uuid
+  branch            Branch        @relation(fields: [branch_id], references: [id], onDelete: Restrict)
+  name              String        @db.VarChar(120)
+  code              String        @db.VarChar(20)
+  kind              WarehouseKind @default(BODEGA)
+  /// Almacén al que caen las operaciones que no eligen uno (ventas, ingresos, devoluciones).
+  is_default        Boolean       @default(false)
+  /// Recibe la mercancía de proveedores y de traslados entrantes.
+  is_receiving      Boolean       @default(false)
+  /// Orden en que se descuenta al vender: menor primero.
+  dispatch_priority Int           @default(100)
+  active            Boolean       @default(true)
+  notes             String?       @db.Text
+
+  locations  StockLocation[]
+  created_at DateTime        @default(now())
+  updated_at DateTime        @updatedAt
+
+  @@unique([branch_id, code])
+  @@index([branch_id, active])
+  @@map("warehouses")
+}
+
+/// Posición dentro del almacén. Si no se quiere ese detalle, basta la ubicación
+/// por defecto, que siempre existe.
+model StockLocation {
+  id                String    @id @default(uuid()) @db.Uuid
+  warehouse_id      String    @db.Uuid
+  warehouse         Warehouse @relation(fields: [warehouse_id], references: [id], onDelete: Restrict)
+  code              String    @db.VarChar(30)
+  name              String?   @db.VarChar(120)
+  is_default        Boolean   @default(false)
+  /// Si es false no se despacha desde aquí (cuarentena, producto dañado).
+  pickable          Boolean   @default(true)
+  dispatch_priority Int       @default(100)
+  active            Boolean   @default(true)
+
+  stocks     ProductStockLocation[]
+  movements  StockMovement[]
+  created_at DateTime               @default(now())
+
+  @@unique([warehouse_id, code])
+  @@index([warehouse_id, active])
+  @@map("stock_locations")
+}
+
+/// Existencias por ubicación: la verdad física. `product_stocks` queda como
+/// espejo por sucursal y `products.stock` como espejo de empresa.
+model ProductStockLocation {
+  id          String        @id @default(uuid()) @db.Uuid
+  product_id  String        @db.Uuid
+  product     Product       @relation(fields: [product_id], references: [id], onDelete: Cascade)
+  location_id String        @db.Uuid
+  location    StockLocation @relation(fields: [location_id], references: [id], onDelete: Restrict)
+  stock       Int           @default(0)
+  /// Punto de reposición interno (bodega → sala). No sustituye a
+  /// product_stocks.min_stock, que sigue siendo el mínimo de compra por sucursal.
+  min_stock   Int           @default(0)
+
+  @@unique([product_id, location_id])
+  @@index([location_id])
+  @@map("product_stock_locations")
+}
+
+enum StockMovementReason {
+  INITIAL
+  PURCHASE
+  SALE
+  SALE_RETURN
+  ORDER_FULFILL
+  TRANSFER_OUT
+  TRANSFER_IN
+  TRANSFER_CANCEL
+  INTERNAL_MOVE
+  COUNT_ADJUST
+  MANUAL_ADJUST
+  KIT_ASSEMBLE
+  KIT_DISASSEMBLE
+}
+
+/// Una fila por (producto, ubicación, delta). Append-only: nunca se edita ni se borra.
+model StockMovement {
+  id          String              @id @default(uuid()) @db.Uuid
+  branch_id   String              @db.Uuid
+  branch      Branch              @relation(fields: [branch_id], references: [id], onDelete: Restrict)
+  location_id String              @db.Uuid
+  location    StockLocation       @relation(fields: [location_id], references: [id], onDelete: Restrict)
+  product_id  String              @db.Uuid
+  product     Product             @relation(fields: [product_id], references: [id], onDelete: Restrict)
+  /// Signo incluido: negativo sale, positivo entra.
+  qty         Int
+  /// Existencia de la ubicación DESPUÉS del movimiento (kardex sin recalcular).
+  balance     Int
+  reason      StockMovementReason
+  /// Documento que lo originó: 'sale' | 'transfer' | 'incoming_merchandise' | ...
+  ref_type    String?             @db.VarChar(30)
+  ref_id      String?             @db.Uuid
+  /// Agrupa las líneas de una misma operación.
+  group_id    String?             @db.Uuid
+  notes       String?             @db.VarChar(300)
+  created_by  String?             @db.Uuid
+  createdBy   User?               @relation(fields: [created_by], references: [id], onDelete: SetNull)
+  created_at  DateTime            @default(now())
+
+  @@index([branch_id, created_at(sort: Desc)])
+  @@index([product_id, created_at(sort: Desc)])
+  @@index([location_id, created_at(sort: Desc)])
+  @@index([ref_type, ref_id])
+  @@index([group_id])
+  @@map("stock_movements")
 }
 
 enum StockTransferStatus {
@@ -436,6 +561,8 @@ model Product {
   stock_reservations         StockReservation[]
   lots                       ProductLot[]
   branch_stocks              ProductStock[]
+  location_stocks            ProductStockLocation[]
+  stock_movements            StockMovement[]
   transfer_lines             StockTransferLine[]
 
   @@unique([company_id, barcode])
@@ -555,6 +682,7 @@ model User {
   defaultBranch      Branch?         @relation("UserDefaultBranch", fields: [default_branch_id], references: [id], onDelete: SetNull)
   transfers_created  StockTransfer[] @relation("TransferCreatedBy")
   transfers_received StockTransfer[] @relation("TransferReceivedBy")
+  stock_movements    StockMovement[]
 
   // Campos de empleado
   is_employee Boolean   @default(false)
