@@ -18,7 +18,7 @@ for (const code of ['stock_moves.view', 'warehouses.view', 'products.view']) {
 }
 
 // 3. No inventa permisos: lo que no arrastra nada se queda solo.
-assert.deepStrictEqual(expandPermissions(['reports.view']), ['reports.view'])
+assert.deepStrictEqual(expandPermissions(['analytics.view']), ['analytics.view'])
 
 // 4. Idempotente y sin duplicados.
 const dos = expandPermissions(['products.edit', 'products.edit', 'products.view'])
