@@ -496,6 +496,31 @@ async function main() {
   assert(trasMudanza['NUEVO@SALA-01'] === 1 && trasMudanza['NUEVO@GENERAL'] === 2,
     'y al mover mercancía entre anaqueles el lote se muda con ella')
 
+  console.log('\n== 15. Reposición interna: falta en el anaquel, no en la sucursal ==')
+  // Cerveza quedó con 6 en GENERAL y 1 en SALA-01.
+  const conMinimo = await callController(stockMoves.setLocationMin, {
+    ...req10, body: { product_id: cerveza.id, location_id: salaLoc.id, min_stock: 5 },
+  })
+  assert(conMinimo.body.min_stock === 5, 'el anaquel guarda su mínimo interno')
+
+  const minAjeno = await callController(stockMoves.setLocationMin, {
+    ...req10,
+    body: { product_id: cerveza.id, location_id: enAnexo.body.locations[0].id, min_stock: 5 },
+  })
+  assert(minAjeno.status === 403, 'y no se le pone mínimo a una ubicación de otra sucursal')
+
+  const sugerencias = await callController(stockMoves.replenishment, { ...req10, query: {} })
+  const deCerveza = sugerencias.body.find((r) => r.product_id === cerveza.id)
+  assert(deCerveza && deCerveza.location_id === salaLoc.id && deCerveza.missing === 4,
+    'la sugerencia dice que al anaquel le faltan 4')
+  assert(deCerveza.from_location_id === generalId && deCerveza.suggested_qty === 4,
+    'y de dónde traerlas: de la bodega, que tiene 6')
+
+  const sucCerveza = await prisma.productStock.findUnique({
+    where: { product_id_branch_id: { product_id: cerveza.id, branch_id: suc.id } },
+  })
+  assert(sucCerveza.stock === 7, 'la sucursal no tiene faltante: solo está mal repartido (7 en total)')
+
   console.log('\nTODAS LAS PRUEBAS PASARON')
 }
 

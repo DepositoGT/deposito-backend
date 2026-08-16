@@ -351,6 +351,55 @@ async function moveBetweenLocations(tx, { branchId, fromLocationId, toLocationId
   return groupId
 }
 
+/**
+ * Ubicaciones por debajo de su mínimo interno y de dónde reponerlas. Es otra
+ * cosa que la alerta de compra (`product_stocks.min_stock`): aquí no falta
+ * mercancía en la sucursal, falta en el anaquel. Sin origen sugerido significa
+ * que tampoco hay en otra ubicación — eso sí es asunto del proveedor.
+ */
+async function replenishmentSuggestions(tx, branchId) {
+  const b = requireBranchId(branchId)
+  return tx.$queryRaw`
+    WITH faltantes AS (
+      SELECT psl.product_id, psl.location_id, psl.stock, psl.min_stock,
+             psl.min_stock - psl.stock AS missing
+      FROM product_stock_locations psl
+      JOIN stock_locations l ON l.id = psl.location_id
+      JOIN warehouses w ON w.id = l.warehouse_id
+      WHERE w.branch_id = ${b}::uuid AND w.active AND l.active
+        AND psl.min_stock > 0 AND psl.stock < psl.min_stock
+    ),
+    origen AS (
+      SELECT DISTINCT ON (f.product_id, f.location_id)
+             f.product_id, f.location_id,
+             o.location_id AS from_location_id, o.stock AS from_stock
+      FROM faltantes f
+      JOIN product_stock_locations o
+        ON o.product_id = f.product_id AND o.location_id <> f.location_id AND o.stock > 0
+      JOIN stock_locations lo ON lo.id = o.location_id
+      JOIN warehouses wo ON wo.id = lo.warehouse_id
+      WHERE wo.branch_id = ${b}::uuid AND wo.active AND lo.active
+      -- El anaquel con más existencia: mover de donde sobra es lo que menos estorba.
+      ORDER BY f.product_id, f.location_id, o.stock DESC, lo.code
+    )
+    SELECT f.product_id, p.name AS product_name, p.barcode,
+           f.location_id, l.code AS location_code, l.name AS location_name,
+           w.name AS warehouse_name,
+           f.stock::int, f.min_stock::int, f.missing::int,
+           g.from_location_id, fl.code AS from_location_code, fw.name AS from_warehouse_name,
+           g.from_stock::int,
+           LEAST(f.missing, COALESCE(g.from_stock, 0))::int AS suggested_qty
+    FROM faltantes f
+    JOIN products p ON p.id = f.product_id AND NOT p.deleted
+    JOIN stock_locations l ON l.id = f.location_id
+    JOIN warehouses w ON w.id = l.warehouse_id
+    LEFT JOIN origen g ON g.product_id = f.product_id AND g.location_id = f.location_id
+    LEFT JOIN stock_locations fl ON fl.id = g.from_location_id
+    LEFT JOIN warehouses fw ON fw.id = fl.warehouse_id
+    ORDER BY f.missing DESC, p.name
+  `
+}
+
 /** Existencias del producto en la sucursal, sumando sus ubicaciones. */
 async function branchLocationStock(tx, productId, branchId) {
   const b = requireBranchId(branchId)
@@ -384,6 +433,7 @@ module.exports = {
   applyLocationDeltas,
   applyBranchDelta,
   moveBetweenLocations,
+  replenishmentSuggestions,
   branchLocationStock,
   clearBranchLocations,
 }

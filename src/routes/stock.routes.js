@@ -17,6 +17,8 @@ const canView = hasPermission('stock_moves.view', 'stock_moves.create', 'product
 
 router.get('/moves', Auth, canView, StockMoves.list)
 router.get('/by-location', Auth, canView, StockMoves.stockByLocation)
+router.get('/replenishment', Auth, canView, StockMoves.replenishment)
+router.put('/by-location/min', Auth, hasPermission('stock_moves.create'), StockMoves.setLocationMin)
 router.post('/moves', Auth, hasPermission('stock_moves.create'), StockMoves.createMove)
 // Crear o destruir existencias sin documento tiene su propio permiso.
 router.post('/adjustments', Auth, hasPermission('stock_moves.adjust'), StockMoves.createAdjustment)

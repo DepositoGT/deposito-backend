@@ -17,7 +17,7 @@
 
 const { prisma, prismaTransaction } = require('../models/prisma')
 const { requireBranch } = require('../middlewares/tenant')
-const { moveBetweenLocations } = require('../services/stockLocations')
+const { moveBetweenLocations, replenishmentSuggestions } = require('../services/stockLocations')
 const { deductStockMap, restoreStockMap } = require('../services/bomStock')
 const { ensureStockAlertsBatch } = require('../services/stockAlerts')
 
@@ -153,6 +153,41 @@ exports.stockByLocation = async (req, res, next) => {
     rows.sort((a, b) =>
       a.location.warehouse.dispatch_priority - b.location.warehouse.dispatch_priority ||
       a.location.code.localeCompare(b.location.code))
+    res.json(rows)
+  } catch (e) { next(e) }
+}
+
+// PUT /api/stock/by-location/min — mínimo interno del anaquel. No es el mínimo
+// de compra (ese es de la sucursal): este solo pide mover, no comprar.
+exports.setLocationMin = async (req, res, next) => {
+  try {
+    const branchId = requireBranch(req)
+    const { product_id, location_id, min_stock } = req.body || {}
+    const min = Math.floor(Number(min_stock))
+    if (!product_id || !location_id || !Number.isFinite(min) || min < 0) {
+      return res.status(400).json({ message: 'product_id, location_id y min_stock >= 0 son obligatorios' })
+    }
+    const owned = await prisma.stockLocation.findFirst({
+      where: { id: String(location_id), warehouse: { branch_id: branchId } },
+      select: { id: true },
+    })
+    if (!owned) return res.status(403).json({ message: 'La ubicación no pertenece a esta sucursal' })
+
+    const row = await prisma.productStockLocation.upsert({
+      where: { product_id_location_id: { product_id: String(product_id), location_id: owned.id } },
+      update: { min_stock: min },
+      create: { product_id: String(product_id), location_id: owned.id, stock: 0, min_stock: min },
+      select: { product_id: true, location_id: true, stock: true, min_stock: true },
+    })
+    res.json(row)
+  } catch (e) { next(e) }
+}
+
+// GET /api/stock/replenishment — qué anaquel está por debajo de su mínimo y de
+// dónde reponerlo sin comprarle nada al proveedor.
+exports.replenishment = async (req, res, next) => {
+  try {
+    const rows = await replenishmentSuggestions(prisma, requireBranch(req))
     res.json(rows)
   } catch (e) { next(e) }
 }

@@ -54,10 +54,102 @@ async function reportScope(req) {
   }
 }
 
+/** Almacén y ubicación por los que el modal acotó el reporte, si los hay. */
+function warehouseFilter(req) {
+  const wid = req.query?.warehouse_id ? String(req.query.warehouse_id) : null
+  const lid = req.query?.location_id ? String(req.query.location_id) : null
+  return { wid, lid, active: Boolean(wid || lid) }
+}
+
+/**
+ * Inventario desglosado por almacén. Gemelo de `stockByBranch`, pero un nivel
+ * más abajo: aquí sí tiene sentido fuera del consolidado, porque una sola
+ * sucursal puede tener bodega, sala y vitrina.
+ */
+async function stockByWarehouse(req) {
+  const ids = scopeBranchIds(req)
+  if (!ids.length) return []
+  const { wid, lid } = warehouseFilter(req)
+  const rows = await prisma.productStockLocation.findMany({
+    where: {
+      stock: { not: 0 },
+      product: { deleted: false, deleted_at: null },
+      location: {
+        ...(lid ? { id: lid } : {}),
+        warehouse: { branch_id: { in: ids }, active: true, ...(wid ? { id: wid } : {}) },
+      },
+    },
+    select: {
+      stock: true,
+      product: { select: { cost: true } },
+      location: { select: { warehouse: { select: { name: true }, }, }, },
+    },
+  })
+  const agg = new Map()
+  for (const r of rows) {
+    const name = r.location.warehouse.name
+    const a = agg.get(name) || { warehouse: name, skus: 0, units: 0, value: 0 }
+    a.skus += 1
+    a.units += number(r.stock)
+    a.value += number(r.stock) * number(r.product?.cost)
+    agg.set(name, a)
+  }
+  const out = [...agg.values()].map((a) => ({ ...a, value: Number(a.value.toFixed(2)) }))
+  // Con un solo almacén el desglose no dice nada que no diga el total.
+  return out.length > 1 ? out.sort((a, b) => b.value - a.value) : []
+}
+
+/**
+ * Dónde está lo poco que queda: la ubicación con más existencia de cada
+ * producto. Para que "faltan 3" venga con el "y los 2 que hay están en la
+ * vitrina", que es lo que decide si se compra o se mueve.
+ */
+async function topLocationByProduct(req, productIds) {
+  const ids = scopeBranchIds(req)
+  const pids = [...new Set((productIds || []).filter(Boolean))]
+  if (!ids.length || !pids.length) return new Map()
+  const rows = await prisma.productStockLocation.findMany({
+    where: {
+      product_id: { in: pids },
+      stock: { gt: 0 },
+      location: { warehouse: { branch_id: { in: ids }, active: true } },
+    },
+    select: {
+      product_id: true, stock: true,
+      location: { select: { code: true, warehouse: { select: { name: true } } } },
+    },
+    orderBy: { stock: 'desc' },
+  })
+  const out = new Map()
+  for (const r of rows) {
+    if (out.has(r.product_id)) continue
+    out.set(r.product_id, `${r.location.warehouse.name} · ${r.location.code} (${r.stock})`)
+  }
+  return out
+}
+
 /** Sustituye p.stock por el stock de las sucursales del reporte (in place). */
 async function overlayReportBranchStock(products, req) {
   const ids = scopeBranchIds(req)
   if (!ids.length || !products?.length) return
+  const { wid, lid, active } = warehouseFilter(req)
+  if (active) {
+    // Acotado a un almacén o ubicación: el stock del reporte es el de ahí.
+    const rows = await prisma.productStockLocation.findMany({
+      where: {
+        product_id: { in: products.map((p) => p.id) },
+        location: {
+          ...(lid ? { id: lid } : {}),
+          warehouse: { branch_id: { in: ids }, ...(wid ? { id: wid } : {}) },
+        },
+      },
+      select: { product_id: true, stock: true },
+    })
+    const at = new Map()
+    for (const r of rows) at.set(r.product_id, (at.get(r.product_id) || 0) + r.stock)
+    for (const p of products) p.stock = at.get(p.id) ?? 0
+    return
+  }
   const rows = await prisma.productStock.findMany({
     where: { branch_id: { in: ids }, product_id: { in: products.map((p) => p.id) } },
     select: { product_id: true, stock: true },
@@ -1062,6 +1154,7 @@ async function inventoryReport(req,res,next){
     await overlayReportBranchStock(products, req)
     const scope = await reportScope(req)
     const byBranch = await stockByBranch(req, scope)
+    const byWarehouse = await stockByWarehouse(req)
     if (String(format).toLowerCase() === 'csv' || String(format).toLowerCase() === 'excel') {
       const totalValue = products.reduce((acc,p)=>acc+ number(p.stock)* number(p.cost),0)
       sendCsv(res, 'reporte-inventario', [
@@ -1075,6 +1168,11 @@ async function inventoryReport(req,res,next){
           title:'Inventario por Sucursal',
           columns:['Sucursal','SKUs','Unidades','Valor'],
           rows: byBranch.map(b=>[b.branch, b.skus, b.units, money(b.value)])
+        }] : []),
+        ...(byWarehouse.length ? [{
+          title:'Inventario por Almacén',
+          columns:['Almacén','SKUs','Unidades','Valor'],
+          rows: byWarehouse.map(w=>[w.warehouse, w.skus, w.units, money(w.value)])
         }] : []),
         {
           title:'Detalle',
@@ -1101,6 +1199,16 @@ async function inventoryReport(req,res,next){
       doc,
       ['Sucursal','SKUs','Unidades','Valor'],
       byBranch.map(b=>[b.branch, b.skus, b.units, money(b.value)]),
+      [170,70,70,90],
+      { align: ['left','right','right','right'], headerAlign: ['left','right','right','right'] }
+    )
+  }
+  if (byWarehouse.length) {
+    sectionTitle(doc, 'Inventario por almacén')
+    drawTable(
+      doc,
+      ['Almacén','SKUs','Unidades','Valor'],
+      byWarehouse.map(w=>[w.warehouse, w.skus, w.units, money(w.value)]),
       [170,70,70,90],
       { align: ['left','right','right','right'], headerAlign: ['left','right','right','right'] }
     )
@@ -1275,6 +1383,7 @@ async function financialReport(req, res, next) {
     const data = await getFinancialData(startUtc, endUtc, req)
     const scope = await reportScope(req)
     const byBranch = await stockByBranch(req, scope)
+    const byWarehouse = await stockByWarehouse(req)
 
     const rotTxt = data.inventoryTurnover != null ? String(data.inventoryTurnover) : '—'
     const dInvTxt = data.daysOfInventoryApprox != null ? String(data.daysOfInventoryApprox) : '—'
@@ -1309,6 +1418,11 @@ async function financialReport(req, res, next) {
           title: 'Inventario por Sucursal',
           columns: ['Sucursal', 'SKUs', 'Unidades', 'Valor'],
           rows: byBranch.map((b) => [b.branch, b.skus, b.units, money(b.value)])
+        }] : []),
+        ...(byWarehouse.length ? [{
+          title: 'Valor de Inventario por Almacén',
+          columns: ['Almacén', 'SKUs', 'Unidades', 'Valor'],
+          rows: byWarehouse.map((w) => [w.warehouse, w.skus, w.units, money(w.value)])
         }] : []),
         {
           title: 'Estado de resultado (período)',
@@ -1388,6 +1502,17 @@ async function financialReport(req, res, next) {
           { align: ['left', 'right', 'right', 'right'], headerAlign: ['left', 'right', 'right', 'right'] }
         )
       }
+    }
+
+    if (byWarehouse.length) {
+      sectionTitle(doc, 'Valor de inventario por almacén')
+      drawTable(
+        doc,
+        ['Almacén', 'SKUs', 'Unidades stock', 'Valor inventario'],
+        byWarehouse.map((w) => [w.warehouse, w.skus, w.units, money(w.value)]),
+        [170, 70, 90, 100],
+        { align: ['left', 'right', 'right', 'right'], headerAlign: ['left', 'right', 'right', 'right'] }
+      )
     }
 
     sectionTitle(doc, 'Estado de resultado del período')
@@ -1547,10 +1672,12 @@ async function alertsReport(req, res, next) {
     const fmtTs = (d) =>
       d ? DateTime.fromJSDate(d).setZone(zone).toFormat('yyyy-LL-dd HH:mm') : '—'
 
+    const whereIs = await topLocationByProduct(req, actionList.map((p) => p.id))
     const rowPrioridad = (p) => [
       p.name,
       p.category?.name || '—',
       number(p.stock),
+      whereIs.get(p.id) || '—',
       number(p.min_stock),
       gapUnits(p),
       money(gapUnits(p) * number(p.cost)),
@@ -1580,6 +1707,7 @@ async function alertsReport(req, res, next) {
             'Producto',
             'Categoría',
             'Stock',
+            'Dónde está',
             'Mín.',
             'Faltante',
             'Valor faltante',
@@ -1691,12 +1819,12 @@ async function alertsReport(req, res, next) {
       sectionTitle(doc, 'Prioridad de reposición')
       drawTable(
         doc,
-        ['Producto', 'Categoría', 'Stock', 'Mín.', 'Faltante', 'Valor falt.', 'Proveedor'],
+        ['Producto', 'Categoría', 'Stock', 'Dónde está', 'Mín.', 'Faltante', 'Valor falt.', 'Proveedor'],
         actionList.slice(0, 120).map(rowPrioridad),
-        [118, 68, 34, 34, 46, 72, 102],
+        [104, 50, 32, 84, 32, 40, 62, 70],
         {
-          align: ['left', 'left', 'right', 'right', 'right', 'right', 'left'],
-          headerAlign: ['left', 'left', 'right', 'right', 'right', 'right', 'left']
+          align: ['left', 'left', 'right', 'left', 'right', 'right', 'right', 'left'],
+          headerAlign: ['left', 'left', 'right', 'left', 'right', 'right', 'right', 'left']
         }
       )
       if (actionList.length > 120) {
@@ -1911,6 +2039,7 @@ async function productsReport(req, res, next) {
     const { products, summary, categoryRows, supplierRows, topByInv, topByRetail, tightMargins } = data
     const scope = await reportScope(req)
     const byBranch = await stockByBranch(req, scope)
+    const byWarehouse = await stockByWarehouse(req)
 
     const rowDetalle = (p) => [
       p.name,
@@ -2012,6 +2141,13 @@ async function productsReport(req, res, next) {
           ])
         }
       ]
+      if (byWarehouse.length) {
+        sections.unshift({
+          title: 'Existencias por Almacén',
+          columns: ['Almacén', 'SKUs', 'Unidades', 'Valor inv.'],
+          rows: byWarehouse.map((w) => [w.warehouse, w.skus, w.units, money(w.value)])
+        })
+      }
       if (byBranch.length) {
         sections.unshift({
           title: 'Existencias por Sucursal',
@@ -2043,6 +2179,17 @@ async function productsReport(req, res, next) {
         doc,
         ['Sucursal', 'SKUs', 'Unidades', 'Valor inv.'],
         byBranch.map((b) => [b.branch, b.skus, b.units, money(b.value)]),
+        [170, 70, 70, 90],
+        { align: ['left', 'right', 'right', 'right'], headerAlign: ['left', 'right', 'right', 'right'] }
+      )
+    }
+
+    if (byWarehouse.length) {
+      sectionTitle(doc, 'Existencias por almacén')
+      drawTable(
+        doc,
+        ['Almacén', 'SKUs', 'Unidades', 'Valor inv.'],
+        byWarehouse.map((w) => [w.warehouse, w.skus, w.units, money(w.value)]),
         [170, 70, 70, 90],
         { align: ['left', 'right', 'right', 'right'], headerAlign: ['left', 'right', 'right', 'right'] }
       )
@@ -2668,6 +2815,20 @@ async function merchandiseReport(req, res, next) {
 }
 
 module.exports = {
+  // Ladrillos compartidos con stockReports.controller.js: los reportes nuevos
+  // usan el mismo papel y las mismas tablas, no una copia parecida.
+  reportScope,
+  scopeBranchIds,
+  periodRange,
+  number,
+  makeMoney,
+  newDoc,
+  header,
+  footer,
+  sectionTitle,
+  drawTable,
+  drawSummaryCards,
+  sendCsv,
   salesReport,
   inventoryReport,
   suppliersReport,
