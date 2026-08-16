@@ -15,6 +15,7 @@
 
 const { prisma } = require('../models/prisma')
 const { requireBranch } = require('../middlewares/tenant')
+const { uniqueCode } = require('../utils/autoCode')
 
 const KINDS = ['BODEGA', 'SALA_VENTAS', 'VITRINA', 'TRANSITO', 'OTRO']
 
@@ -96,11 +97,14 @@ exports.create = async (req, res, next) => {
   try {
     const branchId = requireBranch(req)
     const { name, code, kind, dispatch_priority, is_default, is_receiving, notes } = req.body || {}
-    if (!name || !code) return bad(res, 'name y code son obligatorios')
+    if (!name) return bad(res, 'name es obligatorio')
     if (kind && !KINDS.includes(kind)) return bad(res, `kind debe ser uno de: ${KINDS.join(', ')}`)
 
     const created = await prisma.$transaction(async (tx) => {
-      const first = (await tx.warehouse.count({ where: { branch_id: branchId } })) === 0
+      const hermanos = await tx.warehouse.findMany({ where: { branch_id: branchId }, select: { code: true } })
+      // Sin código, se saca del nombre: "Sala de ventas" → SALADEVENTAS.
+      const finalCode = code ? cleanCode(code, 20) : uniqueCode(name, hermanos.map((w) => w.code), 20)
+      const first = hermanos.length === 0
       const wantsDefault = first || Boolean(is_default)
       const wantsReceiving = first || Boolean(is_receiving)
       if (wantsDefault) await tx.warehouse.updateMany({ where: { branch_id: branchId }, data: { is_default: false } })
@@ -110,7 +114,7 @@ exports.create = async (req, res, next) => {
         data: {
           branch_id: branchId,
           name: String(name).trim(),
-          code: cleanCode(code, 20),
+          code: finalCode,
           kind: kind || 'BODEGA',
           is_default: wantsDefault,
           is_receiving: wantsReceiving,
@@ -200,16 +204,21 @@ exports.createLocation = async (req, res, next) => {
     if (!warehouse) return res.status(404).json({ message: 'Almacén no encontrado' })
 
     const { code, name, pickable, dispatch_priority, is_default } = req.body || {}
-    if (!code) return bad(res, 'code es obligatorio')
+    if (!code && !name) return bad(res, 'Ponle al menos un nombre a la ubicación')
 
     const created = await prisma.$transaction(async (tx) => {
+      const hermanas = await tx.stockLocation.findMany({
+        where: { warehouse_id: warehouse.id }, select: { code: true },
+      })
+      // Sin código, se saca del nombre: "Anaquel 3" → ANAQUEL3.
+      const finalCode = code ? cleanCode(code, 30) : uniqueCode(name, hermanas.map((l) => l.code), 30)
       if (is_default) {
         await tx.stockLocation.updateMany({ where: { warehouse_id: warehouse.id }, data: { is_default: false } })
       }
       return tx.stockLocation.create({
         data: {
           warehouse_id: warehouse.id,
-          code: cleanCode(code, 30),
+          code: finalCode,
           name: name ? String(name).trim() : null,
           is_default: Boolean(is_default),
           pickable: pickable === undefined ? true : Boolean(pickable),

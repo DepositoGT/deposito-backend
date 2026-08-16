@@ -62,7 +62,9 @@ async function overlayBranchStock(items, branchId) {
   const byId = new Map(rows.map((r) => [r.product_id, r]))
   return items.map((p) => {
     const s = byId.get(p.id)
-    return { ...p, stock: s ? s.stock : 0, min_stock: s ? s.min_stock : p.min_stock }
+    // in_branch distingue "hay cero" de "esta sucursal no lo maneja": sin esto
+    // la UI no puede ofrecer empezar a manejarlo.
+    return { ...p, stock: s ? s.stock : 0, min_stock: s ? s.min_stock : p.min_stock, in_branch: Boolean(s) }
   })
 }
 const { getTimezone } = require('../utils/getTimezone')
@@ -637,6 +639,33 @@ exports.remove = async (req, res, next) => {
 }
 
 /**
+ * POST /api/products/:id/branch-stock — empieza a manejar el producto en la
+ * sucursal activa: le crea su fila de stock en 0. El producto ya existía (es
+ * de la empresa); esto solo dice "aquí también lo vendemos".
+ * body { min_stock? }
+ */
+exports.addToBranch = async (req, res, next) => {
+  try {
+    const branchId = requireBranch(req)
+    const owned = await prisma.product.findFirst({
+      where: { id: req.params.id, company_id: req.companyId, deleted: false },
+      select: { id: true, name: true },
+    })
+    if (!owned) return res.status(404).json({ message: 'Producto no encontrado' })
+
+    const key = { product_id_branch_id: { product_id: owned.id, branch_id: branchId } }
+    const existing = await prisma.productStock.findUnique({ where: key })
+    if (existing) return res.json({ ok: true, already: true, branch_stock: existing })
+
+    const minStock = Number.isFinite(Number(req.body?.min_stock)) ? Number(req.body.min_stock) : 0
+    const created = await prisma.productStock.create({
+      data: { product_id: owned.id, branch_id: branchId, stock: 0, min_stock: minStock },
+    })
+    res.status(201).json({ ok: true, branch_stock: created })
+  } catch (e) { next(e) }
+}
+
+/**
  * DELETE /api/products/:id/branch-stock — deja de manejar el producto en la
  * sucursal activa. El producto es de la empresa, así que esto solo borra su
  * fila de product_stocks; en las demás sucursales sigue igual.
@@ -1141,6 +1170,52 @@ exports.deleteLot = async (req, res, next) => {
 }
 
 /**
+ * POST /api/products/lots/write-off
+ * body { lot_ids: string[], reason? }
+ * Saca del inventario lo que quede de esos lotes (lo típico: ya vencieron).
+ * Descuenta de la ubicación donde estaba el lote, deja el rastro en el libro y
+ * el lote en 0 — no lo borra: que se sepa que existió y que se dio de baja.
+ */
+exports.writeOffLots = async (req, res, next) => {
+  try {
+    const branchId = requireBranch(req)
+    const ids = [...new Set((req.body?.lot_ids || []).filter(Boolean).map(String))]
+    if (ids.length === 0) return res.status(400).json({ message: 'Indica al menos un lote' })
+    const reason = req.body?.reason ? String(req.body.reason).trim().slice(0, 200) : 'Lote vencido'
+
+    const result = await prismaTransaction.$transaction(async (tx) => {
+      const lots = await tx.productLot.findMany({
+        where: { id: { in: ids }, branch_id: branchId },
+        select: { id: true, product_id: true, location_id: true, qty_remaining: true, lot_code: true },
+      })
+      if (lots.length !== ids.length) {
+        const e = new Error('Uno de los lotes no es de esta sucursal'); e.status = 404; throw e
+      }
+      let units = 0
+      for (const lot of lots) {
+        if (lot.qty_remaining <= 0) continue
+        const map = new Map([[String(lot.product_id), lot.qty_remaining]])
+        const [row] = await deductStockMap(tx, map, branchId, {
+          reason: 'MANUAL_ADJUST', refType: 'product_lot', refId: String(lot.id),
+          userId: req.user?.sub || null,
+          notes: `${reason} (lote ${lot.lot_code || 's/n'})`.slice(0, 300),
+          // Sale del anaquel donde estaba; si el lote no tenía ubicación, del
+          // reparto normal (`adjust` permite tocar las que no despachan).
+          ...(lot.location_id ? { locationId: lot.location_id } : { adjust: true }),
+        })
+        if (row) await ensureStockAlert(tx, row.id, row.stock, row.min_stock, branchId)
+        units += lot.qty_remaining
+      }
+      await tx.productLot.updateMany({ where: { id: { in: ids } }, data: { qty_remaining: 0 } })
+      return { lots: lots.length, units }
+    }, { maxWait: 10000, timeout: 20000 })
+
+    await syncLotExpiryAlerts(prisma, { force: true })
+    res.json({ ok: true, ...result })
+  } catch (e) { next(e) }
+}
+
+/**
  * GET /api/products/lots/expiring?days=30&status=expiring|expired|all
  * Reporte transversal de lotes por vencer / vencidos.
  */
@@ -1220,7 +1295,7 @@ exports.lotsExpiring = async (req, res, next) => {
 exports.registerIncomingMerchandise = async (req, res, next) => {
   try {
     const body = req.body || {}
-    const { supplier_id, items, notes } = body
+    const { supplier_id, items, notes, location_id } = body
     const user = req.user
     if (!user || !user.sub) {
       return res.status(401).json({ message: 'Usuario no autenticado' })
@@ -1412,8 +1487,22 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
       // (llegaron en la misma entrega/factura). ponytail: un solo código por llamada, no por item.
       const autoLotCode = generateLotCode(dateAsUtcWithGtClock)
       let lotsCreated = 0
-      // El lote queda donde entra la mercancía (misma ubicación que usa restoreStockMap).
-      const lotLocationId = await defaultLocationId(tx, branchId, { receiving: true })
+      // Dónde se guarda lo que llega: la ubicación que eligió quien recibe, o
+      // la de recepción por defecto. El lote queda en la misma.
+      if (location_id) {
+        const owned = await tx.stockLocation.findFirst({
+          where: { id: String(location_id), active: true, warehouse: { branch_id: branchId, active: true } },
+          select: { id: true },
+        })
+        if (!owned) {
+          const e = new Error('La ubicación no pertenece a esta sucursal (o está inactiva)')
+          e.status = 403
+          throw e
+        }
+      }
+      const lotLocationId = location_id
+        ? String(location_id)
+        : await defaultLocationId(tx, branchId, { receiving: true })
 
       for (const item of items) {
         const product = products.find(p => p.id === item.product_id)
@@ -1424,7 +1513,8 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
 
         // La mercancía entra al stock de la sucursal (y al espejo global)
         const [updated] = await restoreStockMap(tx, new Map([[String(product.id), quantity]]), branchId, {
-          reason: 'PURCHASE', refType: 'incoming_merchandise', refId: String(incomingMerchandise.id), userId: registered_by,
+          reason: 'PURCHASE', refType: 'incoming_merchandise', refId: String(incomingMerchandise.id),
+          userId: registered_by, locationId: lotLocationId,
         })
         updatedProducts.push(updated)
 

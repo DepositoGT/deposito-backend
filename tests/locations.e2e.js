@@ -158,14 +158,14 @@ async function main() {
   }
 
   console.log('\n== 7. Quitar de la sucursal exige 0 también en las ubicaciones ==')
-  const products = require('../src/controllers/products.controller')
+  const productsCtl = require('../src/controllers/products.controller')
   // Estado que solo se alcanza forzándolo: los espejos dicen 0 pero la
   // cuarentena todavía guarda 3. La prueba defiende el invariante.
   await prisma.productStock.update({
     where: { product_id_branch_id: { product_id: ron.id, branch_id: suc.id } }, data: { stock: 0 },
   })
   await prisma.product.update({ where: { id: ron.id }, data: { stock: 0 } })
-  const conStockOculto = await callController(products.removeFromBranch, {
+  const conStockOculto = await callController(productsCtl.removeFromBranch, {
     params: { id: ron.id }, companyId: co.id, branchId: suc.id,
   })
   assert(conStockOculto.status === 400, 'no se quita el producto si alguna ubicación aún tiene existencias')
@@ -178,7 +178,7 @@ async function main() {
   })
   const vacio = await stockByLocation(suc.id, ron.id)
   assert(Object.values(vacio).every((v) => v === 0), 'el ajuste a la baja dejó todas las ubicaciones en 0')
-  const quitado = await callController(products.removeFromBranch, setBranchStockCtx)
+  const quitado = await callController(productsCtl.removeFromBranch, setBranchStockCtx)
   assert(quitado.body?.ok === true, 'ya en 0 en todos lados, el producto sale de la sucursal')
   const quedan = await stockByLocation(suc.id, ron.id)
   assert(Object.keys(quedan).length === 0, 'y sus filas de ubicación se fueron con él')
@@ -520,6 +520,71 @@ async function main() {
     where: { product_id_branch_id: { product_id: cerveza.id, branch_id: suc.id } },
   })
   assert(sucCerveza.stock === 7, 'la sucursal no tiene faltante: solo está mal repartido (7 en total)')
+
+  console.log('\n== 16. Códigos automáticos, alta en sucursal, baja de lotes e ingreso dirigido ==')
+  const branchesCtl = require('../src/controllers/branches.controller')
+
+  const autoAlm = await callController(warehouses.create, { ...req10, body: { name: 'Sala de ventas' } })
+  assert(autoAlm.status === 201 && autoAlm.body.code === 'SALADEVENTAS',
+    'el almacén saca su código del nombre, sin pedírselo a nadie')
+  const autoAlm2 = await callController(warehouses.create, { ...req10, body: { name: 'Sala de ventas' } })
+  assert(autoAlm2.body.code === 'SALADEVENTAS2', 'y el segundo con el mismo nombre no choca')
+
+  const autoUbi = await callController(warehouses.createLocation, {
+    ...req10, params: { id: autoAlm.body.id }, body: { name: 'Anaquel 3' },
+  })
+  assert(autoUbi.status === 201 && autoUbi.body.code === 'ANAQUEL3', 'la ubicación también se codifica sola')
+
+  const autoSuc = await callController(branchesCtl.create, {
+    companyId: co.id, user: { sub: user.id }, body: { name: 'Bodega Norte' },
+  })
+  assert(autoSuc.status === 201 && autoSuc.body.code === 'BODEGANORT',
+    'y la sucursal igual, recortada a los 10 caracteres que caben')
+
+  // Producto del catálogo que esta sucursal no maneja: se empieza a manejar sin inventar stock.
+  const importado = await prisma.product.create({
+    data: {
+      name: 'Importado', company_id: co.id, category_id: cat.id, supplier_id: sup.id,
+      status_id: stockStatus.id, price: 300, cost: 200, stock: 0, min_stock: 0,
+    },
+  })
+  const alta = await callController(productsCtl.addToBranch, { ...req10, params: { id: importado.id }, body: {} })
+  assert(alta.status === 201 && alta.body.branch_stock.stock === 0,
+    'el producto empieza a manejarse en la sucursal, con existencia 0')
+  const repetida = await callController(productsCtl.addToBranch, { ...req10, params: { id: importado.id }, body: {} })
+  assert(repetida.body.already === true, 'y volver a darlo de alta no duplica ni truena')
+
+  // Baja de lote vencido: sale del anaquel donde estaba, no de otro.
+  const viejo = await prisma.productLot.findFirst({ where: { product_id: cerveza.id, lot_code: 'VIEJO' } })
+  const antesBaja = await stockByLocation(suc.id, cerveza.id)
+  const baja = await callController(productsCtl.writeOffLots, {
+    ...req10, body: { lot_ids: [viejo.id], reason: 'Vencido en bodega' },
+  })
+  assert(baja.body.units === viejo.qty_remaining, `la baja saca las ${viejo.qty_remaining} unidades que quedaban`)
+  const trasBaja = await stockByLocation(suc.id, cerveza.id)
+  assert(trasBaja.GENERAL === antesBaja.GENERAL - viejo.qty_remaining && trasBaja['SALA-01'] === antesBaja['SALA-01'],
+    'y las saca de la ubicación del lote, sin tocar las otras')
+  const lotEnCero = await prisma.productLot.findUnique({ where: { id: viejo.id } })
+  assert(lotEnCero.qty_remaining === 0, 'el lote queda en 0 pero no se borra: el rastro importa')
+  const movBaja = await prisma.stockMovement.findFirst({
+    where: { ref_type: 'product_lot', ref_id: viejo.id }, orderBy: { created_at: 'desc' },
+  })
+  assert(movBaja.notes.includes('Vencido en bodega'), 'el libro dice por qué se dio de baja')
+
+  // Ingreso dirigido a una ubicación concreta.
+  const destino = autoUbi.body.id
+  const ingreso = await callController(productsCtl.registerIncomingMerchandise, {
+    ...req10,
+    body: {
+      supplier_id: sup.id, location_id: destino,
+      items: [{ product_id: importado.id, quantity: 5, unit_cost: 200, expiry_date: dias(90).toISOString().slice(0, 10) }],
+    },
+  })
+  assert(ingreso.status === 201 || ingreso.status === 200, 'la mercancía se registra')
+  const trasIngreso = await stockByLocation(suc.id, importado.id)
+  assert(trasIngreso.ANAQUEL3 === 5, 'y entró en la ubicación elegida, no en la de recepción por defecto')
+  const loteNuevo = await prisma.productLot.findFirst({ where: { product_id: importado.id } })
+  assert(loteNuevo.location_id === destino, 'el lote se guarda donde quedó la mercancía')
 
   console.log('\nTODAS LAS PRUEBAS PASARON')
 }

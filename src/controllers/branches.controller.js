@@ -10,6 +10,7 @@
 
 const { prisma } = require('../models/prisma')
 const { hasPerm } = require('../middlewares/tenant')
+const { uniqueCode } = require('../utils/autoCode')
 
 const BRANCH_SELECT = {
   id: true, company_id: true, name: true, code: true, address: true,
@@ -45,15 +46,20 @@ exports.list = async (req, res, next) => {
 exports.create = async (req, res, next) => {
   try {
     const { name, code, address, phone } = req.body || {}
-    if (!name || !code) {
-      return res.status(400).json({ message: 'name y code son obligatorios' })
+    if (!name) {
+      return res.status(400).json({ message: 'name es obligatorio' })
     }
+    // El código sale del nombre si no lo mandan: es una etiqueta interna, no
+    // algo que el usuario deba inventar (y menos recordar cuáles ya usó).
     const branch = await prisma.$transaction(async (tx) => {
+      const usados = code ? [] : (await tx.branch.findMany({
+        where: { company_id: req.companyId }, select: { code: true },
+      })).map((b) => b.code)
       const b = await tx.branch.create({
         data: {
           company_id: req.companyId,
           name,
-          code: String(code).toUpperCase(),
+          code: code ? String(code).toUpperCase() : uniqueCode(name, usados, 10),
           address,
           phone,
         },
