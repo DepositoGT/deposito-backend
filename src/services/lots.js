@@ -82,11 +82,15 @@ function fefoSort(a, b) {
  * Best-effort: nunca lanza.
  * @param {object} tx cliente Prisma (transacción o no)
  * @param {Map<string, number>} stockMap product_id -> qty vendida
+ * @param {Map<string, Array<{location_id, qty}>>} [byLocation] de qué ubicación
+ *   salió cada unidad (ver `dispatchedByRef`). Con esto el FEFO se resuelve
+ *   DENTRO de la ubicación que despachó: primero se decide el anaquel, después
+ *   el lote. Sin esto, FEFO de toda la sucursal (comportamiento viejo).
  * @returns {Promise<Map<string, Array<object>>>} product_id -> lotes consumidos
- *   [{ lot_code, expiry_date, unit_cost, supplier_id, qty }], en orden FEFO.
+ *   [{ lot_code, expiry_date, unit_cost, supplier_id, location_id, qty }], en orden FEFO.
  *   Vacío si algo falló: quien lo use debe tolerarlo (los lotes son advisory).
  */
-async function consumeLotsFEFO(tx, stockMap, branchId) {
+async function consumeLotsFEFO(tx, stockMap, branchId, byLocation) {
   const consumed = new Map()
   try {
     const client = tx || prisma
@@ -99,27 +103,39 @@ async function consumeLotsFEFO(tx, stockMap, branchId) {
     const lots = await client.productLot.findMany({
       where: { product_id: { in: productIds }, branch_id: branchId, qty_remaining: { gt: 0 } },
       select: {
-        id: true, product_id: true, qty_remaining: true, expiry_date: true, received_at: true,
-        lot_code: true, unit_cost: true, supplier_id: true,
+        id: true, product_id: true, location_id: true, qty_remaining: true, expiry_date: true,
+        received_at: true, lot_code: true, unit_cost: true, supplier_id: true,
       },
     })
     const byId = new Map(lots.map((l) => [l.id, l]))
     for (const [productId, qty] of stockMap.entries()) {
-      const productLots = lots.filter((l) => l.product_id === productId).sort(fefoSort)
-      for (const { lotId, take } of planConsume(productLots, qty)) {
-        await client.productLot.update({
-          where: { id: lotId },
-          data: { qty_remaining: { decrement: take } },
-        })
-        const lot = byId.get(lotId)
-        if (!consumed.has(productId)) consumed.set(productId, [])
-        consumed.get(productId).push({
-          lot_code: lot.lot_code,
-          expiry_date: lot.expiry_date ? lot.expiry_date.toISOString().slice(0, 10) : null,
-          unit_cost: lot.unit_cost != null ? Number(lot.unit_cost) : null,
-          supplier_id: lot.supplier_id,
-          qty: take,
-        })
+      const productLots = lots.filter((l) => l.product_id === productId)
+      const plan = byLocation?.get(productId)?.length
+        ? byLocation.get(productId).map((d) => ({
+            // Lotes de ese anaquel; los que no tienen ubicación conocida tapan el hueco.
+            lots: productLots.filter((l) => !l.location_id || l.location_id === d.location_id),
+            qty: d.qty,
+          }))
+        : [{ lots: productLots, qty }]
+
+      for (const chunk of plan) {
+        for (const { lotId, take } of planConsume(chunk.lots.slice().sort(fefoSort), chunk.qty)) {
+          await client.productLot.update({
+            where: { id: lotId },
+            data: { qty_remaining: { decrement: take } },
+          })
+          const lot = byId.get(lotId)
+          lot.qty_remaining -= take // el siguiente anaquel ya no lo vuelve a contar
+          if (!consumed.has(productId)) consumed.set(productId, [])
+          consumed.get(productId).push({
+            lot_code: lot.lot_code,
+            expiry_date: lot.expiry_date ? lot.expiry_date.toISOString().slice(0, 10) : null,
+            unit_cost: lot.unit_cost != null ? Number(lot.unit_cost) : null,
+            supplier_id: lot.supplier_id,
+            location_id: lot.location_id,
+            qty: take,
+          })
+        }
       }
     }
   } catch (e) {
@@ -133,8 +149,9 @@ async function consumeLotsFEFO(tx, stockMap, branchId) {
  * `qty` (lo efectivamente recibido puede ser menor a lo enviado). Los lotes se
  * toman en el orden del snapshot, que ya viene FEFO. Best-effort: nunca lanza.
  * @param {Array<object>} snapshot lotes serializados por consumeLotsFEFO
+ * @param {string} [locationId] anaquel donde quedan; si no viene, el que traía el snapshot
  */
-async function recreateLotsFromSnapshot(tx, productId, branchId, snapshot, qty) {
+async function recreateLotsFromSnapshot(tx, productId, branchId, snapshot, qty, locationId) {
   try {
     if (!branchId || !Array.isArray(snapshot) || snapshot.length === 0) return
     const client = tx || prisma
@@ -148,6 +165,7 @@ async function recreateLotsFromSnapshot(tx, productId, branchId, snapshot, qty) 
         data: {
           product_id: productId,
           branch_id: branchId,
+          location_id: locationId || lot.location_id || null,
           lot_code: lot.lot_code || null,
           expiry_date: lot.expiry_date ? new Date(lot.expiry_date) : null,
           qty_received: take,
@@ -165,6 +183,8 @@ async function recreateLotsFromSnapshot(tx, productId, branchId, snapshot, qty) 
 /**
  * Devuelve cantidad a los lotes (reversa de venta cancelada), inverso del FEFO.
  * Best-effort: nunca lanza.
+ * ponytail: devuelve al lote con espacio, sin mirar la ubicación. Si un día
+ * importa, el libro tiene el SALE_RETURN con su location_id para dirigirlo.
  * @param {object} tx cliente Prisma
  * @param {Map<string, number>} stockMap product_id -> qty restaurada
  */
@@ -236,6 +256,7 @@ async function syncLotExpiryAlerts(tx, opts = {}) {
       select: {
         product_id: true, branch_id: true, lot_code: true, expiry_date: true, qty_remaining: true,
         product: { select: { name: true } },
+        location: { select: { code: true } },
       },
       orderBy: { expiry_date: 'asc' },
     })
@@ -278,12 +299,14 @@ async function syncLotExpiryAlerts(tx, opts = {}) {
       const priorityName = expired ? 'Crítica' : days <= 7 ? 'Alta' : 'Media'
       const priority = priorityByName[priorityName]
       const extra = productLots.length > 1 ? ` (+${productLots.length - 1} lote${productLots.length > 2 ? 's' : ''} más)` : ''
+      // Dónde está lo que vence: sin esto hay que buscarlo anaquel por anaquel.
+      const where = nearest.location?.code ? ` en ${nearest.location.code}` : ''
 
       const alertData = {
         title: expired ? 'Lote vencido' : 'Lote por vencer',
         message: expired
-          ? `El lote ${nearest.lot_code || 's/n'} de "${nearest.product.name}" venció hace ${Math.abs(days)} día(s) (${nearest.qty_remaining} unidades)${extra}.`
-          : `El lote ${nearest.lot_code || 's/n'} de "${nearest.product.name}" vence en ${days} día(s) (${nearest.qty_remaining} unidades)${extra}.`,
+          ? `El lote ${nearest.lot_code || 's/n'} de "${nearest.product.name}" venció hace ${Math.abs(days)} día(s) (${nearest.qty_remaining} unidades${where})${extra}.`
+          : `El lote ${nearest.lot_code || 's/n'} de "${nearest.product.name}" vence en ${days} día(s) (${nearest.qty_remaining} unidades${where})${extra}.`,
         timestamp,
         priority_id: priority?.id,
         type_id: alertType.id,

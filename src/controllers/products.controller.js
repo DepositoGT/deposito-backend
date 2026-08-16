@@ -18,7 +18,9 @@ const { createClient } = require('@supabase/supabase-js')
 const { ensureStockAlert } = require('../services/stockAlerts')
 const { requireBranch, branchWhere } = require('../middlewares/tenant')
 const { ensureBranchStockRows } = require('../services/stockAvailability')
-const { applyBranchDelta, branchLocationStock, clearBranchLocations } = require('../services/stockLocations')
+const {
+  applyBranchDelta, branchLocationStock, clearBranchLocations, defaultLocationId,
+} = require('../services/stockLocations')
 
 /**
  * Fija stock/min_stock del producto EN LA SUCURSAL dada y ajusta el espejo
@@ -1171,6 +1173,7 @@ exports.lotsExpiring = async (req, res, next) => {
           select: { id: true, name: true, brand: true, size: true, barcode: true, stock: true, image_url: true }
         },
         branch: { select: { id: true, name: true, code: true } },
+        location: { select: { id: true, code: true, name: true } },
       },
     })
 
@@ -1202,6 +1205,7 @@ exports.lotsExpiring = async (req, res, next) => {
           days_to_expiry: Math.round((new Date(l.expiry_date).getTime() - today.getTime()) / 86400000),
           received_at: l.received_at,
           branch: l.branch,
+          location: l.location,
           product: {
             ...l.product,
             lotted,
@@ -1408,6 +1412,8 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
       // (llegaron en la misma entrega/factura). ponytail: un solo código por llamada, no por item.
       const autoLotCode = generateLotCode(dateAsUtcWithGtClock)
       let lotsCreated = 0
+      // El lote queda donde entra la mercancía (misma ubicación que usa restoreStockMap).
+      const lotLocationId = await defaultLocationId(tx, branchId, { receiving: true })
 
       for (const item of items) {
         const product = products.find(p => p.id === item.product_id)
@@ -1454,6 +1460,7 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
             data: {
               product_id: product.id,
               branch_id: branchId,
+              location_id: lotLocationId,
               lot_code: lotCode,
               expiry_date: hasExpiry ? new Date(item.expiry_date) : null,
               qty_received: quantity,

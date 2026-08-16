@@ -192,6 +192,7 @@ model StockLocation {
   stocks         ProductStockLocation[]
   movements      StockMovement[]
   count_lines    InventoryCountLine[]
+  lots           ProductLot[]
   /// Sucursales que venden desde aquí (su punto de venta despacha de esta ubicación).
   sales_branches Branch[]               @relation("BranchSalesLocation")
   created_at     DateTime               @default(now())
@@ -587,6 +588,10 @@ model ProductLot {
   product                 Product   @relation(fields: [product_id], references: [id])
   branch_id               String    @db.Uuid
   branch                  Branch    @relation(fields: [branch_id], references: [id], onDelete: Restrict)
+  /// Anaquel donde está el lote. Null = sin ubicación conocida (lote heredado):
+  /// sigue contando para caducidad y puede despachar desde cualquiera.
+  location_id             String?   @db.Uuid
+  location                StockLocation? @relation(fields: [location_id], references: [id], onDelete: SetNull)
   /// Nº de lote del proveedor (opcional)
   lot_code                String?   @db.VarChar(60)
   /// Obligatoria vía API si product.tracks_expiry
@@ -601,6 +606,7 @@ model ProductLot {
   received_at             DateTime  @default(now())
 
   @@index([product_id, expiry_date])
+  @@index([product_id, location_id, expiry_date])
   @@index([expiry_date])
   @@index([branch_id])
   @@map("product_lots")

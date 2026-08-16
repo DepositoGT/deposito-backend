@@ -14,6 +14,7 @@ const { DateTime } = require('luxon')
 const { getTimezone } = require('../utils/getTimezone')
 const { ensureStockAlertsBatch } = require('../services/stockAlerts')
 const { consumeLotsFEFO, restoreLotsFEFO } = require('../services/lots')
+const { dispatchedByRef } = require('../services/stockLocations')
 const { salesOperationLimiter } = require('../utils/concurrencyLimiter')
 const {
   assertPartyAction,
@@ -692,10 +693,16 @@ exports.create = async (req, res, next) => {
         tx,
         resolvedItems.map((it) => ({ product_id: it.product_id, qty: it.qty }))
       )
-      const updatedProducts = await deductStockMap(tx, stockMap, branchId, {
+      // groupId propio: una venta puede descontar stock más de una vez a lo largo
+      // de su vida (completar → cancelar → completar), y los lotes solo deben
+      // seguir a la salida de ahora.
+      const saleStockCtx = {
         reason: 'SALE', refType: 'sale', refId: String(sale.id), userId: user.sub,
-      })
-      await consumeLotsFEFO(tx, stockMap, branchId) // advisory: descuenta lotes por caducidad
+        groupId: require('crypto').randomUUID(),
+      }
+      const updatedProducts = await deductStockMap(tx, stockMap, branchId, saleStockCtx)
+      // Advisory: descuenta lotes por caducidad, dentro de la ubicación que despachó.
+      await consumeLotsFEFO(tx, stockMap, branchId, await dispatchedByRef(tx, { groupId: saleStockCtx.groupId }))
       await ensureStockAlertsBatch(tx, updatedProducts, branchId)
 
       // 3) Guardar promociones con descuento efectivo e incrementar solo esos códigos
@@ -801,10 +808,13 @@ exports.updateStatus = async (req, res, next) => {
             tx,
             current.sale_items.map((si) => ({ product_id: si.product_id, qty: si.qty }))
           )
-          const updatedProducts = await deductStockMap(tx, stockMap, saleBranchId, {
+          const stockCtx = {
             reason: 'SALE', refType: 'sale', refId: String(id), userId: req.user?.sub || null,
-          })
-          await consumeLotsFEFO(tx, stockMap, saleBranchId) // advisory: descuenta lotes por caducidad
+            groupId: require('crypto').randomUUID(),
+          }
+          const updatedProducts = await deductStockMap(tx, stockMap, saleBranchId, stockCtx)
+          // Advisory: descuenta lotes por caducidad, dentro de la ubicación que despachó.
+          await consumeLotsFEFO(tx, stockMap, saleBranchId, await dispatchedByRef(tx, { groupId: stockCtx.groupId }))
 
           updatedProducts.forEach(p => {
             console.log(`[STOCK ADJUSTMENT] ${p.name}: nuevo stock = ${p.stock}`)

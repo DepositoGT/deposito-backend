@@ -136,6 +136,49 @@ async function planDispatch(tx, branchId, entries, { adjust = false, preferLocat
   return out
 }
 
+/** Todas las ubicaciones dadas tienen que ser de esta sucursal y estar activas. */
+async function assertBranchLocations(tx, branchId, locationIds) {
+  const ids = [...new Set((locationIds || []).filter(Boolean).map(String))]
+  if (ids.length === 0) return
+  const rows = await tx.$queryRaw`
+    SELECT l.id FROM stock_locations l
+    JOIN warehouses w ON w.id = l.warehouse_id
+    WHERE w.branch_id = ${requireBranchId(branchId)}::uuid AND w.active AND l.active
+      AND l.id IN (${Prisma.join(ids.map((id) => Prisma.sql`${id}::uuid`))})
+  `
+  if (rows.length !== ids.length) {
+    const err = new Error('Una de las ubicaciones no pertenece a esta sucursal (o está inactiva)')
+    err.status = 403
+    throw err
+  }
+}
+
+/**
+ * De qué ubicaciones salió (o a cuáles entró) una operación ya escrita en el
+ * libro. El libro es append-only, así que sirve tanto en la misma transacción
+ * que lo escribió como meses después (cancelar un traslado viejo).
+ * Con `groupId` se lee UNA operación; por (refType, refId, reason) se leen
+ * todas las del documento — sirve si el documento solo pudo hacerla una vez.
+ * @returns {Promise<Map<string, Array<{ location_id: string, qty: number }>>>}
+ *   qty en positivo, en el orden en que se aplicó.
+ */
+async function dispatchedByRef(tx, { refType, refId, reason, groupId }) {
+  const rows = await tx.stockMovement.findMany({
+    where: groupId
+      ? { group_id: String(groupId) }
+      : { ref_type: String(refType), ref_id: String(refId), reason },
+    select: { product_id: true, location_id: true, qty: true },
+    orderBy: { created_at: 'asc' },
+  })
+  const out = new Map()
+  for (const r of rows) {
+    const key = String(r.product_id)
+    if (!out.has(key)) out.set(key, [])
+    out.get(key).push({ location_id: String(r.location_id), qty: Math.abs(Number(r.qty)) })
+  }
+  return out
+}
+
 function aggregate(deltas) {
   const map = new Map()
   for (const d of deltas) {
@@ -266,18 +309,7 @@ async function moveBetweenLocations(tx, { branchId, fromLocationId, toLocationId
     const err = new Error('Indica al menos un producto con cantidad mayor a 0'); err.status = 400; throw err
   }
 
-  // Ambas ubicaciones tienen que ser de esta sucursal y estar activas.
-  const valid = await tx.$queryRaw`
-    SELECT l.id FROM stock_locations l
-    JOIN warehouses w ON w.id = l.warehouse_id
-    WHERE w.branch_id = ${b}::uuid AND w.active AND l.active
-      AND l.id IN (${String(fromLocationId)}::uuid, ${String(toLocationId)}::uuid)
-  `
-  if (valid.length !== 2) {
-    const err = new Error('Origen o destino no pertenecen a esta sucursal (o están inactivos)')
-    err.status = 403
-    throw err
-  }
+  await assertBranchLocations(tx, b, [fromLocationId, toLocationId])
 
   // Se valida antes para poder decir qué falta y cuánto hay, no solo "negativo".
   const have = await tx.productStockLocation.findMany({
@@ -303,6 +335,19 @@ async function moveBetweenLocations(tx, { branchId, fromLocationId, toLocationId
   await applyLocationDeltas(tx, deltas, {
     branchId: b, reason: 'INTERNAL_MOVE', refType: 'internal_move', groupId, userId, notes,
   })
+
+  // Los lotes se mudan con la mercancía: salen FEFO del origen y se recrean en
+  // el destino. Advisory (nunca lanza), igual que el resto de la capa de lotes.
+  const { consumeLotsFEFO, recreateLotsFromSnapshot } = require('./lots')
+  const stockMap = new Map(rows.map((l) => [l.product_id, l.qty]))
+  const byLocation = new Map(
+    rows.map((l) => [l.product_id, [{ location_id: String(fromLocationId), qty: l.qty }]])
+  )
+  const moved = await consumeLotsFEFO(tx, stockMap, b, byLocation)
+  for (const [productId, snapshot] of moved) {
+    const qty = snapshot.reduce((sum, s) => sum + Number(s.qty || 0), 0)
+    await recreateLotsFromSnapshot(tx, productId, b, snapshot, qty, String(toLocationId))
+  }
   return groupId
 }
 
@@ -333,6 +378,8 @@ async function clearBranchLocations(tx, productId, branchId) {
 
 module.exports = {
   defaultLocationId,
+  assertBranchLocations,
+  dispatchedByRef,
   planDispatch,
   applyLocationDeltas,
   applyBranchDelta,

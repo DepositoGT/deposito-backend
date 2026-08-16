@@ -21,6 +21,7 @@ const { deductStockMap, restoreStockMap, expandLinesToStockMap } = require('../s
 const { assertLinesAvailable } = require('../services/stockAvailability')
 const { ensureStockAlertsBatch } = require('../services/stockAlerts')
 const { consumeLotsFEFO, recreateLotsFromSnapshot } = require('../services/lots')
+const { assertBranchLocations, dispatchedByRef, defaultLocationId } = require('../services/stockLocations')
 
 // El pooler de Supabase excede los 5s por defecto en conexiones frías: sin esto
 // el envío fallaba "a veces" y funcionaba al reintentar (conexión ya caliente).
@@ -183,9 +184,13 @@ exports.create = async (req, res, next) => {
       })
       await ensureStockAlertsBatch(tx, updated, fromBranchId)
 
-      // Los lotes viajan con la mercancía: salen del origen y se guardan en la
+      // Los lotes viajan con la mercancía: salen del origen (FEFO dentro de la
+      // ubicación que despachó, según quedó en el libro) y se guardan en la
       // línea para recrearlos en el destino al recibir.
-      const lotsByProduct = await consumeLotsFEFO(tx, stockMap, fromBranchId)
+      const dispatched = await dispatchedByRef(tx, {
+        refType: 'transfer', refId: String(transfer.id), reason: 'TRANSFER_OUT',
+      })
+      const lotsByProduct = await consumeLotsFEFO(tx, stockMap, fromBranchId, dispatched)
       for (const line of transfer.lines) {
         const snapshot = lotsByProduct.get(String(line.product_id))
         if (snapshot?.length) {
@@ -205,12 +210,14 @@ exports.create = async (req, res, next) => {
 
 /**
  * POST /api/transfers/:id/receive
- * body { lines?: [{ line_id, qty_received }] } — si no viene, se recibe todo lo enviado.
+ * body { to_location_id?, lines?: [{ line_id, qty_received, to_location_id? }] }
+ * Sin líneas se recibe todo lo enviado; sin ubicación entra a la de recepción
+ * del almacén por defecto (lo de siempre). La de la línea gana sobre la general.
  * Suma al destino lo efectivamente recibido; la diferencia queda como faltante.
  */
 exports.receive = async (req, res, next) => {
   try {
-    const { lines: linesRaw } = req.body || {}
+    const { lines: linesRaw, to_location_id: toLocationId } = req.body || {}
     const branchId = requireBranch(req)
 
     const result = await prismaTransaction.$transaction(async (tx) => {
@@ -235,6 +242,7 @@ exports.receive = async (req, res, next) => {
       }
 
       const receivedByLine = new Map()
+      const locationByLine = new Map()
       if (Array.isArray(linesRaw) && linesRaw.length > 0) {
         for (const l of linesRaw) {
           const lineId = String(l.line_id || '')
@@ -245,10 +253,15 @@ exports.receive = async (req, res, next) => {
             throw err
           }
           receivedByLine.set(lineId, qty)
+          if (l.to_location_id) locationByLine.set(lineId, String(l.to_location_id))
         }
       }
+      // Recibir en la ubicación de otra sucursal sería meter mercancía ajena.
+      await assertBranchLocations(tx, branchId, [toLocationId, ...locationByLine.values()])
 
-      const stockMap = new Map()
+      // Agrupado por ubicación de destino ('' = la de recepción por defecto).
+      const byLocation = new Map()
+      let receivingLocation = null
       for (const line of transfer.lines) {
         const qty = receivedByLine.has(line.id) ? receivedByLine.get(line.id) : line.qty_sent
         if (qty > line.qty_sent) {
@@ -261,14 +274,24 @@ exports.receive = async (req, res, next) => {
           data: { qty_received: qty },
         })
         if (qty > 0) {
-          stockMap.set(String(line.product_id), (stockMap.get(String(line.product_id)) || 0) + qty)
-          await recreateLotsFromSnapshot(tx, String(line.product_id), branchId, line.lots_snapshot, qty)
+          const target = locationByLine.get(line.id) || (toLocationId ? String(toLocationId) : '')
+          if (!byLocation.has(target)) byLocation.set(target, new Map())
+          const map = byLocation.get(target)
+          map.set(String(line.product_id), (map.get(String(line.product_id)) || 0) + qty)
+          // Los lotes que viajaron aterrizan donde aterrizó la mercancía.
+          if (!target && !receivingLocation) {
+            receivingLocation = await defaultLocationId(tx, branchId, { receiving: true })
+          }
+          await recreateLotsFromSnapshot(
+            tx, String(line.product_id), branchId, line.lots_snapshot, qty, target || receivingLocation,
+          )
         }
       }
 
-      if (stockMap.size > 0) {
+      for (const [target, stockMap] of byLocation) {
         const updated = await restoreStockMap(tx, stockMap, branchId, {
-          reason: 'TRANSFER_IN', refType: 'transfer', refId: String(transfer.id), userId: req.user?.sub || null,
+          reason: 'TRANSFER_IN', refType: 'transfer', refId: String(transfer.id),
+          userId: req.user?.sub || null, locationId: target || undefined,
         })
         await ensureStockAlertsBatch(tx, updated, branchId)
       }
@@ -315,18 +338,35 @@ exports.cancel = async (req, res, next) => {
         throw err
       }
 
-      const stockMap = new Map()
+      // Cada unidad vuelve al anaquel del que salió, según el libro. Traslados
+      // viejos (sin libro por ubicación) vuelven a la ubicación por defecto.
+      const dispatched = await dispatchedByRef(tx, {
+        refType: 'transfer', refId: String(transfer.id), reason: 'TRANSFER_OUT',
+      })
+      const byLocation = new Map()
       for (const line of transfer.lines) {
-        stockMap.set(String(line.product_id), (stockMap.get(String(line.product_id)) || 0) + line.qty_sent)
-        // Los lotes que salieron vuelven al origen
+        const productId = String(line.product_id)
+        const back = dispatched.get(productId)?.length
+          ? dispatched.get(productId)
+          : [{ location_id: '', qty: line.qty_sent }]
+        for (const d of back) {
+          if (!byLocation.has(d.location_id)) byLocation.set(d.location_id, new Map())
+          const map = byLocation.get(d.location_id)
+          map.set(productId, (map.get(productId) || 0) + d.qty)
+        }
+        // Los lotes que salieron vuelven al origen, cada uno a su anaquel (el
+        // snapshot ya trae de dónde salió).
         await recreateLotsFromSnapshot(
-          tx, String(line.product_id), transfer.from_branch_id, line.lots_snapshot, line.qty_sent,
+          tx, productId, transfer.from_branch_id, line.lots_snapshot, line.qty_sent,
         )
       }
-      const updated = await restoreStockMap(tx, stockMap, transfer.from_branch_id, {
-        reason: 'TRANSFER_CANCEL', refType: 'transfer', refId: String(transfer.id), userId: req.user?.sub || null,
-      })
-      await ensureStockAlertsBatch(tx, updated, transfer.from_branch_id)
+      for (const [locationId, stockMap] of byLocation) {
+        const updated = await restoreStockMap(tx, stockMap, transfer.from_branch_id, {
+          reason: 'TRANSFER_CANCEL', refType: 'transfer', refId: String(transfer.id),
+          userId: req.user?.sub || null, locationId: locationId || undefined,
+        })
+        await ensureStockAlertsBatch(tx, updated, transfer.from_branch_id)
+      }
 
       return tx.stockTransfer.update({
         where: { id: transfer.id },
