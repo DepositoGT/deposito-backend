@@ -20,6 +20,7 @@ const {
   refreshCookieOptions,
 } = require('../config/security')
 const { generateUserTemplate } = require('../services/userTemplate')
+const { IMPLIES, expandPermissions } = require('../config/permissionDeps')
 const { bulkValidateUsers, bulkCreateUsers } = require('../services/userBulkImport')
 const { requireCompany } = require('../middlewares/tenant')
 
@@ -60,9 +61,11 @@ function serializeUser(user) {
       ? user.user_branches.map((ub) => ub.branch).filter((b) => b && b.active)
       : [],
     default_branch_id: user.default_branch_id || null,
-    permissions: Array.isArray(user.role?.permissions)
-      ? user.role.permissions.map((rp) => rp.permission?.code).filter(Boolean)
-      : [],
+    permissions: expandPermissions(
+      Array.isArray(user.role?.permissions)
+        ? user.role.permissions.map((rp) => rp.permission?.code).filter(Boolean)
+        : []
+    ),
   }
 }
 
@@ -217,9 +220,11 @@ exports.register = async (req, res, next) => {
         phone: user.phone,
         address: user.address,
         hire_date: user.hire_date,
-        permissions: Array.isArray(user.role?.permissions)
-          ? user.role.permissions.map((rp) => rp.permission?.code).filter(Boolean)
-          : [],
+        permissions: expandPermissions(
+          Array.isArray(user.role?.permissions)
+            ? user.role.permissions.map((rp) => rp.permission?.code).filter(Boolean)
+            : []
+        ),
       },
       token,
     })
@@ -443,7 +448,9 @@ exports.getPermissions = async (req, res, next) => {
     const permissions = await prisma.permission.findMany({
       orderBy: { code: 'asc' }
     })
-    res.json(permissions)
+    // `implies` viaja con el catálogo: la pantalla de roles no tiene que
+    // mantener su propia copia de las dependencias.
+    res.json(permissions.map((p) => ({ ...p, implies: IMPLIES[p.code] || [] })))
   } catch (e) { next(e) }
 }
 
@@ -556,8 +563,9 @@ exports.createRole = async (req, res, next) => {
     const role = await prisma.role.create({ data: { name } })
 
     if (Array.isArray(permissions) && permissions.length > 0) {
+      // Se guarda lo marcado MÁS lo que arrastra: "editar" sin "ver" no sirve.
       const perms = await prisma.permission.findMany({
-        where: { code: { in: permissions.map(String) } }
+        where: { code: { in: expandPermissions(permissions) } }
       })
       if (perms.length) {
         await prisma.rolePermission.createMany({
@@ -619,7 +627,7 @@ exports.updateRole = async (req, res, next) => {
 
         if (permissions.length > 0) {
           const perms = await prisma.permission.findMany({
-            where: { code: { in: permissions.map(String) } }
+            where: { code: { in: expandPermissions(permissions) } }
           })
           if (perms.length) {
             await prisma.rolePermission.createMany({
