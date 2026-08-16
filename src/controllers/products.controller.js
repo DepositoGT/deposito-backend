@@ -49,6 +49,41 @@ async function setBranchStock(tx, productId, branchId, { stock, minStock }, ctx 
 }
 
 /**
+ * Alcance de un listado de inventario: lo que eligió la pantalla (?branch_id,
+ * ?warehouse_id, ?location_id) manda sobre el selector global. Sin sucursal el
+ * alcance es toda la empresa.
+ */
+function listScope(req) {
+  const allowed = req.branchIds || req.userBranchIds || (req.branchId ? [req.branchId] : [])
+  const wanted = req.query?.branch_id ? String(req.query.branch_id) : null
+  if (wanted === 'all') return { branchId: null, allowed, warehouseId: null, locationId: null }
+  if (wanted && !allowed.includes(wanted)) {
+    const err = new Error('Sin acceso a esa sucursal')
+    err.status = 403
+    throw err
+  }
+  return {
+    branchId: wanted || req.branchId || null,
+    allowed,
+    warehouseId: req.query?.warehouse_id ? String(req.query.warehouse_id) : null,
+    locationId: req.query?.location_id ? String(req.query.location_id) : null,
+  }
+}
+
+/** Where de ubicación para el alcance dado (sirve para filtrar y para sumar). */
+function scopeLocationWhere(scope) {
+  return {
+    ...(scope.locationId ? { location_id: scope.locationId } : {}),
+    location: {
+      warehouse: {
+        ...(scope.warehouseId ? { id: scope.warehouseId } : {}),
+        ...(scope.branchId ? { branch_id: scope.branchId } : { branch_id: { in: scope.allowed } }),
+      },
+    },
+  }
+}
+
+/**
  * Sustituye stock/min_stock por los valores de la sucursal activa en las
  * respuestas de productos (la forma del JSON no cambia). En vista consolidada
  * (sin sucursal) se devuelven los totales espejo tal cual.
@@ -65,6 +100,31 @@ async function overlayBranchStock(items, branchId) {
     // in_branch distingue "hay cero" de "esta sucursal no lo maneja": sin esto
     // la UI no puede ofrecer empezar a manejarlo.
     return { ...p, stock: s ? s.stock : 0, min_stock: s ? s.min_stock : p.min_stock, in_branch: Boolean(s) }
+  })
+}
+
+/**
+ * El stock que corresponde al alcance elegido: de un anaquel, de un almacén, de
+ * una sucursal o de toda la empresa (ahí el espejo `products.stock` ya es el total).
+ */
+async function overlayScopedStock(items, scope) {
+  if (!items?.length) return items
+  if (!scope.warehouseId && !scope.locationId) return overlayBranchStock(items, scope.branchId)
+
+  const rows = await prisma.productStockLocation.findMany({
+    where: { product_id: { in: items.map((p) => p.id) }, ...scopeLocationWhere(scope) },
+    select: { product_id: true, stock: true, min_stock: true },
+  })
+  const agg = new Map()
+  for (const r of rows) {
+    const a = agg.get(r.product_id) || { stock: 0, min_stock: 0 }
+    a.stock += r.stock
+    a.min_stock += r.min_stock
+    agg.set(r.product_id, a)
+  }
+  return items.map((p) => {
+    const a = agg.get(p.id)
+    return { ...p, stock: a ? a.stock : 0, min_stock: a ? a.min_stock : 0, in_branch: Boolean(a) }
   })
 }
 const { getTimezone } = require('../utils/getTimezone')
@@ -102,11 +162,18 @@ exports.list = async (req, res, next) => {
 
     const where = includeDeleted === 'true' ? {} : { deleted: false }
     where.company_id = req.companyId
-    // ?in_branch=1 → solo los productos que esta sucursal maneja (tienen fila de
+    // El alcance de la pantalla: sucursal / almacén / ubicación.
+    const scope = listScope(req)
+    // ?in_branch=1 → solo los productos que esa sucursal maneja (tienen fila de
     // stock propia), en vez de todo el catálogo de la empresa en cero.
     const inBranchOnly = req.query.in_branch === '1' || req.query.in_branch === 'true'
-    if (inBranchOnly && req.branchId) {
-      where.branch_stocks = { some: { branch_id: req.branchId } }
+    if (inBranchOnly && scope.branchId) {
+      where.branch_stocks = { some: { branch_id: scope.branchId } }
+    }
+    // Acotado a un almacén o anaquel, lo que se lista es lo que está ahí: un
+    // catálogo entero en cero no dice nada de una ubicación.
+    if (scope.warehouseId || scope.locationId) {
+      where.location_stocks = { some: { stock: { not: 0 }, ...scopeLocationWhere(scope) } }
     }
     if (forSaleOnly) {
       where.available_for_sale = true
@@ -149,7 +216,7 @@ exports.list = async (req, res, next) => {
     const prevPage = safePage > 1 ? safePage - 1 : null
 
     res.json({
-      items: await overlayBranchStock(products, req.branchId),
+      items: await overlayScopedStock(products, scope),
       page: safePage,
       pageSize,
       totalPages,

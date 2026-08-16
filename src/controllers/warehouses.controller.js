@@ -59,14 +59,24 @@ async function unitsIn(where) {
 // GET /api/warehouses
 exports.list = async (req, res, next) => {
   try {
-    const branchId = requireBranch(req)
+    // ?branch_id= (o 'all') deja que una pantalla pida los almacenes de otra
+    // sucursal sin cambiar el selector global; sin él, los de la activa.
+    const allowed = req.branchIds || req.userBranchIds || (req.branchId ? [req.branchId] : [])
+    const asked = req.query?.branch_id ? String(req.query.branch_id) : null
+    if (asked && asked !== 'all' && !allowed.includes(asked)) {
+      return res.status(403).json({ message: 'Sin acceso a esa sucursal' })
+    }
+    const branchId = asked === 'all' ? null : (asked || req.branchId)
+    const where = branchId ? { branch_id: branchId } : { branch_id: { in: allowed } }
     const [rows, branch] = await Promise.all([
       prisma.warehouse.findMany({
-        where: { branch_id: branchId },
-        include: WAREHOUSE_INCLUDE,
+        where,
+        include: { ...WAREHOUSE_INCLUDE, branch: { select: { id: true, name: true } } },
         orderBy: [{ dispatch_priority: 'asc' }, { name: 'asc' }],
       }),
-      prisma.branch.findUnique({ where: { id: branchId }, select: { sales_location_id: true } }),
+      branchId
+        ? prisma.branch.findUnique({ where: { id: branchId }, select: { sales_location_id: true } })
+        : null,
     ])
     // Marca de dónde despacha el punto de venta, para no exponer otra ruta.
     for (const w of rows) {

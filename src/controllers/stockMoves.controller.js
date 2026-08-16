@@ -132,25 +132,35 @@ exports.createAdjustment = async (req, res, next) => {
 }
 
 // GET /api/stock/by-location?product_id= — dónde está lo que hay del producto.
+// En vista consolidada recorre todas las sucursales de la empresa, y cada fila
+// dice de cuál es: "Central · Bodega · GENERAL".
 exports.stockByLocation = async (req, res, next) => {
   try {
-    const branchId = requireBranch(req)
     const productId = String(req.query.product_id || '')
     if (!productId) return res.status(400).json({ message: 'product_id es obligatorio' })
+    const branchFilter = req.branchId
+      ? { branch_id: req.branchId }
+      : { branch_id: { in: req.branchIds || [] } }
 
     const rows = await prisma.productStockLocation.findMany({
-      where: { product_id: productId, location: { warehouse: { branch_id: branchId } } },
+      where: { product_id: productId, location: { warehouse: branchFilter } },
       select: {
         stock: true, min_stock: true,
         location: {
           select: {
             id: true, code: true, name: true, pickable: true, active: true,
-            warehouse: { select: { id: true, name: true, code: true, dispatch_priority: true } },
+            warehouse: {
+              select: {
+                id: true, name: true, code: true, dispatch_priority: true,
+                branch: { select: { id: true, name: true } },
+              },
+            },
           },
         },
       },
     })
     rows.sort((a, b) =>
+      a.location.warehouse.branch.name.localeCompare(b.location.warehouse.branch.name) ||
       a.location.warehouse.dispatch_priority - b.location.warehouse.dispatch_priority ||
       a.location.code.localeCompare(b.location.code))
     res.json(rows)

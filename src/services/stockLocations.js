@@ -18,7 +18,7 @@ const DISPATCH_ORDER = Prisma.sql`w.dispatch_priority, l.dispatch_priority, l.co
 
 /**
  * Ubicación por defecto de la sucursal. Si la sucursal se creó después de la
- * migración de almacenes, se le arma aquí su almacén "Principal" — así ni el
+ * migración de almacenes, se le arma aquí su bodega — así ni el
  * alta de sucursales ni el seed ni las pruebas tienen que acordarse.
  * @param {boolean} receiving prefiere el almacén marcado como de recepción
  */
@@ -40,10 +40,13 @@ async function defaultLocationId(tx, branchId, { receiving = false } = {}) {
   const found = await pick()
   if (found) return found
 
+  // Lleva el nombre de su sucursal: cada sucursal tiene el suyo y tres almacenes
+  // llamados "Principal" no se distinguen en ninguna pantalla.
   await tx.$executeRaw`
     WITH w AS (
       INSERT INTO warehouses (id, branch_id, name, code, kind, is_default, is_receiving, dispatch_priority, active, created_at, updated_at)
-      VALUES (gen_random_uuid(), ${b}::uuid, 'Principal', 'PRIN', 'BODEGA', true, true, 10, true, now(), now())
+      SELECT gen_random_uuid(), ${b}::uuid, 'Bodega ' || br.name, 'PRIN', 'BODEGA', true, true, 10, true, now(), now()
+      FROM branches br WHERE br.id = ${b}::uuid
       ON CONFLICT (branch_id, code) DO NOTHING
       RETURNING id
     )

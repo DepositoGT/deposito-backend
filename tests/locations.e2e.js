@@ -586,6 +586,52 @@ async function main() {
   const loteNuevo = await prisma.productLot.findFirst({ where: { product_id: importado.id } })
   assert(loteNuevo.location_id === destino, 'el lote se guarda donde quedó la mercancía')
 
+  console.log('\n== 17. El inventario se acota por sucursal, almacén y ubicación ==')
+  // Cerveza quedó repartida: GENERAL y SALA-01 de Central.
+  const req17 = { ...req10, userBranchIds: [suc.id, otraSuc.id] }
+  const porUbicacionStock = await stockByLocation(suc.id, cerveza.id)
+
+  const todaLaEmpresa = await callController(productsCtl.list, {
+    ...req17, branchId: null, branchIds: [suc.id, otraSuc.id], query: { branch_id: 'all', pageSize: 100 },
+  })
+  const cervezaEmpresa = todaLaEmpresa.body.items.find((p) => p.id === cerveza.id)
+  const cervezaReal = await prisma.product.findUnique({ where: { id: cerveza.id }, select: { stock: true } })
+  assert(cervezaEmpresa.stock === cervezaReal.stock,
+    'sin sucursal, el listado trae el total de la empresa')
+
+  const soloCentral = await callController(productsCtl.list, {
+    ...req17, query: { branch_id: suc.id, pageSize: 100 },
+  })
+  const cervezaCentral = soloCentral.body.items.find((p) => p.id === cerveza.id)
+  const enSucursal = await prisma.productStock.findUnique({
+    where: { product_id_branch_id: { product_id: cerveza.id, branch_id: suc.id } },
+  })
+  assert(cervezaCentral.stock === enSucursal.stock, 'con sucursal, el de esa sucursal')
+
+  const salaWarehouse = await prisma.warehouse.findFirst({ where: { branch_id: suc.id, code: 'SALA' } })
+  const soloSala = await callController(productsCtl.list, {
+    ...req17, query: { branch_id: suc.id, warehouse_id: salaWarehouse.id, pageSize: 100 },
+  })
+  const cervezaSala = soloSala.body.items.find((p) => p.id === cerveza.id)
+  assert(cervezaSala.stock === porUbicacionStock['SALA-01'],
+    'acotado al almacén, solo cuenta lo que está ahí')
+  assert(soloSala.body.items.every((p) => p.stock !== 0),
+    'y no lista productos que no están en ese almacén')
+
+  const soloGeneral = await callController(productsCtl.list, {
+    ...req17, query: { location_id: generalId, pageSize: 100 },
+  })
+  const cervezaGeneral = soloGeneral.body.items.find((p) => p.id === cerveza.id)
+  assert(cervezaGeneral.stock === porUbicacionStock.GENERAL, 'y acotado al anaquel, lo del anaquel')
+
+  let sucursalAjena = null
+  try {
+    await callController(productsCtl.list, {
+      ...req10, userBranchIds: [suc.id], query: { branch_id: otraSuc.id },
+    })
+  } catch (e) { sucursalAjena = e }
+  assert(sucursalAjena?.status === 403, 'no se puede espiar el inventario de una sucursal ajena')
+
   console.log('\nTODAS LAS PRUEBAS PASARON')
 }
 
