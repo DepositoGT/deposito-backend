@@ -13,7 +13,11 @@ const router = Router()
 const { Auth, hasPermission } = require('../middlewares/autenticacion')
 const Warehouses = require('../controllers/warehouses.controller')
 
-const canView = hasPermission('warehouses.view', 'warehouses.manage')
+// Leer la lista es saber cómo se llaman los anaqueles: lo necesita cualquiera
+// que filtre inventario, reciba un traslado o cuente. Gestionarlos sí es aparte.
+const canView = hasPermission(
+  'warehouses.view', 'warehouses.manage', 'products.view', 'stock_moves.view', 'stock_moves.create'
+)
 const canManage = hasPermission('warehouses.manage')
 
 router.get('/', Auth, canView, Warehouses.list)

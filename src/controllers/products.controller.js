@@ -56,14 +56,15 @@ async function setBranchStock(tx, productId, branchId, { stock, minStock }, ctx 
 function listScope(req) {
   const allowed = req.branchIds || req.userBranchIds || (req.branchId ? [req.branchId] : [])
   const wanted = req.query?.branch_id ? String(req.query.branch_id) : null
-  if (wanted === 'all') return { branchId: null, allowed, warehouseId: null, locationId: null }
-  if (wanted && !allowed.includes(wanted)) {
+  if (wanted && wanted !== 'all' && !allowed.includes(wanted)) {
     const err = new Error('Sin acceso a esa sucursal')
     err.status = 403
     throw err
   }
   return {
-    branchId: wanted || req.branchId || null,
+    // 'all' = toda la empresa; el almacén y la ubicación siguen valiendo ahí
+    // (el JOIN los limita a las sucursales que el usuario puede ver).
+    branchId: wanted === 'all' ? null : (wanted || req.branchId || null),
     allowed,
     warehouseId: req.query?.warehouse_id ? String(req.query.warehouse_id) : null,
     locationId: req.query?.location_id ? String(req.query.location_id) : null,
