@@ -1442,6 +1442,34 @@ exports.lotsExpiring = async (req, res, next) => {
   } catch (e) { next(e) }
 }
 
+/**
+ * Costo promedio ponderado del producto tras recibir `qty` a `unitCost`.
+ * Se calcula sobre el stock de EMPRESA (el catálogo es de empresa, y el costo
+ * vive en el producto, no en la sucursal). Con stock en cero o negativo el
+ * promedio no significa nada: manda el costo de lo que acaba de entrar.
+ */
+async function updateAverageCost(tx, product, qty, unitCost, corriente) {
+  const entran = Number(qty)
+  const costoNuevo = Number(unitCost)
+  if (!Number.isFinite(entran) || entran <= 0) return
+  if (!Number.isFinite(costoNuevo) || costoNuevo < 0) return
+
+  // El mismo producto puede venir en dos líneas del ingreso con costos
+  // distintos: se arrastra el resultado de la anterior en vez de releer.
+  const key = String(product.id)
+  const estado = corriente.get(key) || {
+    stock: Number(product.stock || 0),
+    cost: Number(product.cost || 0),
+  }
+  const promedio = estado.stock > 0
+    ? (estado.stock * estado.cost + entran * costoNuevo) / (estado.stock + entran)
+    : costoNuevo
+  const redondeado = Math.round(promedio * 100) / 100
+  corriente.set(key, { stock: estado.stock + entran, cost: redondeado })
+
+  await tx.product.update({ where: { id: product.id }, data: { cost: redondeado } })
+}
+
 exports.registerIncomingMerchandise = async (req, res, next) => {
   try {
     const body = req.body || {}
@@ -1572,7 +1600,9 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
       }
 
       // Verify all products exist and belong to the supplier
-      const productIds = items.map(item => item.product_id)
+      // Únicos: el mismo producto puede venir en dos líneas (dos lotes, o dos
+      // costos en la misma factura) y contra el crudo la cuenta nunca cuadraba.
+      const productIds = [...new Set(items.map(item => item.product_id))]
       const products = await tx.product.findMany({
         where: {
           id: { in: productIds },
@@ -1637,6 +1667,10 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
       // (llegaron en la misma entrega/factura). ponytail: un solo código por llamada, no por item.
       const autoLotCode = generateLotCode(dateAsUtcWithGtClock)
       let lotsCreated = 0
+      // Stock y costo que va quedando por producto dentro de esta misma entrada:
+      // si el mismo producto viene en dos líneas, la segunda promedia contra lo
+      // que dejó la primera y no contra el dato viejo de la base.
+      const costeoCorriente = new Map()
       // Dónde se guarda lo que llega: la ubicación que eligió quien recibe, o
       // la de recepción por defecto. El lote queda en la misma.
       if (location_id) {
@@ -1660,6 +1694,12 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
 
         const quantity = Number(item.quantity)
         const unitCost = Number(item.unit_cost)
+
+        // Costo promedio ponderado, ANTES de sumar lo que entra: mezcla lo que
+        // ya había al costo viejo con lo que llega al costo nuevo. Sin esto el
+        // costo del producto se quedaba en el del día que se creó, y con él la
+        // valuación del inventario y todos los márgenes.
+        await updateAverageCost(tx, product, quantity, unitCost, costeoCorriente)
 
         // La mercancía entra al stock de la sucursal (y al espejo global)
         const [updated] = await restoreStockMap(tx, new Map([[String(product.id), quantity]]), branchId, {

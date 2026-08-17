@@ -689,11 +689,19 @@ exports.convertToSale = async (req, res, next) => {
         },
       })
 
+      // Mismo criterio que en el punto de venta: el costo se congela al vender.
+      const costos = new Map(
+        (await tx.product.findMany({
+          where: { id: { in: [...new Set(fulfillments.map((f) => f.line.product_id))] } },
+          select: { id: true, cost: true },
+        })).map((p) => [String(p.id), p.cost])
+      )
       await tx.saleItem.createMany({
         data: fulfillments.map(({ line, qty }) => ({
           sale_id: sale.id,
           product_id: line.product_id,
           price: line.unit_price,
+          unit_cost: costos.get(String(line.product_id)) ?? null,
           qty,
         })),
       })

@@ -953,6 +953,10 @@ model SaleItem {
   product_id   String       @db.Uuid
   product      Product      @relation(fields: [product_id], references: [id])
   price        Decimal      @db.Decimal(12, 2)
+  /// Costo del producto AL MOMENTO DE VENDER. Sin esto el asiento contable toma
+  /// el costo de hoy y editar un costo cambia el CMV de ventas viejas.
+  /// Null = venta anterior a este campo; ahí se cae al costo del producto.
+  unit_cost    Decimal?     @db.Decimal(12, 2)
   qty          Int
   return_items ReturnItem[]
 

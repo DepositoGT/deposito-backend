@@ -423,6 +423,8 @@ exports.create = async (req, res, next) => {
           price_promotion: true,
           promotion_valid_until: true,
           available_for_sale: true,
+          // Para congelar el costo en la línea de venta.
+          cost: true,
         },
       })
       const prodMap = new Map(products.map(p => [String(p.id), p]))
@@ -680,10 +682,13 @@ exports.create = async (req, res, next) => {
       })
 
       await tx.saleItem.createMany({
+        // El costo se congela acá: es el de hoy, no el que tenga el producto
+        // cuando alguien contabilice o mire el reporte dentro de seis meses.
         data: resolvedItems.map(it => ({
           sale_id: sale.id,
           product_id: it.product_id,
           price: it.price,
+          unit_cost: prodMap.get(String(it.product_id))?.cost ?? null,
           qty: it.qty,
         })),
       })

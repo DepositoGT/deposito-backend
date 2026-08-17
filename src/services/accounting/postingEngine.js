@@ -75,7 +75,7 @@ async function postPendingOperations(prisma, userId, companyId) {
       id: true, reference: true, date: true, total: true, customer: true, branch_id: true,
       customerContact: { select: { name: true } },
       payment_method: { select: { name: true } },
-      sale_items: { select: { qty: true, product: { select: { cost: true } } } },
+      sale_items: { select: { qty: true, unit_cost: true, product: { select: { cost: true } } } },
     },
     orderBy: { date: 'asc' },
   })
@@ -85,7 +85,11 @@ async function postPendingOperations(prisma, userId, companyId) {
     const total = round2(sale.total)
     if (total <= 0) { track(label, 'total 0'); continue }
     const { base, iva } = splitIva(total, ivaRate)
-    const cost = costBase(round2(sale.sale_items.reduce((s, i) => s + i.qty * Number(i.product.cost || 0), 0)))
+    // El costo congelado en la venta; las ventas viejas (sin él) caen al costo
+    // del producto, que es lo que se usaba antes de guardarlo por línea.
+    const cost = costBase(round2(sale.sale_items.reduce(
+      (s, i) => s + i.qty * Number(i.unit_cost ?? i.product.cost ?? 0), 0
+    )))
     const chargeAccount = cashOrBank(defaults, sale.payment_method?.name)
     const lines = splitVat
       ? [
@@ -137,7 +141,14 @@ async function postPendingOperations(prisma, userId, companyId) {
           payment_method: { select: { name: true } },
         },
       },
-      return_items: { select: { qty_returned: true, product: { select: { cost: true } } } },
+      return_items: {
+        select: {
+          qty_returned: true,
+          // Lo devuelto vuelve al inventario al costo con el que salió.
+          sale_item: { select: { unit_cost: true } },
+          product: { select: { cost: true } },
+        },
+      },
     },
     orderBy: { return_date: 'asc' },
   })
@@ -147,7 +158,9 @@ async function postPendingOperations(prisma, userId, companyId) {
     const refund = round2(ret.total_refund)
     if (refund <= 0) { track(label, 'monto 0'); continue }
     const { base, iva } = splitIva(refund, ivaRate)
-    const cost = costBase(round2(ret.return_items.reduce((s, i) => s + i.qty_returned * Number(i.product.cost || 0), 0)))
+    const cost = costBase(round2(ret.return_items.reduce(
+      (s, i) => s + i.qty_returned * Number(i.sale_item?.unit_cost ?? i.product.cost ?? 0), 0
+    )))
     const refundAccount = cashOrBank(defaults, ret.sale?.payment_method?.name)
     const lines = splitVat
       ? [
