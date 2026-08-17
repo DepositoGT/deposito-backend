@@ -24,6 +24,7 @@ const BRAND = {
 
 // Utility: parse period range (supports: week, month, quarter, semester, year, all)
 const { branchWhere } = require('../middlewares/tenant')
+const { inTransitTotals } = require('../services/inTransit')
 
 /** Sucursales que alcanza el reporte: la activa, o todas en vista consolidada. */
 function scopeBranchIds(req) {
@@ -793,6 +794,15 @@ async function getFinancialData(startUtc, endUtc, req) {
     inventoryUnits += st
   }
 
+  // Lo enviado y no recibido no está en ningún anaquel, así que no aparece
+  // arriba, pero sigue siendo de la empresa: sin esta línea la valuación queda
+  // corta y no cuadra contra la cuenta contable de Inventario. Acotado a un
+  // almacén o ubicación no aplica: el tránsito no vive en ninguno.
+  const { active: filtradoPorAlmacen } = warehouseFilter(req)
+  const enTransito = filtradoPorAlmacen
+    ? { units: 0, value: 0 }
+    : await inTransitTotals(req.companyId, products, { branchIds: scopeBranchIds(req) })
+
   const purchaseLogs = await prisma.purchaseLog.findMany({
     where: { date: { gte: startUtc, lte: endUtc }, product: { company_id: req.companyId } },
     select: {
@@ -876,6 +886,11 @@ async function getFinancialData(startUtc, endUtc, req) {
     inventoryValue: Number(inventoryValue.toFixed(2)),
     inventoryUnits,
     inventorySkuCount: products.length,
+    inTransitUnits: enTransito.units,
+    inTransitValue: Number(enTransito.value.toFixed(2)),
+    // Lo que la empresa posee: anaqueles + camioneta. Es la cifra que se compara
+    // contra la cuenta contable de Inventario.
+    inventoryValueOwned: Number((inventoryValue + enTransito.value).toFixed(2)),
     purchasesPeriod: Number(purchasesTotal.toFixed(2)),
     purchaseLogLines: purchaseLogs.length,
     purchasesBySupplier: purchasesBySupplierList,
@@ -1398,6 +1413,11 @@ async function financialReport(req, res, next) {
         `Valor inventario (fecha generación),${money(data.inventoryValue)}`,
         `Unidades en stock,${data.inventoryUnits}`,
         `SKUs activos,${data.inventorySkuCount}`,
+        ...(data.inTransitUnits > 0 ? [
+          `En tránsito (enviado sin recibir),${money(data.inTransitValue)}`,
+          `Unidades en tránsito,${data.inTransitUnits}`,
+          `Valor total propiedad de la empresa,${money(data.inventoryValueOwned)}`,
+        ] : []),
         `Compras registradas período,${money(data.purchasesPeriod)}`,
         `Líneas de compra (movimientos),${data.purchaseLogLines}`,
         `Ingresos brutos ventas,${money(data.totalRevenueGross)}`,
@@ -1474,6 +1494,10 @@ async function financialReport(req, res, next) {
       .fillColor(BRAND.muted)
       .text(
         `Stock: ${data.inventoryUnits} u. | SKUs: ${data.inventorySkuCount} | ` +
+          (data.inTransitUnits > 0
+            ? `En tránsito: ${data.inTransitUnits} u. (${money(data.inTransitValue)}) | ` +
+              `Total propiedad de la empresa: ${money(data.inventoryValueOwned)} | `
+            : '') +
           `Movimientos de compra: ${data.purchaseLogLines} | ` +
           `Rotación (CMV / valor inv.): ${rotTxt} | Días aprox. de inventario: ${dInvTxt}`,
         doc.page.margins.left,
@@ -2830,6 +2854,8 @@ module.exports = {
   drawSummaryCards,
   sendCsv,
   salesReport,
+  // Expuesto para probarlo sin armar un PDF.
+  getFinancialData,
   inventoryReport,
   suppliersReport,
   financialReport,
