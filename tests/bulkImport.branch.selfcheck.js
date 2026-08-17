@@ -9,17 +9,22 @@ const { validateBulkData, bulkCreateProducts } = require('../src/services/bulkIm
 const { defaultLocationId } = require('../src/services/stockLocations')
 
 async function main() {
+  // Código propio de esta corrida: el archivo describe una bodega, y la prueba
+  // tiene que poder correrse dos veces sobre la misma base.
+  const CODIGO = `750${String(Date.now()).slice(-10)}`
   const co = await prisma.company.findFirst()
   const cat = await prisma.productCategory.findFirst({ where: { company_id: co.id } })
     || await prisma.productCategory.create({ data: { name: 'General', company_id: co.id } })
   const a = await prisma.branch.findFirst({ where: { company_id: co.id } })
-  const b = await prisma.branch.create({ data: { company_id: co.id, name: 'Segunda', code: `SEG${Date.now() % 1000}` } })
+  const b = await prisma.branch.create({
+    data: { company_id: co.id, name: 'Segunda', code: `S${String(Date.now()).slice(-9)}` },
+  })
 
   const prov = await prisma.supplier.findFirst({ where: { company_id: co.id, party_type: 'SUPPLIER' } })
     || await prisma.supplier.create({ data: { name: 'Prov', contact: 'c', company_id: co.id, party_type: 'SUPPLIER' } })
   const fila = (stock) => ({
     nombre: 'Ron Importado', categoria: cat.name, proveedor: prov.name, precio: '100', costo: '60',
-    stock: String(stock), codigo_barras: '7501234567890',
+    stock: String(stock), codigo_barras: CODIGO,
   })
 
   // --- Primera sucursal: se crea el producto ---
@@ -29,7 +34,7 @@ async function main() {
   assert.strictEqual(r1.created, 1, 'crea el producto')
   assert.strictEqual(r1.adopted, 0, 'y no adopta nada')
 
-  const prod = await prisma.product.findFirst({ where: { barcode: '7501234567890' } })
+  const prod = await prisma.product.findFirst({ where: { barcode: CODIGO } })
   const enA = await prisma.productStock.findUnique({
     where: { product_id_branch_id: { product_id: prod.id, branch_id: a.id } },
   })
@@ -44,7 +49,7 @@ async function main() {
   assert.strictEqual(r2.created, 0, 'no duplica el producto en el catálogo')
   assert.strictEqual(r2.adopted, 1, 'lo adopta en la segunda sucursal')
 
-  const cuantos = await prisma.product.count({ where: { barcode: '7501234567890' } })
+  const cuantos = await prisma.product.count({ where: { barcode: CODIGO } })
   assert.strictEqual(cuantos, 1, 'sigue habiendo un solo producto en el catálogo')
 
   const enB = await prisma.productStock.findUnique({
