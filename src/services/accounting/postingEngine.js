@@ -272,6 +272,65 @@ async function postPendingOperations(prisma, userId, companyId) {
     track(label, reason)
   }
 
+  // ---- Ajustes de inventario (manuales, conteos, bajas de lote) ----
+  // Sin esto la cuenta de Inventario solo sube con compras y baja con ventas, y
+  // se separa de la valuación física sin que nada lo avise. Se excluyen a
+  // propósito: traslados y movimientos internos (valor neto cero para la
+  // empresa), INITIAL (carga de apertura, no es un gasto) y los kits, que son
+  // una reclasificación entre productos.
+  const doneAdjust = await postedIds(prisma, 'STOCK_ADJUSTMENT', companyId)
+  // ponytail: el valor se toma al costo de hoy; el libro de movimientos no
+  // guarda costo. Con el promedio ponderado del #3 es el costo vigente del
+  // producto — si algún día se necesita el histórico exacto, va una columna
+  // `unit_cost` en stock_movements.
+  const adjustments = await prisma.$queryRaw`
+    SELECT COALESCE(m.group_id::text, m.id::text) AS key,
+           MIN(m.created_at)      AS date,
+           MIN(m.branch_id::text) AS branch_id,
+           MIN(m.reason::text)    AS reason,
+           SUM(m.qty * p.cost)    AS value
+    FROM stock_movements m
+    JOIN products p ON p.id = m.product_id
+    JOIN branches b ON b.id = m.branch_id
+    WHERE b.company_id = ${companyId}::uuid
+      AND m.reason IN ('MANUAL_ADJUST', 'COUNT_ADJUST')
+    GROUP BY 1
+    ORDER BY 2 ASC
+  `
+  for (const adj of adjustments) {
+    if (doneAdjust.has(adj.key)) continue
+    const esConteo = adj.reason === 'COUNT_ADJUST'
+    const label = `${esConteo ? 'Ajuste por conteo' : 'Ajuste de inventario'} (${adj.key.slice(0, 8)})`
+    const value = costBase(round2(Number(adj.value || 0)))
+    if (value === 0) { track(label, 'valor 0'); continue }
+    // Sobrante: entra inventario. Merma: sale. En ambos casos la contrapartida
+    // es el costo de lo vendido.
+    // ponytail: cuentas propias de merma y sobrante si se quieren separadas en
+    // el estado de resultados; hoy no existen en el mapeo por defecto y
+    // agregarlas obligatorias rompería a toda empresa ya configurada.
+    const monto = Math.abs(value)
+    const lines = value > 0
+      ? [
+          { account_id: defaults.inventory.id, debit: monto, credit: 0 },
+          { account_id: defaults.cogs.id, debit: 0, credit: monto },
+        ]
+      : [
+          { account_id: defaults.cogs.id, debit: monto, credit: 0 },
+          { account_id: defaults.inventory.id, debit: 0, credit: monto },
+        ]
+    const reason = await tryPost(prisma, () => ({
+      company_id: companyId,
+      branch_id: adj.branch_id,
+      date: adj.date,
+      description: esConteo ? 'Ajuste por conteo de inventario' : 'Ajuste de inventario',
+      source_type: 'STOCK_ADJUSTMENT',
+      source_id: adj.key,
+      created_by: userId,
+      lines,
+    }))
+    track(label, reason)
+  }
+
   // ---- Compras PAID sin abonos (flujo viejo): pago sintético por el total ----
   for (const purchase of purchases) {
     if (purchase.payment_status !== 'PAID' || purchase.paymentEntries.length > 0) continue

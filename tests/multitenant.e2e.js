@@ -295,7 +295,11 @@ async function main() {
   await prisma.journalEntry.create({
     data: { company_id: globex.id, entry_number: 'A-000001', date: new Date(), description: 'y', source_type: 'SALE', source_id: 's1' },
   })
-  const entries = await prisma.journalEntry.count()
+  // Acotado a estas dos empresas: la base de pruebas la comparten varias suites
+  // y un conteo global cuenta los asientos de las demás.
+  const entries = await prisma.journalEntry.count({
+    where: { company_id: { in: [acme.id, globex.id] } },
+  })
   assert(entries === 2, 'la numeración e idempotencia de asientos es por empresa')
 
   console.log('\n== 9. Constraints de aislamiento ==')

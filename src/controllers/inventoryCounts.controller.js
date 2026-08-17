@@ -286,7 +286,12 @@ async function applyStockTransaction(tx, sessionId, branchId) {
     bucket.get(L.location_id).set(String(L.product_id), Math.abs(delta))
   }
 
-  const countCtx = { reason: 'COUNT_ADJUST', refType: 'inventory_count', refId: String(sessionId) }
+  // El grupo hace que el cierre del conteo sea UN asiento contable, no uno por
+  // producto ajustado.
+  const countCtx = {
+    reason: 'COUNT_ADJUST', refType: 'inventory_count', refId: String(sessionId),
+    groupId: require('crypto').randomUUID(),
+  }
   for (const [location_id, map] of ups) {
     await restoreStockMap(tx, map, branchId, { ...countCtx, locationId: location_id })
   }

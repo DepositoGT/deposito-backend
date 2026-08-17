@@ -113,6 +113,9 @@ exports.createAdjustment = async (req, res, next) => {
     const ctx = {
       reason: 'MANUAL_ADJUST',
       refType: 'adjustment',
+      // Un ajuste es una sola operación aunque toque diez productos: el asiento
+      // contable y el kardex lo leen por este grupo.
+      groupId: require('crypto').randomUUID(),
       locationId: owned.id,
       userId: req.user?.sub || null,
       notes: notes ? String(notes).trim().slice(0, 300) : null,

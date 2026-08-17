@@ -1547,6 +1547,9 @@ enum JournalSourceType {
   PURCHASE
   PURCHASE_PAYMENT
   CLOSING
+  /// Ajustes de inventario: manuales, diferencias de conteo y bajas de lote.
+  /// Va al final: ADD VALUE lo agrega ahí y el orden del enum es el de la base.
+  STOCK_ADJUSTMENT
 }
 
 /// Cuenta contable (catálogo). `is_group` = agrupadora, no recibe movimientos.
