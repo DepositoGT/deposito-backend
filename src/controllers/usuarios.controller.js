@@ -96,21 +96,35 @@ exports.list = async (req, res, next) => {
     
     // Filtros opcionales
     const { role_id, search, branch_id } = req.query || {}
-    // Solo usuarios de la empresa activa; opcionalmente de una sucursal concreta.
-    const where = { user_companies: { some: { company_id: requireCompany(req) } } }
+    // Usuarios de la empresa activa, MÁS los que quedaron sin ninguna empresa:
+    // esos no son de nadie y, si no salen aquí, no hay forma de recuperarlos
+    // desde la aplicación aunque sigan existiendo en la base.
+    const companyId = requireCompany(req)
+    const where = {
+      AND: [
+        {
+          OR: [
+            { user_companies: { some: { company_id: companyId } } },
+            { user_companies: { none: {} } },
+          ],
+        },
+      ],
+    }
     if (branch_id) {
-      where.user_branches = { some: { branch_id: String(branch_id) } }
+      where.AND.push({ user_branches: { some: { branch_id: String(branch_id) } } })
     }
 
     if (role_id) {
-      where.role_id = Number(role_id)
+      where.AND.push({ role_id: Number(role_id) })
     }
-    
+
     if (search) {
-      where.OR = [
-        { name: { contains: String(search), mode: 'insensitive' } },
-        { email: { contains: String(search), mode: 'insensitive' } }
-      ]
+      where.AND.push({
+        OR: [
+          { name: { contains: String(search), mode: 'insensitive' } },
+          { email: { contains: String(search), mode: 'insensitive' } }
+        ],
+      })
     }
     
     const totalItems = await prisma.user.count({ where })
@@ -126,6 +140,7 @@ exports.list = async (req, res, next) => {
           where: { branch: { company_id: req.companyId } },
           select: { branch: { select: { id: true, name: true, code: true, active: true } } },
         },
+        user_companies: { select: { company_id: true } },
       },
       orderBy: { name: 'asc' },
       skip: (safePage - 1) * pageSize,
@@ -151,6 +166,9 @@ exports.list = async (req, res, next) => {
         cash_register: u.cashRegister,
         default_branch_id: u.default_branch_id,
         branches: u.user_branches.map((ub) => ub.branch),
+        // Sin empresa no puede entrar a ninguna; sin sucursal entra pero no
+        // puede operar. La pantalla lo marca para que se pueda arreglar.
+        in_company: u.user_companies.some((uc) => uc.company_id === companyId),
         created_at: u.created_at,
         updated_at: u.updated_at
       })),
@@ -291,8 +309,16 @@ exports.logout = async (req, res, next) => {
 exports.getById = async (req, res, next) => {
   try {
     const { id } = req.params
+    const companyId = requireCompany(req)
     const user = await prisma.user.findFirst({
-      where: { id, user_companies: { some: { company_id: requireCompany(req) } } },
+      where: {
+        id,
+        OR: [
+          { user_companies: { some: { company_id: companyId } } },
+          // Huérfano: hay que poder abrir su ficha para devolverle el acceso.
+          { user_companies: { none: {} } },
+        ],
+      },
       include: {
         role: true,
         cashRegister: { select: { id: true, name: true, code: true, active: true } },
