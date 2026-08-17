@@ -71,6 +71,68 @@ function listScope(req) {
   }
 }
 
+/**
+ * De qué habla el documento: "Todas las sucursales" o
+ * "Central · Bodega Central · GENERAL". Va impreso en la exportación para que
+ * un archivo suelto no se confunda con el de otra sucursal.
+ */
+async function scopeLabel(req, scope) {
+  const partes = []
+  if (scope.branchId) {
+    const b = await prisma.branch.findUnique({ where: { id: scope.branchId }, select: { name: true } })
+    partes.push(b?.name || 'Sucursal')
+  } else {
+    partes.push('Todas las sucursales')
+  }
+  if (scope.warehouseId) {
+    const w = await prisma.warehouse.findUnique({ where: { id: scope.warehouseId }, select: { name: true } })
+    if (w) partes.push(w.name)
+  }
+  if (scope.locationId) {
+    const l = await prisma.stockLocation.findUnique({ where: { id: scope.locationId }, select: { code: true } })
+    if (l) partes.push(l.code)
+  }
+  return partes.join(' · ')
+}
+
+/**
+ * Filtros del listado de inventario. Lo usan la pantalla y la exportación: si
+ * exportás lo que estás viendo, tiene que salir lo mismo que ves.
+ */
+function buildProductListWhere(req, scope) {
+  const { includeDeleted, search, category, supplier, forSale } = req.query || {}
+  const forSaleOnly =
+    forSale === 'true' || forSale === '1' || String(forSale || '').toLowerCase() === 'yes'
+
+  const where = includeDeleted === 'true' ? {} : { deleted: false }
+  where.company_id = req.companyId
+
+  // ?in_branch=1 → solo los productos que esa sucursal maneja (tienen fila de
+  // stock propia), en vez de todo el catálogo de la empresa en cero.
+  const inBranchOnly = req.query.in_branch === '1' || req.query.in_branch === 'true'
+  if (inBranchOnly && scope.branchId) {
+    where.branch_stocks = { some: { branch_id: scope.branchId } }
+  }
+  // Acotado a un almacén o anaquel, lo que se lista es lo que está ahí: un
+  // catálogo entero en cero no dice nada de una ubicación.
+  if (scope.warehouseId || scope.locationId) {
+    where.location_stocks = { some: { stock: { not: 0 }, ...scopeLocationWhere(scope) } }
+  }
+  if (forSaleOnly) where.available_for_sale = true
+  if (search) {
+    where.OR = [
+      { name: { contains: String(search), mode: 'insensitive' } },
+      { brand: { contains: String(search), mode: 'insensitive' } },
+      { barcode: { contains: String(search), mode: 'insensitive' } },
+    ]
+  }
+  if (category && category !== 'all') {
+    where.category = { name: { equals: String(category), mode: 'insensitive' } }
+  }
+  if (supplier) where.supplier_id = String(supplier)
+  return where
+}
+
 /** Where de ubicación para el alcance dado (sirve para filtrar y para sumar). */
 function scopeLocationWhere(scope) {
   return {
@@ -155,51 +217,8 @@ exports.list = async (req, res, next) => {
   try {
     const page = Math.max(1, Number(req.query.page ?? 1))
     const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 20)))
-    const { includeDeleted, search, category, supplier, forSale } = req.query || {}
-    const forSaleOnly =
-      forSale === 'true' ||
-      forSale === '1' ||
-      String(forSale || '').toLowerCase() === 'yes'
-
-    const where = includeDeleted === 'true' ? {} : { deleted: false }
-    where.company_id = req.companyId
-    // El alcance de la pantalla: sucursal / almacén / ubicación.
     const scope = listScope(req)
-    // ?in_branch=1 → solo los productos que esa sucursal maneja (tienen fila de
-    // stock propia), en vez de todo el catálogo de la empresa en cero.
-    const inBranchOnly = req.query.in_branch === '1' || req.query.in_branch === 'true'
-    if (inBranchOnly && scope.branchId) {
-      where.branch_stocks = { some: { branch_id: scope.branchId } }
-    }
-    // Acotado a un almacén o anaquel, lo que se lista es lo que está ahí: un
-    // catálogo entero en cero no dice nada de una ubicación.
-    if (scope.warehouseId || scope.locationId) {
-      where.location_stocks = { some: { stock: { not: 0 }, ...scopeLocationWhere(scope) } }
-    }
-    if (forSaleOnly) {
-      where.available_for_sale = true
-    }
-    
-    // Filtro de búsqueda
-    if (search) {
-      where.OR = [
-        { name: { contains: String(search), mode: 'insensitive' } },
-        { brand: { contains: String(search), mode: 'insensitive' } },
-        { barcode: { contains: String(search), mode: 'insensitive' } }
-      ]
-    }
-    
-    // Filtro de categoría
-    if (category && category !== 'all') {
-      where.category = {
-        name: { equals: String(category), mode: 'insensitive' }
-      }
-    }
-    
-    // Filtro de proveedor
-    if (supplier) {
-      where.supplier_id = String(supplier)
-    }
+    const where = buildProductListWhere(req, scope)
     
     const totalItems = await prisma.product.count({ where })
     const totalPages = Math.max(1, Math.ceil(totalItems / pageSize))
@@ -769,9 +788,13 @@ exports.reportPdf = async (req, res, next) => {
     const companyName = branding.company_name
     const currencyCode = (branding.currency_code && branding.currency_code.trim()) || 'GTQ'
     const money = (v) => new Intl.NumberFormat('es-GT', { style: 'currency', currency: currencyCode }).format(Number(v || 0))
-    const where = { deleted: false, company_id: req.companyId }
+    // Se exporta LO QUE SE ESTÁ VIENDO: mismo filtro y mismo alcance que el
+    // listado (sucursal, almacén, ubicación, búsqueda, categoría, proveedor).
+    const scope = listScope(req)
+    const where = buildProductListWhere(req, scope)
     const idsParam = req.query.ids
     if (idsParam && typeof idsParam === 'string' && idsParam.trim()) {
+      // Con selección explícita manda la selección, no los filtros de pantalla.
       const ids = idsParam.split(',').map((id) => id.trim()).filter(Boolean)
       if (ids.length > 0) where.id = { in: ids }
     }
@@ -781,12 +804,7 @@ exports.reportPdf = async (req, res, next) => {
       include: { category: true, supplier: true, status: true },
       orderBy: { name: 'asc' },
     })
-    const products = await overlayBranchStock(productRows, req.branchId)
-
-    const doc = new PDFDocument({ size: 'A4', margin: 50 })
-    res.setHeader('Content-Type', 'application/pdf')
-    res.setHeader('Content-Disposition', 'inline; filename="productos_reporte.pdf"')
-    doc.pipe(res)
+    const products = await overlayScopedStock(productRows, scope)
 
     // Optional columns from query (e.g. ?fields=name,category,price,stock for cotización)
     const fieldsParam = req.query.fields
@@ -850,6 +868,30 @@ exports.reportPdf = async (req, res, next) => {
       description: 'Descripción',
     }
 
+    // CSV: las mismas columnas y las mismas filas que el PDF, en texto plano.
+    if (['csv', 'excel'].includes(String(req.query.format || '').toLowerCase())) {
+      const cols = fields?.length ? fields : ['name', 'category', 'brand', 'size', 'barcode', 'cost', 'price', 'stock', 'min_stock', 'supplier', 'status']
+      const { sendCsv } = require('./reports.controller')
+      const alcance = await scopeLabel(req, scope)
+      sendCsv(res, 'inventario', [
+        'INVENTARIO',
+        `Alcance,${alcance}`,
+        `Generado,${new Date().toLocaleString('es-GT')}`,
+        `Productos,${products.length}`,
+        `Unidades,${products.reduce((sum, p) => sum + Number(p.stock || 0), 0)}`,
+      ], [{
+        title: 'Productos',
+        columns: cols.map((c) => headers[c] || c),
+        rows: products.map((p) => cols.map((c) => getCellValue(p, c))),
+      }])
+      return
+    }
+
+    const doc = new PDFDocument({ size: 'A4', margin: 50 })
+    res.setHeader('Content-Type', 'application/pdf')
+    res.setHeader('Content-Disposition', 'inline; filename="productos_reporte.pdf"')
+    doc.pipe(res)
+
     // Header block
     if (branding.logoBuffer) {
       try {
@@ -862,6 +904,8 @@ exports.reportPdf = async (req, res, next) => {
     doc.fillColor('#0b1220').fontSize(22).font('Helvetica-Bold').text(`${companyName} - Informe de Productos`, { align: 'left' })
     doc.moveDown(0.25)
     doc.fontSize(10).font('Helvetica').fillColor('#475569').text(`Generado: ${new Date().toLocaleString('es-GT')}`)
+    // Sin esto, dos PDF de sucursales distintas son indistinguibles.
+    doc.fontSize(10).fillColor('#475569').text(`Alcance: ${await scopeLabel(req, scope)}`)
     if (fields && fields.length > 0) {
       doc.fontSize(9).fillColor('#64748b').text(`Columnas: ${fields.map((f) => headers[f] || f).join(', ')}`)
     }
