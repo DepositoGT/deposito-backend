@@ -793,7 +793,12 @@ model Sale {
   sales_channel       SalesChannel            @default(POS)
   orderLink           CommercialDocumentSale?
 
+  /// Clave del intento de cobro. Un doble clic o un reintento tras un timeout
+  /// repite la misma y devuelve la venta que ya existe en vez de crear otra.
+  idempotency_key String? @db.VarChar(64)
+
   @@unique([branch_id, reference])
+  @@unique([branch_id, idempotency_key])
   @@index([created_by])
   @@index([cash_register_session_id])
   /// Listados por estado y fecha (p. ej. resumen de cliente, ventas «Completada»)

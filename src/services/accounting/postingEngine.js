@@ -14,16 +14,37 @@
  * (source_type, source_id). No modifica ningún flujo operativo.
  */
 
+const { Prisma } = require('@prisma/client')
 const { splitIva, round2 } = require('./logic')
 const { createEntry, getDefaultAccounts, getTaxConfig, AccountingError } = require('./core')
 
-/** ids ya contabilizados para un source_type. */
-async function postedIds(prisma, sourceType, companyId) {
-  const rows = await prisma.journalEntry.findMany({
-    where: { source_type: sourceType, source_id: { not: null }, company_id: companyId },
-    select: { source_id: true },
-  })
-  return new Set(rows.map((r) => r.source_id))
+/**
+ * Cuántas operaciones sin contabilizar se procesan por corrida. Antes se traían
+ * TODAS las ventas de la empresa —sin ventana ni paginación— más el conjunto de
+ * las ya contabilizadas en memoria para descartarlas: con doscientas ventas es
+ * instantáneo y con cincuenta mil es un timeout del pooler.
+ */
+const BATCH = 500
+
+/**
+ * ids todavía sin asiento, en orden cronológico y por tandas. El descarte va en
+ * la base (NOT EXISTS contra el índice único de idempotencia), no en memoria.
+ * `candidatos` debe seleccionar `id text` y `ord` para ordenar.
+ */
+async function pendingIds(prisma, sourceType, companyId, candidatos) {
+  const rows = await prisma.$queryRaw`
+    WITH c AS (${candidatos})
+    SELECT c.id FROM c
+    WHERE NOT EXISTS (
+      SELECT 1 FROM journal_entries je
+      WHERE je.company_id = ${companyId}::uuid
+        AND je.source_type = ${sourceType}::"JournalSourceType"
+        AND je.source_id = c.id
+    )
+    ORDER BY c.ord ASC
+    LIMIT ${BATCH}
+  `
+  return rows.map((r) => String(r.id))
 }
 
 /** Cuenta de cargo según método de pago: efectivo→Caja, crédito→Clientes, resto→Bancos. */
@@ -68,9 +89,15 @@ async function postPendingOperations(prisma, userId, companyId) {
   }
 
   // ---- Ventas completadas ----
-  const doneSales = await postedIds(prisma, 'SALE', companyId)
+  const pendingSales = await pendingIds(prisma, 'SALE', companyId, Prisma.sql`
+    SELECT s.id::text AS id, s.date AS ord
+    FROM sales s
+    JOIN branches b ON b.id = s.branch_id
+    JOIN sale_statuses st ON st.id = s.status_id
+    WHERE b.company_id = ${companyId}::uuid AND st.name = 'Completada'
+  `)
   const sales = await prisma.sale.findMany({
-    where: { status: { name: 'Completada' }, branch: { company_id: companyId } },
+    where: { id: { in: pendingSales } },
     select: {
       id: true, reference: true, date: true, total: true, customer: true, branch_id: true,
       customerContact: { select: { name: true } },
@@ -80,7 +107,6 @@ async function postPendingOperations(prisma, userId, companyId) {
     orderBy: { date: 'asc' },
   })
   for (const sale of sales) {
-    if (doneSales.has(sale.id)) continue
     const label = `Venta ${sale.reference || sale.id.slice(0, 8)}`
     const total = round2(sale.total)
     if (total <= 0) { track(label, 'total 0'); continue }
@@ -129,9 +155,16 @@ async function postPendingOperations(prisma, userId, companyId) {
   }
 
   // ---- Devoluciones aprobadas/completadas ----
-  const doneReturns = await postedIds(prisma, 'RETURN', companyId)
+  const pendingReturns = await pendingIds(prisma, 'RETURN', companyId, Prisma.sql`
+    SELECT r.id::text AS id, r.return_date AS ord
+    FROM returns r
+    JOIN sales s ON s.id = r.sale_id
+    JOIN branches b ON b.id = s.branch_id
+    JOIN return_statuses rs ON rs.id = r.status_id
+    WHERE b.company_id = ${companyId}::uuid AND rs.name IN ('Aprobada', 'Completada')
+  `)
   const returns = await prisma.return.findMany({
-    where: { status: { name: { in: ['Aprobada', 'Completada'] } }, sale: { branch: { company_id: companyId } } },
+    where: { id: { in: pendingReturns } },
     select: {
       id: true, return_date: true, total_refund: true,
       sale: {
@@ -153,7 +186,6 @@ async function postPendingOperations(prisma, userId, companyId) {
     orderBy: { return_date: 'asc' },
   })
   for (const ret of returns) {
-    if (doneReturns.has(ret.id)) continue
     const label = `Devolución venta ${ret.sale?.reference || ret.id.slice(0, 8)}`
     const refund = round2(ret.total_refund)
     if (refund <= 0) { track(label, 'monto 0'); continue }
@@ -202,9 +234,23 @@ async function postPendingOperations(prisma, userId, companyId) {
   }
 
   // ---- Compras (ingresos de mercancía) ----
-  const donePurchases = await postedIds(prisma, 'PURCHASE', companyId)
+  // Las compras se recorren dos veces (asiento de compra y pago sintético del
+  // flujo viejo), así que acá se traen las pendientes de cualquiera de los dos.
+  const pendingPurchases = await pendingIds(prisma, 'PURCHASE', companyId, Prisma.sql`
+    SELECT im.id::text AS id, im.date AS ord
+    FROM incoming_merchandise im
+    JOIN branches b ON b.id = im.branch_id
+    WHERE b.company_id = ${companyId}::uuid
+  `)
+  const pendingSynthPayments = await pendingIds(prisma, 'PURCHASE_PAYMENT', companyId, Prisma.sql`
+    SELECT ('pm-synth:' || im.id::text) AS id, im.date AS ord
+    FROM incoming_merchandise im
+    JOIN branches b ON b.id = im.branch_id
+    WHERE b.company_id = ${companyId}::uuid AND im.payment_status = 'PAID'
+  `)
+  const synthPurchaseIds = pendingSynthPayments.map((k) => k.slice('pm-synth:'.length))
   const purchases = await prisma.incomingMerchandise.findMany({
-    where: { branch: { company_id: companyId } },
+    where: { id: { in: [...new Set([...pendingPurchases, ...synthPurchaseIds])] } },
     select: {
       id: true, date: true, payment_status: true, paid_at: true, branch_id: true,
       supplier: { select: { name: true } },
@@ -213,8 +259,11 @@ async function postPendingOperations(prisma, userId, companyId) {
     },
     orderBy: { date: 'asc' },
   })
+  // `purchases` trae también las que solo necesitan el pago sintético de más
+  // abajo, así que acá se filtran las que de verdad esperan asiento de compra.
+  const esperaAsientoDeCompra = new Set(pendingPurchases)
   for (const purchase of purchases) {
-    if (donePurchases.has(purchase.id)) continue
+    if (!esperaAsientoDeCompra.has(purchase.id)) continue
     const label = `Compra a ${purchase.supplier?.name || 'proveedor'} (${purchase.id.slice(0, 8)})`
     const total = round2(purchase.items.reduce((s, i) => s + i.quantity * Number(i.unit_cost), 0))
     if (total <= 0) { track(label, 'total 0'); continue }
@@ -242,9 +291,15 @@ async function postPendingOperations(prisma, userId, companyId) {
   }
 
   // ---- Abonos a proveedores ----
-  const donePayments = await postedIds(prisma, 'PURCHASE_PAYMENT', companyId)
+  const pendingPayments = await pendingIds(prisma, 'PURCHASE_PAYMENT', companyId, Prisma.sql`
+    SELECT pe.id::text AS id, pe.paid_at AS ord
+    FROM incoming_merchandise_payment_entries pe
+    JOIN incoming_merchandise im ON im.id = pe.incoming_merchandise_id
+    JOIN branches b ON b.id = im.branch_id
+    WHERE b.company_id = ${companyId}::uuid
+  `)
   const payments = await prisma.incomingMerchandisePaymentEntry.findMany({
-    where: { incomingMerchandise: { branch: { company_id: companyId } } },
+    where: { id: { in: pendingPayments } },
     select: {
       id: true, amount: true, paid_at: true,
       incomingMerchandise: { select: { branch_id: true, supplier: { select: { name: true } } } },
@@ -252,7 +307,6 @@ async function postPendingOperations(prisma, userId, companyId) {
     orderBy: { paid_at: 'asc' },
   })
   for (const pay of payments) {
-    if (donePayments.has(pay.id)) continue
     const label = `Abono a ${pay.incomingMerchandise?.supplier?.name || 'proveedor'} (${pay.id.slice(0, 8)})`
     const amount = round2(pay.amount)
     if (amount <= 0) { track(label, 'monto 0'); continue }
@@ -278,7 +332,7 @@ async function postPendingOperations(prisma, userId, companyId) {
   // propósito: traslados y movimientos internos (valor neto cero para la
   // empresa), INITIAL (carga de apertura, no es un gasto) y los kits, que son
   // una reclasificación entre productos.
-  const doneAdjust = await postedIds(prisma, 'STOCK_ADJUSTMENT', companyId)
+
   // ponytail: el valor se toma al costo de hoy; el libro de movimientos no
   // guarda costo. Con el promedio ponderado del #3 es el costo vigente del
   // producto — si algún día se necesita el histórico exacto, va una columna
@@ -294,11 +348,17 @@ async function postPendingOperations(prisma, userId, companyId) {
     JOIN branches b ON b.id = m.branch_id
     WHERE b.company_id = ${companyId}::uuid
       AND m.reason IN ('MANUAL_ADJUST', 'COUNT_ADJUST')
+      AND NOT EXISTS (
+        SELECT 1 FROM journal_entries je
+        WHERE je.company_id = ${companyId}::uuid
+          AND je.source_type = 'STOCK_ADJUSTMENT'
+          AND je.source_id = COALESCE(m.group_id::text, m.id::text)
+      )
     GROUP BY 1
     ORDER BY 2 ASC
+    LIMIT ${BATCH}
   `
   for (const adj of adjustments) {
-    if (doneAdjust.has(adj.key)) continue
     const esConteo = adj.reason === 'COUNT_ADJUST'
     const label = `${esConteo ? 'Ajuste por conteo' : 'Ajuste de inventario'} (${adj.key.slice(0, 8)})`
     const value = costBase(round2(Number(adj.value || 0)))
@@ -332,10 +392,11 @@ async function postPendingOperations(prisma, userId, companyId) {
   }
 
   // ---- Compras PAID sin abonos (flujo viejo): pago sintético por el total ----
+  const esperaPagoSintetico = new Set(pendingSynthPayments)
   for (const purchase of purchases) {
     if (purchase.payment_status !== 'PAID' || purchase.paymentEntries.length > 0) continue
     const synthId = `pm-synth:${purchase.id}`
-    if (donePayments.has(synthId)) continue
+    if (!esperaPagoSintetico.has(synthId)) continue
     const total = round2(purchase.items.reduce((s, i) => s + i.quantity * Number(i.unit_cost), 0))
     if (total <= 0) continue
     const label = `Pago compra a ${purchase.supplier?.name || 'proveedor'} (${purchase.id.slice(0, 8)})`
@@ -355,7 +416,13 @@ async function postPendingOperations(prisma, userId, companyId) {
     track(label, reason)
   }
 
-  return { posted, skipped }
+  // Una tanda llena significa que quedaron operaciones sin contabilizar: la
+  // siguiente corrida las toma, en vez de que una sola muera por timeout.
+  const hasMore = [
+    pendingSales, pendingReturns, pendingPurchases, pendingSynthPayments, pendingPayments, adjustments,
+  ].some((a) => a.length >= BATCH)
+
+  return { posted, skipped, hasMore }
 }
 
 module.exports = { postPendingOperations }

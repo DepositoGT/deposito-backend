@@ -351,11 +351,17 @@ exports.create = async (req, res, next) => {
       promotion_codes = [],
       customer_contact_id: customerContactIdRaw,
       sales_channel: salesChannelRaw,
+      idempotency_key: idempotencyKeyRaw,
       ...saleData
     } = req.body
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ message: 'items es requerido' })
     }
+
+    // Clave del intento de cobro: la manda el POS (cabecera o cuerpo) y se
+    // repite tal cual al reintentar. Sin ella todo funciona como antes.
+    const idempotencyKey = String(req.get?.('Idempotency-Key') || idempotencyKeyRaw || '')
+      .trim().slice(0, 64) || null
 
     const totalItems = items.reduce((acc, it) => acc + Number(it.qty || 0), 0)
 
@@ -370,6 +376,17 @@ exports.create = async (req, res, next) => {
     const adminAuthorizedSet = new Set(admin_authorized_products || [])
 
     const branchId = requireBranch(req)
+
+    // El reintento evidente: la venta anterior ya entró y el navegador volvió a
+    // mandar. La carrera (dos envíos a la vez) la corta el índice único, más
+    // abajo.
+    if (idempotencyKey) {
+      const yaExiste = await prisma.sale.findFirst({
+        where: { branch_id: branchId, idempotency_key: idempotencyKey },
+        include: SALE_DETAIL_INCLUDE,
+      })
+      if (yaExiste) return res.status(200).json(yaExiste)
+    }
 
     const created = await prismaTransaction.$transaction(async (tx) => {
       let cashSessionIdForSale = null
@@ -678,6 +695,7 @@ exports.create = async (req, res, next) => {
           status_id: completadaStatus.id,
           created_by: user.sub,
           cash_register_session_id: cashSessionIdForSale || undefined,
+          idempotency_key: idempotencyKey,
         },
       })
 
@@ -723,10 +741,23 @@ exports.create = async (req, res, next) => {
           })
 
           if (row.usedCodeId) {
-            await tx.promotionCode.update({
-              where: { id: row.usedCodeId },
-              data: { current_uses: { increment: 1 } },
-            })
+            // Incremento condicional en una sola consulta. Leer, comparar y
+            // sumar (que es lo que valida arriba) deja pasar dos ventas
+            // simultáneas con el último uso disponible: ambas leen el mismo
+            // valor y ambas incrementan. Cero filas = el límite ya se alcanzó.
+            const aplicados = await tx.$executeRaw`
+              UPDATE promotion_codes pc
+              SET current_uses = pc.current_uses + 1
+              FROM promotions p
+              WHERE pc.id = ${row.usedCodeId}
+                AND p.id = pc.promotion_id
+                AND (p.max_uses IS NULL OR pc.current_uses < p.max_uses)
+            `
+            if (aplicados === 0) {
+              const err = new Error(`El código ${row.usedCode || ''} alcanzó su límite de usos`.trim())
+              err.status = 400
+              throw err
+            }
           }
         }
       }
@@ -744,6 +775,19 @@ exports.create = async (req, res, next) => {
 
     res.status(201).json(fullSale || created)
   } catch (e) {
+    // Dos envíos a la vez con la misma clave: uno gana el índice único y el
+    // otro devuelve la venta que quedó, no un error al cajero.
+    if (e && e.code === 'P2002' && String(e.meta?.target || '').includes('idempotency')) {
+      const branchId = req.branchId
+      const key = String(req.get?.('Idempotency-Key') || req.body?.idempotency_key || '').trim().slice(0, 64)
+      const yaExiste = key && branchId
+        ? await prisma.sale.findFirst({
+            where: { branch_id: branchId, idempotency_key: key },
+            include: SALE_DETAIL_INCLUDE,
+          })
+        : null
+      if (yaExiste) return res.status(200).json(yaExiste)
+    }
     if (e && e.message === 'CASH_SESSION_REQUIRED') {
       return res.status(403).json({
         code: 'CASH_SESSION_REQUIRED',
@@ -794,9 +838,24 @@ exports.updateStatus = async (req, res, next) => {
           include: {
             status: true,
             sale_items: { include: { return_items: { select: { qty_returned: true } } } },
+            cashRegisterSession: { select: { status: true } },
           },
         })
         if (!current) throw new Error('Venta no encontrada')
+
+        // El cierre guardó el teórico recorriendo las ventas del turno. Cambiar
+        // una de ellas después deja la diferencia contra el conteo físico sin
+        // explicación posible. La devolución sí se permite: es un movimiento
+        // nuevo, con su fecha, que no reescribe el arqueo de ayer.
+        if (current.cashRegisterSession?.status === 'CLOSED') {
+          const err = new Error(
+            `La venta ${current.reference || ''} pertenece a un turno de caja ya cerrado y no se puede cambiar de estado. `.trim() +
+            'Registre una devolución en el turno actual.'
+          )
+          err.status = 409
+          err.code = 'CASH_SESSION_CLOSED'
+          throw err
+        }
         // El stock se ajusta en la sucursal DONDE SE VENDIÓ, no en la del request
         const saleBranchId = current.branch_id
 
