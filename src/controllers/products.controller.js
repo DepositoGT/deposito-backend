@@ -717,9 +717,47 @@ exports.remove = async (req, res, next) => {
 
     const owned = await prisma.product.findFirst({
       where: { id: req.params.id, company_id: req.companyId },
-      select: { id: true },
+      select: { id: true, name: true },
     })
     if (!owned) return res.status(404).json({ message: 'Producto no encontrado' })
+
+    // Archivar no puede dejar existencias huérfanas ni documentos apuntando al
+    // vacío: el producto desaparece de las pantallas pero sus unidades y sus
+    // reservas siguen ahí. Quitarlo de UNA sucursal ya exigía stock 0; a nivel
+    // de empresa era más permisivo, que es al revés de como debería ser.
+    const [conStock, reservas, enKits] = await Promise.all([
+      prisma.productStock.findMany({
+        where: { product_id: owned.id, stock: { not: 0 } },
+        select: { stock: true, branch: { select: { name: true } } },
+      }),
+      prisma.stockReservation.count({ where: { product_id: owned.id, status: 'ACTIVE' } }),
+      prisma.productBomLine.findMany({
+        where: { component_product_id: owned.id, kit_product: { deleted: false } },
+        select: { kit_product: { select: { name: true } } },
+      }),
+    ])
+
+    if (conStock.length > 0) {
+      const donde = conStock.map((r) => `${r.branch.name} (${r.stock})`).join(', ')
+      return res.status(400).json({
+        message: `"${owned.name}" todavía tiene existencias en ${donde}. Ajústalas o trasládalas antes de archivarlo.`,
+        code: 'PRODUCT_HAS_STOCK',
+      })
+    }
+    if (reservas > 0) {
+      return res.status(400).json({
+        message: `"${owned.name}" está comprometido en ${reservas} pedido(s) o cotización(es) sin entregar.`,
+        code: 'PRODUCT_HAS_RESERVATIONS',
+      })
+    }
+    if (enKits.length > 0) {
+      const kits = [...new Set(enKits.map((k) => k.kit_product.name))].join(', ')
+      return res.status(400).json({
+        message: `"${owned.name}" es componente de: ${kits}. Sacalo de esos kits antes de archivarlo.`,
+        code: 'PRODUCT_IN_KIT',
+      })
+    }
+
     await prisma.product.update({ where: { id: req.params.id }, data: { deleted: true, deleted_at: dateAsUtcWithGtClock } })
     res.json({ ok: true })
   } catch (e) { next(e) }

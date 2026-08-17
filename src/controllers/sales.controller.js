@@ -784,7 +784,12 @@ exports.updateStatus = async (req, res, next) => {
         // Cargar venta actual con su status e items (por id o por reference)
         const current = await tx.sale.findFirst({
           where: { ...where, branch: { company_id: req.companyId } },
-          include: { status: true, sale_items: true }
+          // Las devoluciones ya devolvieron su parte del stock: sin ellas a la
+          // vista, cancelar devolvía la venta completa y duplicaba lo devuelto.
+          include: {
+            status: true,
+            sale_items: { include: { return_items: { select: { qty_returned: true } } } },
+          },
         })
         if (!current) throw new Error('Venta no encontrada')
         // El stock se ajusta en la sucursal DONDE SE VENDIÓ, no en la del request
@@ -829,10 +834,15 @@ exports.updateStatus = async (req, res, next) => {
         if (wasCompleted && willBeCancelled) {
           console.log(`[STOCK REVERT] Venta ${id}: Completada -> Cancelada. Revirtiendo ajustes de stock...`)
 
-          const stockMap = await expandLinesToStockMap(
-            tx,
-            current.sale_items.map((si) => ({ product_id: si.product_id, qty: si.qty }))
-          )
+          // Solo se devuelve lo que el cliente todavía tiene: lo ya devuelto
+          // volvió al inventario cuando se aprobó la devolución.
+          const porDevolver = current.sale_items
+            .map((si) => {
+              const devuelto = (si.return_items || []).reduce((n, r) => n + Number(r.qty_returned || 0), 0)
+              return { product_id: si.product_id, qty: Math.max(0, Number(si.qty) - devuelto) }
+            })
+            .filter((l) => l.qty > 0)
+          const stockMap = await expandLinesToStockMap(tx, porDevolver)
           const updatedProducts = await restoreStockMap(tx, stockMap, saleBranchId, {
             reason: 'SALE_RETURN', refType: 'sale', refId: String(id), userId: req.user?.sub || null,
           })

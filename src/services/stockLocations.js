@@ -87,7 +87,12 @@ async function salesLocationId(tx, branchId) {
  *   `pickable` frena las ventas, no el corregir lo que hay.
  * @returns {Promise<Array<{ product_id, location_id, qty }>>} qty NEGATIVA
  */
-async function planDispatch(tx, branchId, entries, { adjust = false, preferLocationId = null } = {}) {
+async function planDispatch(
+  tx,
+  branchId,
+  entries,
+  { adjust = false, preferLocationId = null, shortfall = null } = {}
+) {
   const b = requireBranchId(branchId)
   const ids = entries.map(([id]) => String(id))
   if (ids.length === 0) return []
@@ -126,8 +131,20 @@ async function planDispatch(tx, branchId, entries, { adjust = false, preferLocat
       pending -= take
     }
     if (pending > 0) {
-      // El total de la sucursal ya se validó antes: si aquí falta, los espejos
-      // están descuadrados y se reporta en vez de "arreglarlo" callado.
+      // Dos situaciones distintas que antes se trataban igual:
+      //
+      //  - La sucursal TAMPOCO tiene: es una venta autorizada por encima de la
+      //    existencia (el mostrador lo permite con clave de administrador). No
+      //    es un error de datos: se despacha lo que hay y el resto queda en
+      //    negativo en un anaquel, que es la verdad de lo que pasó.
+      //  - La sucursal sí tiene pero las ubicaciones no lo juntan: ahí los
+      //    espejos están descuadrados y hay que gritar, no "arreglarlo" callado.
+      const permitido = shortfall?.allowed.get(String(productId)) || 0
+      if (permitido >= pending && shortfall?.locationId) {
+        out.push({ product_id: String(productId), location_id: shortfall.locationId, qty: -pending })
+        shortfall.used.add(String(productId))
+        continue
+      }
       const err = new Error(
         `Descuadre de existencias: faltan ${pending} unidades del producto ${productId} en las ubicaciones de la sucursal`
       )
@@ -235,7 +252,10 @@ async function applyLocationDeltas(tx, deltas, ctx = {}) {
     RETURNING psl.product_id, psl.location_id, psl.stock AS balance, v.qty
   `
 
-  const negative = updated.find((r) => Number(r.balance) < 0)
+  const permitidos = ctx.negativosPermitidos || new Set()
+  const negative = updated.find(
+    (r) => Number(r.balance) < 0 && !permitidos.has(String(r.product_id))
+  )
   if (negative) {
     const err = new Error(`Una ubicación quedaría en negativo para el producto ${negative.product_id}`)
     err.status = 409
@@ -272,12 +292,28 @@ async function applyBranchDelta(tx, entries, branchId, sign, ctx = {}) {
   // vuelve ahí: el mostrador no despacha desde la bodega que más tenga.
   const pos = !ctx.locationId && SALES_REASONS.has(ctx.reason) ? await salesLocationId(tx, b) : null
   let deltas
+  let negativosPermitidos = null
   if (sign < 0) {
     // Con ubicación explícita (ajuste de una ubicación concreta) sale de ahí y
     // de ningún otro lado; si no alcanza, applyLocationDeltas lo rechaza.
-    deltas = ctx.locationId
-      ? entries.map(([id, qty]) => ({ product_id: String(id), location_id: ctx.locationId, qty: -Number(qty) }))
-      : await planDispatch(tx, b, entries, { adjust: ctx.adjust, preferLocationId: pos })
+    if (ctx.locationId) {
+      deltas = entries.map(([id, qty]) => ({
+        product_id: String(id), location_id: ctx.locationId, qty: -Number(qty),
+      }))
+    } else {
+      // Cuánto de cada producto NO tiene ni siquiera la sucursal: eso es lo que
+      // se puede dejar en negativo (venta autorizada por encima de la
+      // existencia). El espejo todavía no se actualizó: se lee el valor previo.
+      const shortfall = {
+        allowed: await branchShortfall(tx, b, entries),
+        locationId: pos || (await defaultLocationId(tx, b)),
+        used: new Set(),
+      }
+      deltas = await planDispatch(tx, b, entries, {
+        adjust: ctx.adjust, preferLocationId: pos, shortfall,
+      })
+      if (shortfall.used.size > 0) negativosPermitidos = shortfall.used
+    }
   } else {
     const locationId = ctx.locationId || pos || (await defaultLocationId(tx, b, { receiving: true }))
     deltas = entries.map(([id, qty]) => ({
@@ -286,7 +322,31 @@ async function applyBranchDelta(tx, entries, branchId, sign, ctx = {}) {
       qty: Number(qty),
     }))
   }
-  return applyLocationDeltas(tx, deltas, { ...ctx, branchId: b })
+  return applyLocationDeltas(tx, deltas, { ...ctx, branchId: b, negativosPermitidos })
+}
+
+/**
+ * Cuánto de cada producto le falta a la SUCURSAL (no a la ubicación) para
+ * cubrir la salida. Mayor que cero significa que se está vendiendo lo que no
+ * hay, cosa que el mostrador permite con autorización; cero significa que la
+ * sucursal sí lo tiene y si las ubicaciones no lo juntan es un descuadre.
+ * @returns {Promise<Map<string, number>>}
+ */
+async function branchShortfall(tx, branchId, entries) {
+  const b = requireBranchId(branchId)
+  const ids = entries.map(([id]) => String(id))
+  const out = new Map()
+  if (ids.length === 0) return out
+  const rows = await tx.productStock.findMany({
+    where: { branch_id: b, product_id: { in: ids } },
+    select: { product_id: true, stock: true },
+  })
+  const enSucursal = new Map(rows.map((r) => [String(r.product_id), Number(r.stock)]))
+  for (const [id, qty] of entries) {
+    const falta = Number(qty) - (enSucursal.get(String(id)) ?? 0)
+    if (falta > 0) out.set(String(id), falta)
+  }
+  return out
 }
 
 /**
