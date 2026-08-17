@@ -1866,12 +1866,19 @@ exports.bulkImport = async (req, res, next) => {
     }
 
     // All valid, proceed to import
-    const result = await bulkCreateProducts(validation.validRows, { companyId: req.companyId, branchId: requireBranch(req) })
+    const result = await bulkCreateProducts(validation.validRows, {
+      companyId: req.companyId,
+      branchId: requireBranch(req),
+      locationId: req.body?.location_id ? String(req.body.location_id) : null,
+    })
 
     res.json({
       ok: true,
       created: result.created,
-      message: `Se importaron ${result.created} productos exitosamente`
+      adopted: result.adopted,
+      message: result.adopted
+        ? `${result.created} producto(s) nuevo(s) y ${result.adopted} que ya estaban en el catálogo, con su existencia cargada en esta sucursal`
+        : `Se importaron ${result.created} productos exitosamente`,
     })
   } catch (e) {
     next(e)
@@ -1922,16 +1929,23 @@ exports.bulkImportMapped = async (req, res, next) => {
     }
 
     // All valid, proceed to import
-    const result = await bulkCreateProducts(validation.validRows, { companyId: req.companyId, branchId: requireBranch(req) })
+    const result = await bulkCreateProducts(validation.validRows, {
+      companyId: req.companyId,
+      branchId: requireBranch(req),
+      locationId: req.body?.location_id ? String(req.body.location_id) : null,
+    })
 
     res.json({
       ok: true,
       created: result.created,
+      adopted: result.adopted || 0,
       skipped: result.skipped || 0,
       errors: result.errors || [],
-      message: result.skipped > 0
-        ? `Se importaron ${result.created} productos (${result.skipped} omitidos por duplicados)`
-        : `Se importaron ${result.created} productos exitosamente`
+      message: [
+        `${result.created} producto(s) nuevo(s)`,
+        result.adopted ? `${result.adopted} ya en el catálogo, con existencia cargada aquí` : null,
+        result.skipped ? `${result.skipped} omitido(s)` : null,
+      ].filter(Boolean).join(', ')
     })
   } catch (e) {
     next(e)

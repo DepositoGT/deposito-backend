@@ -250,9 +250,15 @@ function validateRow(row, i, categoriesMap, suppliersMap, existingBarcodes, batc
 
     // Optional: barcode (must be unique if provided)
     const barcode = String(normalizedRow.barcode || '').trim()
+    let existingProductId = null
     if (barcode) {
         if (existingBarcodes.has(barcode)) {
-            errors.push(`El código de barras "${barcode}" ya existe en el sistema`)
+            // El catálogo es de la empresa: que el producto ya exista no es un
+            // error, es que esta sucursal todavía no lo maneja (o ya lo maneja y
+            // se está recargando su existencia). Ver `bulkCreateProducts`.
+            existingProductId = existingBarcodes.get(barcode)
+            data.barcode = barcode
+            batchBarcodes.add(barcode)
         } else if (batchBarcodes.has(barcode)) {
             errors.push(`El código de barras "${barcode}" está duplicado en el archivo`)
         } else {
@@ -282,6 +288,8 @@ function validateRow(row, i, categoriesMap, suppliersMap, existingBarcodes, batc
         data,
         rowIndex: i + 2,
         hints,
+        // Con id, la fila no crea producto: le carga existencia en la sucursal.
+        existingProductId,
     }
 }
 
@@ -302,12 +310,17 @@ async function validateBulkData(rows, importOptionsRaw, ctx = {}) {
             where: { deleted: false, party_type: 'SUPPLIER', company_id: companyId },
             select: { id: true, name: true },
         }),
-        prisma.product.findMany({ where: { company_id: companyId }, select: { barcode: true } }),
+        prisma.product.findMany({
+            where: { company_id: companyId, deleted: false },
+            select: { id: true, barcode: true },
+        }),
     ])
 
     const categoriesMap = new Map(categories.map(c => [c.name.toLowerCase(), c.id]))
     const suppliersMap = new Map(suppliers.map(s => [s.name.toLowerCase(), s.id]))
-    const existingBarcodes = new Set(products.filter(p => p.barcode).map(p => p.barcode))
+    const existingBarcodes = new Map(
+        products.filter((p) => p.barcode).map((p) => [p.barcode, p.id])
+    )
     const batchBarcodes = new Set()
 
     const validRows = []
@@ -430,9 +443,10 @@ async function ensureSupplierIdForProductImport(name, cache, companyId) {
  * @param {Object[]} validRows
  */
 async function bulkCreateProducts(validRows, ctx = {}) {
-    const { companyId, branchId } = ctx
+    const { companyId, branchId, locationId } = ctx
     const errors = []
     let created = 0
+    let adopted = 0
     let skipped = 0
     const categoryCache = new Map()
     const supplierCache = new Map()
@@ -440,6 +454,15 @@ async function bulkCreateProducts(validRows, ctx = {}) {
     for (const row of validRows) {
         try {
             const d = { ...row.data, company_id: companyId }
+            // Ya está en el catálogo de la empresa: no se duplica el producto, se
+            // le fija la existencia en ESTA sucursal (lo que trae el archivo).
+            if (row.existingProductId) {
+                const initialStock = Number(d.stock || 0)
+                const initialMin = Number(d.min_stock || 0)
+                await adoptIntoBranch(row.existingProductId, branchId, initialStock, initialMin, locationId)
+                adopted++
+                continue
+            }
             if (d.category_create_name) {
                 d.category_id = await ensureProductCategoryIdImport(d.category_create_name, categoryCache, companyId)
                 delete d.category_create_name
@@ -469,6 +492,7 @@ async function bulkCreateProducts(validRows, ctx = {}) {
                 // El stock inicial también aterriza en una ubicación real.
                 await applyBranchDelta(prisma, [[prod.id, initialStock]], branchId, 1, {
                     reason: 'INITIAL', refType: 'product', refId: prod.id,
+                    ...(locationId ? { locationId } : {}),
                 })
             }
             created++
@@ -481,7 +505,34 @@ async function bulkCreateProducts(validRows, ctx = {}) {
         }
     }
 
-    return { created, skipped, errors }
+    return { created, adopted, skipped, errors }
+}
+
+/**
+ * Deja el producto (que ya existe en la empresa) con la existencia que trae el
+ * archivo EN ESTA SUCURSAL. Fija, no suma: un archivo de existencias describe
+ * cómo está la bodega, así que volver a importarlo no debe duplicar nada.
+ */
+async function adoptIntoBranch(productId, branchId, stock, minStock, locationId) {
+    const key = { product_id_branch_id: { product_id: productId, branch_id: branchId } }
+    const actual = await prisma.productStock.findUnique({ where: key })
+    const previo = Number(actual?.stock || 0)
+    if (!actual) {
+        await prisma.productStock.create({
+            data: { product_id: productId, branch_id: branchId, stock: 0, min_stock: minStock },
+        })
+    } else if (minStock) {
+        await prisma.productStock.update({ where: key, data: { min_stock: minStock } })
+    }
+
+    const delta = stock - previo
+    if (delta === 0) return
+    await prisma.productStock.update({ where: key, data: { stock } })
+    await prisma.product.update({ where: { id: productId }, data: { stock: { increment: delta } } })
+    await applyBranchDelta(prisma, [[productId, Math.abs(delta)]], branchId, Math.sign(delta), {
+        reason: 'INITIAL', refType: 'product', refId: productId, adjust: true,
+        ...(locationId ? { locationId } : {}),
+    })
 }
 
 /**
