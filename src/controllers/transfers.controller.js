@@ -241,6 +241,20 @@ exports.receive = async (req, res, next) => {
         throw err
       }
 
+      // Reclamo atómico ANTES de tocar stock: mismo patrón anti-carrera que el
+      // cierre de turno de caja (updateMany + count). Sin esto, dos recepciones
+      // simultáneas del mismo traslado pasarían ambas el check de arriba y
+      // acreditarían el stock por duplicado.
+      const claim = await tx.stockTransfer.updateMany({
+        where: { id: transfer.id, status: 'EN_TRANSITO' },
+        data: { status: 'RECIBIDA', received_by: req.user.sub, received_at: new Date() },
+      })
+      if (claim.count !== 1) {
+        const err = new Error('El traslado ya fue recibido')
+        err.status = 409
+        throw err
+      }
+
       const receivedByLine = new Map()
       const locationByLine = new Map()
       if (Array.isArray(linesRaw) && linesRaw.length > 0) {
@@ -296,13 +310,10 @@ exports.receive = async (req, res, next) => {
         await ensureStockAlertsBatch(tx, updated, branchId)
       }
 
-      return tx.stockTransfer.update({
+      // El status ya se reclamó arriba; solo falta releer con las relaciones
+      // (líneas con qty_received ya actualizado) para la respuesta.
+      return tx.stockTransfer.findUnique({
         where: { id: transfer.id },
-        data: {
-          status: 'RECIBIDA',
-          received_by: req.user.sub,
-          received_at: new Date(),
-        },
         include: TRANSFER_INCLUDE,
       })
     }, TX_OPTIONS)

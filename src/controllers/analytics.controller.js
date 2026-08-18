@@ -238,12 +238,15 @@ exports.summary = async (req, res, next) => {
       .map(([category, v]) => ({ category, value: Number(v.value.toFixed(2)), units: v.units }))
       .sort((a, b) => b.value - a.value)
 
-    // Compras / cuentas por pagar (ingresos de mercancía del período)
+    // Compras / cuentas por pagar (ingresos de mercancía del período).
+    // Excluye cargas de saldo de apertura (source: INITIAL) — esas no son
+    // compras operativas, se reportan aparte en `initialInventory`.
     const incoming = await prisma.incomingMerchandise.findMany({
       where: { date: { gte: startUtc, lte: endUtc } },
       select: {
         date: true,
         payment_status: true,
+        source: true,
         supplier: { select: { name: true } },
         items: { select: { quantity: true, unit_cost: true } },
         paymentEntries: { select: { amount: true } },
@@ -253,8 +256,15 @@ exports.summary = async (req, res, next) => {
     for (let m = 1; m <= 12; m++) purchasesMonthly.set(m, 0)
     const supplierAgg = new Map()
     let purchasesTotal = 0, payablePending = 0, payableCount = 0
+    let initialInventoryTotal = 0, initialInventoryUnits = 0, initialInventoryCount = 0
     for (const inc of incoming) {
       const total = inc.items.reduce((s, it) => s + number(it.quantity) * number(it.unit_cost), 0)
+      if (inc.source === 'INITIAL') {
+        initialInventoryTotal += total
+        initialInventoryUnits += inc.items.reduce((s, it) => s + number(it.quantity), 0)
+        initialInventoryCount += 1
+        continue
+      }
       const paid = inc.paymentEntries.reduce((s, e) => s + number(e.amount), 0)
       const month = new Date(inc.date).getUTCMonth() + 1
       purchasesMonthly.set(month, purchasesMonthly.get(month) + total)
@@ -275,6 +285,11 @@ exports.summary = async (req, res, next) => {
         .map(([name, amount]) => ({ name, amount: Number(number(amount).toFixed(2)) }))
         .sort((a, b) => b.amount - a.amount)
         .slice(0, 6),
+    }
+    const initialInventory = {
+      total: Number(initialInventoryTotal.toFixed(2)),
+      units: initialInventoryUnits,
+      count: initialInventoryCount,
     }
 
     res.json({
@@ -304,6 +319,7 @@ exports.summary = async (req, res, next) => {
         byCategory: inventoryByCategory,
       },
       purchases,
+      initialInventory,
     })
   } catch (e) { next(e) }
 }
