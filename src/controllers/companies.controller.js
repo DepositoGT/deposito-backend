@@ -10,6 +10,7 @@
 
 const { prisma } = require('../models/prisma')
 const { seedCompanySettings } = require('../services/companySettings')
+const { seedChartOfAccounts } = require('../services/accounting/seedChartOfAccounts')
 const { invalidateSystemConfigCache } = require('../utils/getTimezone')
 
 const COMPANY_SELECT = {
@@ -54,6 +55,8 @@ exports.create = async (req, res, next) => {
       await tx.userBranch.create({ data: { user_id: req.user.sub, branch_id: branch.id } })
       // Nace configurada: moneda, zona horaria, denominaciones y sus datos fiscales
       await seedCompanySettings(tx, company.id, company)
+      // Nace con catálogo de cuentas y mapeo por defecto: sin esto no puede contabilizar nada
+      await seedChartOfAccounts(tx, company.id)
       return { ...company, branches: [branch] }
     })
     res.status(201).json(result)
