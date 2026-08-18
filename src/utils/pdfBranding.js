@@ -104,9 +104,10 @@ async function fetchLogoForHttp(logoUrl) {
 
 /**
  * @param {import('@prisma/client').PrismaClient} prisma
+ * @param {string} companyId empresa cuyo membrete se imprime
  */
-async function getBrandingForPdf(prisma) {
-  const config = await getSystemConfig(prisma)
+async function getBrandingForPdf(prisma, companyId) {
+  const config = await getSystemConfig(prisma, companyId)
   const logoUrl = config.company_logo_url || ''
   const logoBuffer = await fetchLogoBuffer(logoUrl)
   return {

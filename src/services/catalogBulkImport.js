@@ -81,7 +81,7 @@ function validateCatalogRow(row, rowIndex, type, existingNames, batchNames) {
  * @param {string} type - 'categories' or 'payment-terms'
  * @returns {Object} Validation result with validRows and invalidRows
  */
-async function bulkValidateCatalogs(rows, type) {
+async function bulkValidateCatalogs(rows, type, companyId) {
     if (!rows || !Array.isArray(rows) || rows.length === 0) {
         return {
             validRows: [],
@@ -93,7 +93,7 @@ async function bulkValidateCatalogs(rows, type) {
     // Fetch existing names from database
     const model = type === 'categories' ? prisma.productCategory : prisma.paymentTerm
     const existing = await model.findMany({
-        where: { deleted: false },
+        where: { deleted: false, company_id: companyId },
         select: { name: true }
     })
     const existingNames = new Set(existing.map(item => item.name.toLowerCase()))
@@ -139,7 +139,7 @@ async function bulkValidateCatalogs(rows, type) {
  * @param {string} type - 'categories' or 'payment-terms'
  * @returns {Object} Result with created count and skipped count
  */
-async function bulkCreateCatalogs(validRows, type) {
+async function bulkCreateCatalogs(validRows, type, companyId) {
     if (!validRows || validRows.length === 0) {
         return { created: 0, skipped: 0, errors: [] }
     }
@@ -153,7 +153,8 @@ async function bulkCreateCatalogs(validRows, type) {
         try {
             await model.create({
                 data: {
-                    name: row.data.name
+                    name: row.data.name,
+                    company_id: companyId
                 }
             })
             created++

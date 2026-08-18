@@ -90,19 +90,21 @@ function checkClosureScopePermission(req, isOwnClosure) {
  */
 exports.validateStocks = async (req, res, next) => {
   try {
-    // Buscar todos los productos con stock < 0
-    const negativeStockProducts = await prisma.product.findMany({
+    // Productos con stock negativo EN LA SUCURSAL activa
+    const negativeRows = await prisma.productStock.findMany({
+      where: { stock: { lt: 0 }, branch_id: req.branchId ?? undefined, product: { deleted: false, company_id: req.companyId } },
+      select: { stock: true, product_id: true },
+    })
+    const stockByProduct = new Map(negativeRows.map((r) => [r.product_id, r.stock]))
+    const negativeStockProducts = negativeRows.length === 0 ? [] : await prisma.product.findMany({
       where: {
-        stock: { lt: 0 },
+        id: { in: negativeRows.map((r) => r.product_id) },
         deleted: false
       },
       include: {
         category: true,
         supplier: true,
         status: true
-      },
-      orderBy: {
-        stock: 'asc' // Los más negativos primero
       }
     })
 
@@ -111,15 +113,17 @@ exports.validateStocks = async (req, res, next) => {
     return res.json({
       valid: !hasNegativeStock,
       negative_stock_count: negativeStockProducts.length,
-      products: negativeStockProducts.map(p => ({
-        id: p.id,
-        name: p.name,
-        category: p.category.name,
-        supplier: p.supplier.name,
-        current_stock: p.stock,
-        barcode: p.barcode,
-        status: p.status.name
-      }))
+      products: negativeStockProducts
+        .map(p => ({
+          id: p.id,
+          name: p.name,
+          category: p.category.name,
+          supplier: p.supplier.name,
+          current_stock: stockByProduct.get(p.id) ?? 0,
+          barcode: p.barcode,
+          status: p.status.name
+        }))
+        .sort((a, b) => a.current_stock - b.current_stock) // los más negativos primero
     })
   } catch (error) {
     console.error('Error validating stocks:', error)
@@ -155,7 +159,7 @@ exports.calculateTheoretical = async (req, res, next) => {
 
     const isAdminRole = String(req.user?.role?.name || req.user?.role_name || '').toLowerCase() === 'admin'
 
-    const tz = await getTimezone(prisma)
+    const tz = await getTimezone(prisma, req.companyId)
     let start
     let end
     let sessionOpeningFloat = 0
@@ -263,6 +267,8 @@ exports.calculateTheoretical = async (req, res, next) => {
     }
 
     // Obtener ventas completadas en el período (opcionalmente filtradas por cajero)
+    const { branchWhere } = require('../middlewares/tenant')
+    Object.assign(salesWhere, branchWhere(req))
     const sales = await prisma.sale.findMany({
       where: salesWhere,
       include: {
@@ -408,7 +414,7 @@ exports.create = async (req, res, next) => {
       return res.status(403).json({ message: 'Solo puede registrar el cierre de su propia caja' })
     }
 
-    const tz = await getTimezone(prisma)
+    const tz = await getTimezone(prisma, req.companyId)
     // Parsear fechas: vienen sin 'Z', son hora local configurada
     const cleanStartDate = String(startDate).replace('Z', '').replace(/[+-]\d{2}:\d{2}$/, '');
     const cleanEndDate = String(endDate).replace('Z', '').replace(/[+-]\d{2}:\d{2}$/, '');
@@ -490,6 +496,7 @@ exports.create = async (req, res, next) => {
 
       const cashClosure = await tx.cashClosure.create({
         data: {
+          branch_id: require('../middlewares/tenant').requireBranch(req),
           date: dateUTC,
           opening_float: isOwnClosure && linkedSession ? linkedSession.opening_float : null,
           start_date: startDateUTC,
@@ -628,7 +635,7 @@ exports.list = async (req, res, next) => {
   try {
     const { page = 1, pageSize = 20, status, startDate, endDate } = req.query
 
-    const where = {}
+    const where = { ...require('../middlewares/tenant').branchWhere(req) }
     
     if (status) {
       where.status = status
@@ -694,8 +701,8 @@ exports.getById = async (req, res, next) => {
   try {
     const { id } = req.params
 
-    const closure = await prisma.cashClosure.findUnique({
-      where: { id },
+    const closure = await prisma.cashClosure.findFirst({
+      where: { id, ...require('../middlewares/tenant').branchWhere(req) },
       include: {
         payment_breakdowns: {
           include: {
@@ -752,12 +759,18 @@ exports.validate = async (req, res, next) => {
       return res.status(400).json({ message: 'Nombre y firma del supervisor son requeridos' })
     }
 
-    const tz = await getTimezone(prisma)
+    const tz = await getTimezone(prisma, req.companyId)
     const nowLocal = DateTime.now().setZone(tz);
     const validatedAtUTC = DateTime.utc(
       nowLocal.year, nowLocal.month, nowLocal.day,
       nowLocal.hour, nowLocal.minute, nowLocal.second, nowLocal.millisecond
     ).toJSDate();
+
+    const target = await prisma.cashClosure.findFirst({
+      where: { id, ...require('../middlewares/tenant').branchWhere(req) },
+      select: { id: true },
+    })
+    if (!target) return res.status(404).json({ message: 'Cierre no encontrado' })
 
     // status se mantiene (Pendiente); aprobación/rechazo vía PATCH :id/status
     const updated = await prisma.cashClosure.update({
@@ -792,10 +805,10 @@ exports.getLastClosureDate = async (req, res, next) => {
     const scope = String(req.query.scope || 'day').toLowerCase() === 'mine' ? 'mine' : 'day'
     const authUser = req.user
 
-    const where =
-      scope === 'mine' && authUser?.sub
-        ? { cashier_id: authUser.sub }
-        : undefined
+    const where = {
+      ...require('../middlewares/tenant').branchWhere(req),
+      ...(scope === 'mine' && authUser?.sub ? { cashier_id: authUser.sub } : {}),
+    }
 
     const lastClosure = await prisma.cashClosure.findFirst({
       where,
@@ -808,7 +821,7 @@ exports.getLastClosureDate = async (req, res, next) => {
       }
     })
 
-    const tz = await getTimezone(prisma)
+    const tz = await getTimezone(prisma, req.companyId)
     const fallbackStart = DateTime.now().setZone(tz).startOf('day').toJSDate()
 
     res.json({
@@ -840,8 +853,8 @@ exports.updateStatus = async (req, res, next) => {
     }
 
     // Buscar el cierre
-    const closure = await prisma.cashClosure.findUnique({
-      where: { id }
+    const closure = await prisma.cashClosure.findFirst({
+      where: { id, ...require('../middlewares/tenant').branchWhere(req) }
     })
 
     if (!closure) {
@@ -867,7 +880,7 @@ exports.updateStatus = async (req, res, next) => {
     }
 
     if (status === 'Rechazado' && rejection_reason) {
-      const tz = await getTimezone(prisma)
+      const tz = await getTimezone(prisma, req.companyId)
       const nowStr = DateTime.now().setZone(tz).toFormat('dd/MM/yyyy HH:mm')
       const existingNotes = closure.notes || ''
       updateData.notes = existingNotes 

@@ -25,6 +25,7 @@ const {
 exports.getAll = async (req, res, next) => {
   try {
     const rows = await prisma.systemSetting.findMany({
+      where: { company_id: req.companyId },
       orderBy: { key: 'asc' }
     })
     const settings = {}
@@ -53,7 +54,7 @@ exports.getPublic = async (req, res, next) => {
   try {
     const keys = ['timezone', 'currency_code', 'currency_name', 'company_name', 'company_logo_url', 'date_format', 'locale', 'cash_closure_max_diff_pct', 'vat_affiliation', 'iva_rate']
     const rows = await prisma.systemSetting.findMany({
-      where: { key: { in: keys } }
+      where: { key: { in: keys }, company_id: req.companyId }
     })
     const out = {
       timezone: 'America/Guatemala',
@@ -82,8 +83,11 @@ exports.getPublic = async (req, res, next) => {
  */
 exports.getCompanyName = async (req, res, next) => {
   try {
+    // Sin empresa resuelta (login, cotización pública) se responde el default:
+    // servir el nombre y logo de una empresa cualquiera sería peor.
+    if (!req.companyId) return res.json({ company_name: 'Deposito', company_logo_url: '' })
     const rows = await prisma.systemSetting.findMany({
-      where: { key: { in: ['company_name', 'company_logo_url'] } },
+      where: { key: { in: ['company_name', 'company_logo_url'] }, company_id: req.companyId },
     })
     const map = Object.fromEntries(rows.map((r) => [r.key, r.value]))
     const company_name = (map.company_name && String(map.company_name).trim()) || 'Deposito'
@@ -100,7 +104,8 @@ exports.getCompanyName = async (req, res, next) => {
  */
 exports.getCompanyLogo = async (req, res, next) => {
   try {
-    const row = await prisma.systemSetting.findUnique({ where: { key: 'company_logo_url' } })
+    if (!req.companyId) return res.status(404).end()
+    const row = await prisma.systemSetting.findFirst({ where: { key: 'company_logo_url', company_id: req.companyId } })
     const logoUrl = row?.value?.trim()
     if (!logoUrl) return res.status(404).end()
 
@@ -142,7 +147,7 @@ exports.uploadLogo = async (req, res, next) => {
       }
     }
 
-    const prev = await prisma.systemSetting.findUnique({ where: { key: 'company_logo_url' } })
+    const prev = await prisma.systemSetting.findFirst({ where: { key: 'company_logo_url', company_id: req.companyId } })
     const prevUrl = prev?.value?.trim()
 
     const imageUrl = await uploadImageBuffer({
@@ -152,9 +157,10 @@ exports.uploadLogo = async (req, res, next) => {
     })
 
     await prisma.systemSetting.upsert({
-      where: { key: 'company_logo_url' },
+      where: { company_id_key: { company_id: req.companyId, key: 'company_logo_url' } },
       update: { value: imageUrl, type: 'string' },
       create: {
+        company_id: req.companyId,
         key: 'company_logo_url',
         value: imageUrl,
         type: 'string',
@@ -166,7 +172,8 @@ exports.uploadLogo = async (req, res, next) => {
       await removePublicObject(prevUrl, COMPANY_LOGO_BUCKET)
     }
 
-    invalidateSystemConfigCache()
+    await prisma.company.update({ where: { id: req.companyId }, data: { logo_url: imageUrl } })
+    invalidateSystemConfigCache(req.companyId)
     res.json({ imageUrl, company_logo_url: imageUrl })
   } catch (e) {
     if (e.status) return res.status(e.status).json({ message: e.message })
@@ -180,13 +187,14 @@ exports.uploadLogo = async (req, res, next) => {
  */
 exports.removeLogo = async (req, res, next) => {
   try {
-    const prev = await prisma.systemSetting.findUnique({ where: { key: 'company_logo_url' } })
+    const prev = await prisma.systemSetting.findFirst({ where: { key: 'company_logo_url', company_id: req.companyId } })
     const prevUrl = prev?.value?.trim()
 
     await prisma.systemSetting.upsert({
-      where: { key: 'company_logo_url' },
+      where: { company_id_key: { company_id: req.companyId, key: 'company_logo_url' } },
       update: { value: '', type: 'string' },
       create: {
+        company_id: req.companyId,
         key: 'company_logo_url',
         value: '',
         type: 'string',
@@ -198,7 +206,8 @@ exports.removeLogo = async (req, res, next) => {
       await removePublicObject(prevUrl, COMPANY_LOGO_BUCKET)
     }
 
-    invalidateSystemConfigCache()
+    await prisma.company.update({ where: { id: req.companyId }, data: { logo_url: null } })
+    invalidateSystemConfigCache(req.companyId)
     res.json({ company_logo_url: '' })
   } catch (e) {
     next(e)
@@ -211,8 +220,8 @@ exports.removeLogo = async (req, res, next) => {
  */
 exports.getDenominations = async (req, res, next) => {
   try {
-    const row = await prisma.systemSetting.findUnique({
-      where: { key: 'cash_closure_denominations' }
+    const row = await prisma.systemSetting.findFirst({
+      where: { key: 'cash_closure_denominations', company_id: req.companyId }
     })
     if (!row) {
       return res.json([])
@@ -325,15 +334,27 @@ exports.update = async (req, res, next) => {
       const valueStr = typeof value === 'object' ? JSON.stringify(value) : String(value)
       const type = key === 'cash_closure_denominations' ? 'json' : 'string'
       await prisma.systemSetting.upsert({
-        where: { key },
+        where: { company_id_key: { company_id: req.companyId, key } },
         update: { value: valueStr, type },
-        create: { key, value: valueStr, type }
+        create: { company_id: req.companyId, key, value: valueStr, type }
       })
     }
 
-    invalidateSystemConfigCache()
+    // La identidad de la empresa vive en dos lados: la fila Company (selector,
+    // traslados, contabilidad) y estas claves (PDFs, membretes). Se espejan para
+    // que editar la configuración no deje el selector mostrando el nombre viejo.
+    const companyFields = {}
+    if (payload.company_name !== undefined) companyFields.name = String(payload.company_name).slice(0, 150)
+    if (payload.company_nit !== undefined) companyFields.tax_id = String(payload.company_nit).slice(0, 100)
+    if (payload.company_address !== undefined) companyFields.address = String(payload.company_address)
+    if (payload.company_logo_url !== undefined) companyFields.logo_url = String(payload.company_logo_url).slice(0, 500)
+    if (Object.keys(companyFields).length > 0) {
+      await prisma.company.update({ where: { id: req.companyId }, data: companyFields })
+    }
 
-    const rows = await prisma.systemSetting.findMany({ orderBy: { key: 'asc' } })
+    invalidateSystemConfigCache(req.companyId)
+
+    const rows = await prisma.systemSetting.findMany({ where: { company_id: req.companyId }, orderBy: { key: 'asc' } })
     const settings = {}
     for (const row of rows) {
       if (row.type === 'json') {

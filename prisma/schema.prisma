@@ -16,18 +16,324 @@ datasource db {
 }
 
 // ========================================
+// Multi-empresa y sucursales
+// ========================================
+
+/// Empresa (tenant). Cada empresa tiene su propio catálogo, precios,
+/// proveedores, clientes, contabilidad y sucursales. Los usuarios pueden
+/// pertenecer a varias empresas (UserCompany).
+model Company {
+  id         String   @id @default(uuid()) @db.Uuid
+  name       String   @db.VarChar(150)
+  code       String   @unique @db.VarChar(20)
+  /// NIT / ID fiscal para membretes y DTE
+  tax_id     String?  @db.VarChar(100)
+  address    String?  @db.Text
+  phone      String?  @db.VarChar(50)
+  logo_url   String?  @db.VarChar(500)
+  active     Boolean  @default(true)
+  is_default Boolean  @default(false)
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  branches           Branch[]
+  user_companies     UserCompany[]
+  products           Product[]
+  product_categories ProductCategory[]
+  suppliers          Supplier[]
+  payment_terms      PaymentTerm[]
+  promotions         Promotion[]
+  promotion_codes    PromotionCode[]
+  system_settings    SystemSetting[]
+  accounts           Account[]
+  accounting_periods AccountingPeriod[]
+  journal_entries    JournalEntry[]
+
+  @@map("companies")
+}
+
+/// Pertenencia usuario ↔ empresa (N a N). El email del usuario es único global.
+model UserCompany {
+  user_id    String   @db.Uuid
+  user       User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  company_id String   @db.Uuid
+  company    Company  @relation(fields: [company_id], references: [id], onDelete: Cascade)
+  created_at DateTime @default(now())
+
+  @@id([user_id, company_id])
+  @@index([company_id])
+  @@map("user_companies")
+}
+
+/// Sucursal. Toda entidad transaccional lleva branch_id; la empresa se deriva
+/// de la sucursal.
+model Branch {
+  id                String         @id @default(uuid()) @db.Uuid
+  company_id        String         @db.Uuid
+  company           Company        @relation(fields: [company_id], references: [id], onDelete: Restrict)
+  name              String         @db.VarChar(150)
+  /// Código corto para referencias de documentos: "SUC1"
+  code              String         @db.VarChar(10)
+  /// Secuencia global estable para derivar advisory lock keys de numeración
+  seq               Int            @unique @default(autoincrement())
+  address           String?        @db.Text
+  phone             String?        @db.VarChar(50)
+  active            Boolean        @default(true)
+  is_default        Boolean        @default(false)
+  /// Ubicación de la que despacha el punto de venta de esta sucursal. Si es
+  /// null, la venta sale por prioridad de despacho como cualquier otra salida.
+  sales_location_id String?        @db.Uuid
+  sales_location    StockLocation? @relation("BranchSalesLocation", fields: [sales_location_id], references: [id], onDelete: SetNull)
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  user_branches            UserBranch[]
+  users_default            User[]                  @relation("UserDefaultBranch")
+  product_stocks           ProductStock[]
+  product_lots             ProductLot[]
+  alerts                   Alert[]
+  sales                    Sale[]
+  commercial_documents     CommercialDocument[]
+  stock_reservations       StockReservation[]
+  incoming_merchandise     IncomingMerchandise[]
+  inventory_count_sessions InventoryCountSession[]
+  cash_registers           CashRegister[]
+  cash_closures            CashClosure[]
+  transfers_out            StockTransfer[]         @relation("TransferFromBranch")
+  transfers_in             StockTransfer[]         @relation("TransferToBranch")
+  journal_entries          JournalEntry[]
+  promotions               PromotionBranch[]
+  warehouses               Warehouse[]
+  stock_movements          StockMovement[]
+
+  @@unique([company_id, code])
+  @@map("branches")
+}
+
+/// Asignación usuario ↔ sucursal (N a N).
+model UserBranch {
+  user_id    String   @db.Uuid
+  user       User     @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  branch_id  String   @db.Uuid
+  branch     Branch   @relation(fields: [branch_id], references: [id], onDelete: Cascade)
+  created_at DateTime @default(now())
+
+  @@id([user_id, branch_id])
+  @@index([branch_id])
+  @@map("user_branches")
+}
+
+/// Stock por sucursal: la verdad para vender. `products.stock` queda como
+/// espejo (suma de sucursales) durante la transición.
+model ProductStock {
+  id         String  @id @default(uuid()) @db.Uuid
+  product_id String  @db.Uuid
+  product    Product @relation(fields: [product_id], references: [id], onDelete: Cascade)
+  branch_id  String  @db.Uuid
+  branch     Branch  @relation(fields: [branch_id], references: [id], onDelete: Restrict)
+  stock      Int     @default(0)
+  min_stock  Int     @default(0)
+
+  @@unique([product_id, branch_id])
+  @@index([branch_id])
+  @@map("product_stocks")
+}
+
+enum WarehouseKind {
+  BODEGA
+  SALA_VENTAS
+  VITRINA
+  TRANSITO
+  OTRO
+}
+
+/// Espacio físico dentro de una sucursal: bodega, sala de ventas, vitrina, tránsito.
+model Warehouse {
+  id                String        @id @default(uuid()) @db.Uuid
+  branch_id         String        @db.Uuid
+  branch            Branch        @relation(fields: [branch_id], references: [id], onDelete: Restrict)
+  name              String        @db.VarChar(120)
+  code              String        @db.VarChar(20)
+  kind              WarehouseKind @default(BODEGA)
+  /// Almacén al que caen las operaciones que no eligen uno (ventas, ingresos, devoluciones).
+  is_default        Boolean       @default(false)
+  /// Recibe la mercancía de proveedores y de traslados entrantes.
+  is_receiving      Boolean       @default(false)
+  /// Orden en que se descuenta al vender: menor primero.
+  dispatch_priority Int           @default(100)
+  active            Boolean       @default(true)
+  notes             String?       @db.Text
+
+  locations      StockLocation[]
+  count_sessions InventoryCountSession[]
+  created_at     DateTime                @default(now())
+  updated_at     DateTime                @updatedAt
+
+  @@unique([branch_id, code])
+  @@index([branch_id, active])
+  @@map("warehouses")
+}
+
+/// Posición dentro del almacén. Si no se quiere ese detalle, basta la ubicación
+/// por defecto, que siempre existe.
+model StockLocation {
+  id                String    @id @default(uuid()) @db.Uuid
+  warehouse_id      String    @db.Uuid
+  warehouse         Warehouse @relation(fields: [warehouse_id], references: [id], onDelete: Restrict)
+  code              String    @db.VarChar(30)
+  name              String?   @db.VarChar(120)
+  is_default        Boolean   @default(false)
+  /// Si es false no se despacha desde aquí (cuarentena, producto dañado).
+  pickable          Boolean   @default(true)
+  dispatch_priority Int       @default(100)
+  active            Boolean   @default(true)
+
+  stocks         ProductStockLocation[]
+  movements      StockMovement[]
+  count_lines    InventoryCountLine[]
+  lots           ProductLot[]
+  /// Sucursales que venden desde aquí (su punto de venta despacha de esta ubicación).
+  sales_branches Branch[]               @relation("BranchSalesLocation")
+  created_at     DateTime               @default(now())
+
+  @@unique([warehouse_id, code])
+  @@index([warehouse_id, active])
+  @@map("stock_locations")
+}
+
+/// Existencias por ubicación: la verdad física. `product_stocks` queda como
+/// espejo por sucursal y `products.stock` como espejo de empresa.
+model ProductStockLocation {
+  id          String        @id @default(uuid()) @db.Uuid
+  product_id  String        @db.Uuid
+  product     Product       @relation(fields: [product_id], references: [id], onDelete: Cascade)
+  location_id String        @db.Uuid
+  location    StockLocation @relation(fields: [location_id], references: [id], onDelete: Restrict)
+  stock       Int           @default(0)
+  /// Punto de reposición interno (bodega → sala). No sustituye a
+  /// product_stocks.min_stock, que sigue siendo el mínimo de compra por sucursal.
+  min_stock   Int           @default(0)
+
+  @@unique([product_id, location_id])
+  @@index([location_id])
+  @@map("product_stock_locations")
+}
+
+enum StockMovementReason {
+  INITIAL
+  PURCHASE
+  SALE
+  SALE_RETURN
+  ORDER_FULFILL
+  TRANSFER_OUT
+  TRANSFER_IN
+  TRANSFER_CANCEL
+  INTERNAL_MOVE
+  COUNT_ADJUST
+  MANUAL_ADJUST
+  KIT_ASSEMBLE
+  KIT_DISASSEMBLE
+}
+
+/// Una fila por (producto, ubicación, delta). Append-only: nunca se edita ni se borra.
+model StockMovement {
+  id          String              @id @default(uuid()) @db.Uuid
+  branch_id   String              @db.Uuid
+  branch      Branch              @relation(fields: [branch_id], references: [id], onDelete: Restrict)
+  location_id String              @db.Uuid
+  location    StockLocation       @relation(fields: [location_id], references: [id], onDelete: Restrict)
+  product_id  String              @db.Uuid
+  product     Product             @relation(fields: [product_id], references: [id], onDelete: Restrict)
+  /// Signo incluido: negativo sale, positivo entra.
+  qty         Int
+  /// Existencia de la ubicación DESPUÉS del movimiento (kardex sin recalcular).
+  balance     Int
+  reason      StockMovementReason
+  /// Documento que lo originó: 'sale' | 'transfer' | 'incoming_merchandise' | ...
+  ref_type    String?             @db.VarChar(30)
+  ref_id      String?             @db.Uuid
+  /// Agrupa las líneas de una misma operación.
+  group_id    String?             @db.Uuid
+  notes       String?             @db.VarChar(300)
+  created_by  String?             @db.Uuid
+  createdBy   User?               @relation(fields: [created_by], references: [id], onDelete: SetNull)
+  created_at  DateTime            @default(now())
+
+  @@index([branch_id, created_at(sort: Desc)])
+  @@index([product_id, created_at(sort: Desc)])
+  @@index([location_id, created_at(sort: Desc)])
+  @@index([ref_type, ref_id])
+  @@index([group_id])
+  @@map("stock_movements")
+}
+
+enum StockTransferStatus {
+  EN_TRANSITO
+  RECIBIDA
+  CANCELADA
+}
+
+/// Traslado de mercancía entre sucursales de la misma empresa, en dos pasos:
+/// envío (resta en origen) → recepción (suma en destino). Lo enviado y no
+/// recibido queda como faltante de tránsito.
+model StockTransfer {
+  id             String              @id @default(uuid()) @db.Uuid
+  reference      String              @db.VarChar(30) // T-SUC1-000001
+  from_branch_id String              @db.Uuid
+  fromBranch     Branch              @relation("TransferFromBranch", fields: [from_branch_id], references: [id], onDelete: Restrict)
+  to_branch_id   String              @db.Uuid
+  toBranch       Branch              @relation("TransferToBranch", fields: [to_branch_id], references: [id], onDelete: Restrict)
+  status         StockTransferStatus @default(EN_TRANSITO)
+  created_by     String              @db.Uuid
+  createdBy      User                @relation("TransferCreatedBy", fields: [created_by], references: [id], onDelete: Restrict)
+  sent_at        DateTime            @default(now())
+  received_by    String?             @db.Uuid
+  receivedBy     User?               @relation("TransferReceivedBy", fields: [received_by], references: [id], onDelete: SetNull)
+  received_at    DateTime?
+  cancelled_at   DateTime?
+  notes          String?             @db.Text
+  lines          StockTransferLine[]
+
+  @@unique([from_branch_id, reference])
+  @@index([to_branch_id, status])
+  @@index([from_branch_id, status])
+  @@map("stock_transfers")
+}
+
+model StockTransferLine {
+  id            String        @id @default(uuid()) @db.Uuid
+  transfer_id   String        @db.Uuid
+  transfer      StockTransfer @relation(fields: [transfer_id], references: [id], onDelete: Cascade)
+  product_id    String        @db.Uuid
+  product       Product       @relation(fields: [product_id], references: [id], onDelete: Restrict)
+  qty_sent      Int
+  qty_received  Int?
+  /// Lotes consumidos en el origen al enviar: [{ lot_code, expiry_date, unit_cost, supplier_id, qty }].
+  /// Al recibir se recrean en el destino; al cancelar se devuelven al origen.
+  lots_snapshot Json?
+
+  @@index([transfer_id])
+  @@index([product_id])
+  @@map("stock_transfer_lines")
+}
+
+// ========================================
 // Catálogos
 // ========================================
 
 model ProductCategory {
   id                   Int                 @id @default(autoincrement())
-  name                 String              @unique @db.VarChar(100)
+  company_id           String              @db.Uuid
+  company              Company             @relation(fields: [company_id], references: [id], onDelete: Restrict)
+  name                 String              @db.VarChar(100)
   image_url            String?             @db.VarChar(500)
   deleted              Boolean             @default(false)
   products             Product[]
   suppliers            SupplierCategory[]
   promotion_categories PromotionCategory[]
 
+  @@unique([company_id, name])
   @@map("product_categories")
 }
 
@@ -84,14 +390,17 @@ model ReturnStatus {
 }
 
 model PaymentTerm {
-  id        Int        @id @default(autoincrement())
-  name      String     @unique @db.VarChar(50)
+  id                     Int                   @id @default(autoincrement())
+  company_id             String                @db.Uuid
+  company                Company               @relation(fields: [company_id], references: [id], onDelete: Restrict)
+  name                   String                @db.VarChar(50)
   /// Días naturales desde la fecha del ingreso hasta el vencimiento (opcional; sugiere due_date automática)
-  net_days  Int?
-  deleted   Boolean    @default(false)
+  net_days               Int?
+  deleted                Boolean               @default(false)
   supplier_payment_terms SupplierPaymentTerm[]
   incoming_merchandise   IncomingMerchandise[]
 
+  @@unique([company_id, name])
   @@map("payment_terms")
 }
 
@@ -149,51 +458,54 @@ enum SalesChannel {
 }
 
 model Supplier {
-  id                   String                @id @default(uuid()) @db.Uuid
+  id                     String                @id @default(uuid()) @db.Uuid
+  company_id             String                @db.Uuid
+  company                Company               @relation(fields: [company_id], references: [id], onDelete: Restrict)
   /// Proveedor (compras / productos) o cliente (maestro de ventas)
-  party_type           SupplierPartyType     @default(SUPPLIER)
+  party_type             SupplierPartyType     @default(SUPPLIER)
   /// Persona individual o empresa (nombre = razón social o nombre completo según tipo)
-  entity_kind          ContactEntityKind     @default(ORGANIZATION)
-  name                 String                @db.VarChar(150)
-  contact              String                @db.VarChar(100)
-  phone                String?               @db.VarChar(50)
-  email                String?               @db.VarChar(150)
-  address              String?               @db.Text
+  entity_kind            ContactEntityKind     @default(ORGANIZATION)
+  name                   String                @db.VarChar(150)
+  contact                String                @db.VarChar(100)
+  phone                  String?               @db.VarChar(50)
+  email                  String?               @db.VarChar(150)
+  address                String?               @db.Text
   /// ID fiscal para facturación (NIT, VAT, RFC, EIN, etc.; formato según país)
-  tax_id               String?               @db.VarChar(100)
-  products             Int                   @default(0)
-  last_order           DateTime?
-  total_purchases      Decimal               @default(0) @db.Decimal(12, 2)
-  rating               Decimal?              @db.Decimal(3, 2)
-  estado               Int                   @default(1) // 0 = inactivo, 1 = activo
+  tax_id                 String?               @db.VarChar(100)
+  products               Int                   @default(0)
+  last_order             DateTime?
+  total_purchases        Decimal               @default(0) @db.Decimal(12, 2)
+  rating                 Decimal?              @db.Decimal(3, 2)
+  estado                 Int                   @default(1) // 0 = inactivo, 1 = activo
   supplier_payment_terms SupplierPaymentTerm[]
-  categories           SupplierCategory[]
-  productsList         Product[]
-  purchase_logs        PurchaseLog[]
-  incoming_merchandise IncomingMerchandise[]
-  deleted              Boolean               @default(false)
-  deleted_at           DateTime?
+  categories             SupplierCategory[]
+  productsList           Product[]
+  purchase_logs          PurchaseLog[]
+  incoming_merchandise   IncomingMerchandise[]
+  deleted                Boolean               @default(false)
+  deleted_at             DateTime?
   /// Precio por defecto si no hay regla `CustomerPriceRule` que aplique (solo clientes).
-  default_price_tier   PriceTier             @default(LIST)
-  customer_price_rules CustomerPriceRule[]
+  default_price_tier     PriceTier             @default(LIST)
+  customer_price_rules   CustomerPriceRule[]
   linked_sales           Sale[]                @relation("SaleCustomerContact")
   commercial_documents   CommercialDocument[]  @relation("CommercialDocCustomer")
 
   /// Listado de contactos: party_type + orden por nombre (reemplaza índice solo party_type)
   @@index([party_type, name], map: "idx_suppliers_party_type_name")
+  @@index([company_id, party_type])
   @@map("suppliers")
 }
 
 /// Reglas de lista de precios por cliente: canal opcional (null = todos) y prioridad descendente.
 model CustomerPriceRule {
-  id          String         @id @default(uuid()) @db.Uuid
-  supplier_id String         @db.Uuid
-  supplier    Supplier       @relation(fields: [supplier_id], references: [id], onDelete: Cascade)
+  id          String        @id @default(uuid()) @db.Uuid
+  supplier_id String        @db.Uuid
+  supplier    Supplier      @relation(fields: [supplier_id], references: [id], onDelete: Cascade)
   channel     SalesChannel?
   price_tier  PriceTier
-  priority    Int            @default(0)
-  active      Boolean        @default(true)
-  created_at  DateTime       @default(now())
+  priority    Int           @default(0)
+  active      Boolean       @default(true)
+  created_at  DateTime      @default(now())
 
   @@index([supplier_id, active])
   @@map("customer_price_rules")
@@ -215,6 +527,8 @@ model SupplierPaymentTerm {
 
 model Product {
   id                         String                    @id @default(uuid()) @db.Uuid
+  company_id                 String                    @db.Uuid
+  company                    Company                   @relation(fields: [company_id], references: [id], onDelete: Restrict)
   name                       String                    @db.VarChar(150)
   category_id                Int
   category                   ProductCategory           @relation(fields: [category_id], references: [id])
@@ -230,7 +544,7 @@ model Product {
   image_url                  String?                   @db.VarChar(500)
   supplier_id                String                    @db.Uuid
   supplier                   Supplier                  @relation(fields: [supplier_id], references: [id])
-  barcode                    String?                   @unique @db.VarChar(100)
+  barcode                    String?                   @db.VarChar(100)
   /// Si es false, el producto no aparece en el punto de venta ni puede venderse por la API.
   available_for_sale         Boolean                   @default(true)
   /// Opt-in: si es true, cada ingreso de mercancía exige fecha de caducidad (lotes).
@@ -256,7 +570,13 @@ model Product {
   commercial_document_lines  CommercialDocumentLine[]
   stock_reservations         StockReservation[]
   lots                       ProductLot[]
+  branch_stocks              ProductStock[]
+  location_stocks            ProductStockLocation[]
+  stock_movements            StockMovement[]
+  transfer_lines             StockTransferLine[]
 
+  @@unique([company_id, barcode])
+  @@index([company_id])
   @@map("products")
 }
 
@@ -266,6 +586,12 @@ model ProductLot {
   id                      String    @id @default(uuid()) @db.Uuid
   product_id              String    @db.Uuid
   product                 Product   @relation(fields: [product_id], references: [id])
+  branch_id               String    @db.Uuid
+  branch                  Branch    @relation(fields: [branch_id], references: [id], onDelete: Restrict)
+  /// Anaquel donde está el lote. Null = sin ubicación conocida (lote heredado):
+  /// sigue contando para caducidad y puede despachar desde cualquiera.
+  location_id             String?   @db.Uuid
+  location                StockLocation? @relation(fields: [location_id], references: [id], onDelete: SetNull)
   /// Nº de lote del proveedor (opcional)
   lot_code                String?   @db.VarChar(60)
   /// Obligatoria vía API si product.tracks_expiry
@@ -280,7 +606,9 @@ model ProductLot {
   received_at             DateTime  @default(now())
 
   @@index([product_id, expiry_date])
+  @@index([product_id, location_id, expiry_date])
   @@index([expiry_date])
+  @@index([branch_id])
   @@map("product_lots")
 }
 
@@ -331,35 +659,45 @@ model RolePermission {
 }
 
 model User {
-  id                   String                @id @default(uuid()) @db.Uuid
-  name                 String                @db.VarChar(150)
-  email                String                @unique @db.VarChar(150)
-  password             String                @db.VarChar(255)
-  role_id              Int
-  role                 Role                  @relation(fields: [role_id], references: [id])
-  alerts               Alert[]               @relation("AlertAssignedTo")
-  incoming_merchandise IncomingMerchandise[] @relation("MerchandiseRegisteredBy")
+  id                                     String                            @id @default(uuid()) @db.Uuid
+  name                                   String                            @db.VarChar(150)
+  email                                  String                            @unique @db.VarChar(150)
+  password                               String                            @db.VarChar(255)
+  role_id                                Int
+  role                                   Role                              @relation(fields: [role_id], references: [id])
+  alerts                                 Alert[]                           @relation("AlertAssignedTo")
+  incoming_merchandise                   IncomingMerchandise[]             @relation("MerchandiseRegisteredBy")
   /// Auditoría: última edición de datos de pago en un ingreso de mercancía
-  incoming_merchandise_payment_updates IncomingMerchandise[] @relation("MerchandisePaymentAudit")
+  incoming_merchandise_payment_updates   IncomingMerchandise[]             @relation("MerchandisePaymentAudit")
   /// Abonos parciales registrados en ingresos de mercancía
   merchandise_payment_entries_registered IncomingMerchandisePaymentEntry[] @relation("MerchandisePaymentEntryRegisteredBy")
-  sales_created        Sale[]                @relation("SaleCreatedBy")
-  cash_closures_as_cashier    CashClosure[]  @relation("CashClosureCashier")
-  cash_closures_as_supervisor CashClosure[]  @relation("CashClosureSupervisor")
+  sales_created                          Sale[]                            @relation("SaleCreatedBy")
+  cash_closures_as_cashier               CashClosure[]                     @relation("CashClosureCashier")
+  cash_closures_as_supervisor            CashClosure[]                     @relation("CashClosureSupervisor")
   /// Sesiones de caja (apertura)
-  cash_sessions_opened        CashRegisterSession[] @relation("CashSessionOpenedBy")
-  cash_sessions_closed        CashRegisterSession[] @relation("CashSessionClosedBy")
+  cash_sessions_opened                   CashRegisterSession[]             @relation("CashSessionOpenedBy")
+  cash_sessions_closed                   CashRegisterSession[]             @relation("CashSessionClosedBy")
   /// Caja asignada para POS (opcional; si es null usa la caja default)
-  cash_register_id            String?               @db.Uuid
-  cashRegister                CashRegister?         @relation("UserAssignedRegister", fields: [cash_register_id], references: [id], onDelete: SetNull)
-  inventory_counts_created              InventoryCountSession[] @relation("InventoryCountCreatedBy")
-  inventory_counts_approved             InventoryCountSession[] @relation("InventoryCountApprovedBy")
-  inventory_counts_first_approved       InventoryCountSession[] @relation("InventoryCountFirstApprovedBy")
-  inventory_count_lines_counted         InventoryCountLine[]    @relation("InventoryCountLineCountedBy")
-  inventory_count_lines_secondary_count InventoryCountLine[]    @relation("InventoryCountLineSecondaryCountedBy")
-  commercial_documents_created        CommercialDocument[]    @relation("CommercialDocCreatedBy")
-  accounting_periods_closed AccountingPeriod[] @relation("PeriodClosedBy")
-  journal_entries_created   JournalEntry[]     @relation("JournalCreatedBy")
+  cash_register_id                       String?                           @db.Uuid
+  cashRegister                           CashRegister?                     @relation("UserAssignedRegister", fields: [cash_register_id], references: [id], onDelete: SetNull)
+  inventory_counts_created               InventoryCountSession[]           @relation("InventoryCountCreatedBy")
+  inventory_counts_approved              InventoryCountSession[]           @relation("InventoryCountApprovedBy")
+  inventory_counts_first_approved        InventoryCountSession[]           @relation("InventoryCountFirstApprovedBy")
+  inventory_count_lines_counted          InventoryCountLine[]              @relation("InventoryCountLineCountedBy")
+  inventory_count_lines_secondary_count  InventoryCountLine[]              @relation("InventoryCountLineSecondaryCountedBy")
+  commercial_documents_created           CommercialDocument[]              @relation("CommercialDocCreatedBy")
+  accounting_periods_closed              AccountingPeriod[]                @relation("PeriodClosedBy")
+  journal_entries_created                JournalEntry[]                    @relation("JournalCreatedBy")
+
+  // Multi-empresa / sucursales
+  user_companies     UserCompany[]
+  user_branches      UserBranch[]
+  /// Sucursal por defecto al entrar (si es null se usa la primera asignada)
+  default_branch_id  String?         @db.Uuid
+  defaultBranch      Branch?         @relation("UserDefaultBranch", fields: [default_branch_id], references: [id], onDelete: SetNull)
+  transfers_created  StockTransfer[] @relation("TransferCreatedBy")
+  transfers_received StockTransfer[] @relation("TransferReceivedBy")
+  stock_movements    StockMovement[]
 
   // Campos de empleado
   is_employee Boolean   @default(false)
@@ -392,6 +730,8 @@ model RefreshToken {
 
 model Alert {
   id            String        @id @default(uuid()) @db.Uuid
+  branch_id     String        @db.Uuid
+  branch        Branch        @relation(fields: [branch_id], references: [id], onDelete: Restrict)
   type_id       Int
   type          AlertType     @relation(fields: [type_id], references: [id])
   priority_id   Int
@@ -409,12 +749,15 @@ model Alert {
   assignedTo    User?         @relation(fields: [assigned_to], references: [id], name: "AlertAssignedTo")
   resolved      Int           @default(0)
 
+  @@index([branch_id])
   @@map("alerts")
 }
 
 model Sale {
   id                String          @id @default(uuid()) @db.Uuid
-  reference         String?         @unique @db.VarChar(20)  // Referencia legible: V-000001 (generada al crear)
+  branch_id         String          @db.Uuid
+  branch            Branch          @relation(fields: [branch_id], references: [id], onDelete: Restrict)
+  reference         String?         @db.VarChar(30) // Referencia legible: V-SUC1-000001 (generada al crear)
   date              DateTime        @default(now())
   customer          String?         @db.VarChar(150)
   customer_nit      String?         @db.VarChar(50)
@@ -432,28 +775,35 @@ model Sale {
   amount_received   Decimal?        @db.Decimal(12, 2)
   change            Decimal?        @db.Decimal(12, 2)
   sale_items        SaleItem[]
-  sale_dtes         SaleDte[]       // Facturación DTE (InFile/SAT): autorización, serie, número
+  sale_dtes         SaleDte[] // Facturación DTE (InFile/SAT): autorización, serie, número
   returns           Return[]
   sale_promotions   SalePromotion[]
   sold_at           DateTime        @default(now())
 
-  cash_register_session_id String?               @db.Uuid
-  cashRegisterSession      CashRegisterSession?  @relation(fields: [cash_register_session_id], references: [id], onDelete: SetNull)
+  cash_register_session_id String?              @db.Uuid
+  cashRegisterSession      CashRegisterSession? @relation(fields: [cash_register_session_id], references: [id], onDelete: SetNull)
 
   // Usuario que registró la venta
   created_by String? @db.Uuid
   createdBy  User?   @relation("SaleCreatedBy", fields: [created_by], references: [id])
 
   /// Cliente del maestro (Supplier party_type CUSTOMER), si se eligió en POS.
-  customer_contact_id String?   @db.Uuid
-  customerContact       Supplier? @relation("SaleCustomerContact", fields: [customer_contact_id], references: [id], onDelete: SetNull)
-  sales_channel         SalesChannel @default(POS)
-  orderLink             CommercialDocumentSale?
+  customer_contact_id String?                 @db.Uuid
+  customerContact     Supplier?               @relation("SaleCustomerContact", fields: [customer_contact_id], references: [id], onDelete: SetNull)
+  sales_channel       SalesChannel            @default(POS)
+  orderLink           CommercialDocumentSale?
 
+  /// Clave del intento de cobro. Un doble clic o un reintento tras un timeout
+  /// repite la misma y devuelve la venta que ya existe en vez de crear otra.
+  idempotency_key String? @db.VarChar(64)
+
+  @@unique([branch_id, reference])
+  @@unique([branch_id, idempotency_key])
   @@index([created_by])
   @@index([cash_register_session_id])
   /// Listados por estado y fecha (p. ej. resumen de cliente, ventas «Completada»)
   @@index([status_id, date(sort: Desc)], map: "idx_sales_status_id_date_desc")
+  @@index([branch_id, date(sort: Desc)])
   @@map("sales")
 }
 
@@ -491,51 +841,54 @@ enum StockReservationKind {
 }
 
 model CommercialDocument {
-  id                  String              @id @default(uuid()) @db.Uuid
-  reference           String?             @unique @db.VarChar(20)
+  id                  String                   @id @default(uuid()) @db.Uuid
+  branch_id           String                   @db.Uuid
+  branch              Branch                   @relation(fields: [branch_id], references: [id], onDelete: Restrict)
+  reference           String?                  @db.VarChar(30)
   doc_type            CommercialDocType
-  status              CommercialDocStatus @default(DRAFT)
+  status              CommercialDocStatus      @default(DRAFT)
   valid_until         DateTime?
-  customer            String?             @db.VarChar(150)
-  customer_nit        String?             @db.VarChar(50)
-  is_final_consumer   Boolean             @default(true)
-  customer_contact_id String?             @db.Uuid
-  customerContact     Supplier?           @relation("CommercialDocCustomer", fields: [customer_contact_id], references: [id], onDelete: SetNull)
-  sales_channel       SalesChannel        @default(WHOLESALE)
-  subtotal            Decimal?            @db.Decimal(12, 2)
-  discount_total      Decimal?            @db.Decimal(12, 2)
-  total               Decimal             @db.Decimal(12, 2)
-  notes               String?             @db.Text
-  converted_from_id   String?             @db.Uuid
-  convertedFrom       CommercialDocument? @relation("CommercialDocConversion", fields: [converted_from_id], references: [id], onDelete: SetNull)
-  convertedChildren   CommercialDocument[] @relation("CommercialDocConversion")
-  public_token        String?             @unique @db.VarChar(64)
-  created_by          String?             @db.Uuid
-  createdBy           User?               @relation("CommercialDocCreatedBy", fields: [created_by], references: [id], onDelete: SetNull)
+  customer            String?                  @db.VarChar(150)
+  customer_nit        String?                  @db.VarChar(50)
+  is_final_consumer   Boolean                  @default(true)
+  customer_contact_id String?                  @db.Uuid
+  customerContact     Supplier?                @relation("CommercialDocCustomer", fields: [customer_contact_id], references: [id], onDelete: SetNull)
+  sales_channel       SalesChannel             @default(WHOLESALE)
+  subtotal            Decimal?                 @db.Decimal(12, 2)
+  discount_total      Decimal?                 @db.Decimal(12, 2)
+  total               Decimal                  @db.Decimal(12, 2)
+  notes               String?                  @db.Text
+  converted_from_id   String?                  @db.Uuid
+  convertedFrom       CommercialDocument?      @relation("CommercialDocConversion", fields: [converted_from_id], references: [id], onDelete: SetNull)
+  convertedChildren   CommercialDocument[]     @relation("CommercialDocConversion")
+  public_token        String?                  @unique @db.VarChar(64)
+  created_by          String?                  @db.Uuid
+  createdBy           User?                    @relation("CommercialDocCreatedBy", fields: [created_by], references: [id], onDelete: SetNull)
   confirmed_at        DateTime?
-  created_at          DateTime            @default(now())
-  updated_at          DateTime            @updatedAt
+  created_at          DateTime                 @default(now())
+  updated_at          DateTime                 @updatedAt
   lines               CommercialDocumentLine[]
   stock_reservations  StockReservation[]
   documentSales       CommercialDocumentSale[]
 
+  @@unique([branch_id, reference])
   @@index([doc_type, status, created_at(sort: Desc)], map: "idx_commercial_docs_type_status_created")
   @@index([customer_contact_id], map: "idx_commercial_docs_customer_contact")
   @@map("commercial_documents")
 }
 
 model CommercialDocumentLine {
-  id           String             @id @default(uuid()) @db.Uuid
-  document_id  String             @db.Uuid
-  document     CommercialDocument @relation(fields: [document_id], references: [id], onDelete: Cascade)
-  product_id   String             @db.Uuid
-  product      Product            @relation(fields: [product_id], references: [id])
+  id            String             @id @default(uuid()) @db.Uuid
+  document_id   String             @db.Uuid
+  document      CommercialDocument @relation(fields: [document_id], references: [id], onDelete: Cascade)
+  product_id    String             @db.Uuid
+  product       Product            @relation(fields: [product_id], references: [id])
   qty           Int
   qty_fulfilled Int                @default(0)
   unit_price    Decimal            @db.Decimal(12, 2)
-  line_total   Decimal            @db.Decimal(12, 2)
-  sort_order   Int                @default(0)
-  reservations StockReservation[]
+  line_total    Decimal            @db.Decimal(12, 2)
+  sort_order    Int                @default(0)
+  reservations  StockReservation[]
 
   @@index([document_id], map: "idx_commercial_doc_lines_document")
   @@index([product_id], map: "idx_commercial_doc_lines_product")
@@ -546,6 +899,8 @@ model StockReservation {
   id               String                 @id @default(uuid()) @db.Uuid
   product_id       String                 @db.Uuid
   product          Product                @relation(fields: [product_id], references: [id])
+  branch_id        String                 @db.Uuid
+  branch           Branch                 @relation(fields: [branch_id], references: [id], onDelete: Restrict)
   document_id      String                 @db.Uuid
   document         CommercialDocument     @relation(fields: [document_id], references: [id], onDelete: Cascade)
   document_line_id String                 @db.Uuid
@@ -561,6 +916,7 @@ model StockReservation {
 
   @@index([product_id, status], map: "idx_stock_reservations_product_status")
   @@index([document_id, status], map: "idx_stock_reservations_document_status")
+  @@index([branch_id, product_id, status])
   @@map("stock_reservations")
 }
 
@@ -576,21 +932,20 @@ model CommercialDocumentSale {
   @@map("commercial_document_sales")
 }
 
-
 model SaleDte {
-  id             String    @id @default(uuid()) @db.Uuid
-  sale_id        String    @db.Uuid
-  sale           Sale      @relation(fields: [sale_id], references: [id], onDelete: Cascade)
-  document_type  String?   @db.VarChar(50)   // CFAC, CCRE, etc.
-  authorization  String?   @db.VarChar(100)  // Número de autorización SAT
-  series         String?   @db.VarChar(20)
-  number         String?   @db.VarChar(50)  // Número de factura
-  emission_date  DateTime? // Fecha de emisión
-  status         String?   @db.VarChar(50)  // autorizado, rechazado, etc.
-  provider       String?   @db.VarChar(50)   // InFile, etc.
-  xml_url        String?   @db.VarChar(500)
-  pdf_url        String?   @db.VarChar(500)
-  created_at     DateTime  @default(now())
+  id            String    @id @default(uuid()) @db.Uuid
+  sale_id       String    @db.Uuid
+  sale          Sale      @relation(fields: [sale_id], references: [id], onDelete: Cascade)
+  document_type String?   @db.VarChar(50) // CFAC, CCRE, etc.
+  authorization String?   @db.VarChar(100) // Número de autorización SAT
+  series        String?   @db.VarChar(20)
+  number        String?   @db.VarChar(50) // Número de factura
+  emission_date DateTime? // Fecha de emisión
+  status        String?   @db.VarChar(50) // autorizado, rechazado, etc.
+  provider      String?   @db.VarChar(50) // InFile, etc.
+  xml_url       String?   @db.VarChar(500)
+  pdf_url       String?   @db.VarChar(500)
+  created_at    DateTime  @default(now())
 
   @@index([sale_id])
   @@map("sale_dtes")
@@ -603,6 +958,10 @@ model SaleItem {
   product_id   String       @db.Uuid
   product      Product      @relation(fields: [product_id], references: [id])
   price        Decimal      @db.Decimal(12, 2)
+  /// Costo del producto AL MOMENTO DE VENDER. Sin esto el asiento contable toma
+  /// el costo de hoy y editar un costo cambia el CMV de ventas viejas.
+  /// Null = venta anterior a este campo; ahí se cae al costo del producto.
+  unit_cost    Decimal?     @db.Decimal(12, 2)
   qty          Int
   return_items ReturnItem[]
 
@@ -638,31 +997,34 @@ model SupplierCategory {
 
 /// Registro de auditoría para ingresos de mercancía
 model IncomingMerchandise {
-  id              String                    @id @default(uuid()) @db.Uuid
-  supplier_id     String                    @db.Uuid
-  supplier        Supplier                  @relation(fields: [supplier_id], references: [id])
-  registered_by   String                    @db.Uuid
-  registeredBy    User                      @relation("MerchandiseRegisteredBy", fields: [registered_by], references: [id])
-  date            DateTime                  @default(now())
-  notes           String?                   @db.Text
+  id                 String                            @id @default(uuid()) @db.Uuid
+  branch_id          String                            @db.Uuid
+  branch             Branch                            @relation(fields: [branch_id], references: [id], onDelete: Restrict)
+  supplier_id        String                            @db.Uuid
+  supplier           Supplier                          @relation(fields: [supplier_id], references: [id])
+  registered_by      String                            @db.Uuid
+  registeredBy       User                              @relation("MerchandiseRegisteredBy", fields: [registered_by], references: [id])
+  date               DateTime                          @default(now())
+  notes              String?                           @db.Text
   /// Término de pago acordado para esta compra (debe existir en los términos del proveedor al crear)
-  payment_term_id Int?
-  paymentTerm     PaymentTerm?              @relation(fields: [payment_term_id], references: [id], onDelete: SetNull)
-  payment_status  MerchandisePaymentStatus  @default(PENDING)
-  paid_at         DateTime?
-  payment_reference String?                 @db.VarChar(255)
-  due_date        DateTime?
-  payment_updated_by   String?   @db.Uuid
-  paymentUpdatedBy     User?     @relation("MerchandisePaymentAudit", fields: [payment_updated_by], references: [id], onDelete: SetNull)
-  payment_updated_at   DateTime?
-  items           IncomingMerchandiseItem[]
-  paymentEntries  IncomingMerchandisePaymentEntry[]
+  payment_term_id    Int?
+  paymentTerm        PaymentTerm?                      @relation(fields: [payment_term_id], references: [id], onDelete: SetNull)
+  payment_status     MerchandisePaymentStatus          @default(PENDING)
+  paid_at            DateTime?
+  payment_reference  String?                           @db.VarChar(255)
+  due_date           DateTime?
+  payment_updated_by String?                           @db.Uuid
+  paymentUpdatedBy   User?                             @relation("MerchandisePaymentAudit", fields: [payment_updated_by], references: [id], onDelete: SetNull)
+  payment_updated_at DateTime?
+  items              IncomingMerchandiseItem[]
+  paymentEntries     IncomingMerchandisePaymentEntry[]
 
   @@index([registered_by])
   @@index([date])
   @@index([payment_status])
   /// Cubre también filtro por supplier_id (prefijo del compuesto)
   @@index([supplier_id, date(sort: Desc)], map: "idx_incoming_merchandise_supplier_date")
+  @@index([branch_id, date(sort: Desc)])
   @@map("incoming_merchandise")
 }
 
@@ -697,21 +1059,21 @@ model IncomingMerchandisePaymentEntry {
 }
 
 model Return {
-  id           String       @id @default(uuid()) @db.Uuid
-  sale_id      String       @db.Uuid
-  sale         Sale         @relation(fields: [sale_id], references: [id])
-  return_date  DateTime     @default(now())
-  type         ReturnType   @default(REFUND)
-  reason       String?      @db.Text
-  total_refund Decimal      @db.Decimal(12, 2)
+  id               String       @id @default(uuid()) @db.Uuid
+  sale_id          String       @db.Uuid
+  sale             Sale         @relation(fields: [sale_id], references: [id])
+  return_date      DateTime     @default(now())
+  type             ReturnType   @default(REFUND)
+  reason           String?      @db.Text
+  total_refund     Decimal      @db.Decimal(12, 2)
   /// EXCHANGE: valor_reemplazo − valor_devuelto. + = cliente paga; − = se le devuelve.
-  price_difference Decimal  @default(0) @db.Decimal(12, 2)
-  items_count  Int          @default(0)
-  status_id    Int
-  status       ReturnStatus @relation(fields: [status_id], references: [id])
-  processed_by String?      @db.Uuid
-  processed_at DateTime?
-  notes        String?      @db.Text
+  price_difference Decimal      @default(0) @db.Decimal(12, 2)
+  items_count      Int          @default(0)
+  status_id        Int
+  status           ReturnStatus @relation(fields: [status_id], references: [id])
+  processed_by     String?      @db.Uuid
+  processed_at     DateTime?
+  notes            String?      @db.Text
 
   return_items      ReturnItem[]
   replacement_items ReturnReplacementItem[]
@@ -761,18 +1123,21 @@ model ReturnReplacementItem {
 
 /// Punto de cobro físico o lógico (hoy: una caja «Principal» por defecto; preparado para multi-caja).
 model CashRegister {
-  id          String   @id @default(uuid()) @db.Uuid
-  name        String   @db.VarChar(120)
-  code        String   @unique @db.VarChar(40)
-  is_default  Boolean  @default(false)
-  active      Boolean  @default(true)
-  created_at  DateTime @default(now())
-  updated_at  DateTime @updatedAt
+  id         String   @id @default(uuid()) @db.Uuid
+  branch_id  String   @db.Uuid
+  branch     Branch   @relation(fields: [branch_id], references: [id], onDelete: Restrict)
+  name       String   @db.VarChar(120)
+  code       String   @db.VarChar(40)
+  is_default Boolean  @default(false)
+  active     Boolean  @default(true)
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
 
-  sessions CashRegisterSession[]
+  sessions       CashRegisterSession[]
   /// Usuarios con esta caja asignada para POS
-  assigned_users User[] @relation("UserAssignedRegister")
+  assigned_users User[]                @relation("UserAssignedRegister")
 
+  @@unique([branch_id, code])
   @@map("cash_registers")
 }
 
@@ -784,9 +1149,9 @@ enum CashRegisterSessionStatus {
 
 /// Apertura de caja: una sesión OPEN por caja (índice único parcial en migración SQL).
 model CashRegisterSession {
-  id               String                    @id @default(uuid()) @db.Uuid
-  cash_register_id String                    @db.Uuid
-  cashRegister     CashRegister              @relation(fields: [cash_register_id], references: [id], onDelete: Restrict)
+  id               String       @id @default(uuid()) @db.Uuid
+  cash_register_id String       @db.Uuid
+  cashRegister     CashRegister @relation(fields: [cash_register_id], references: [id], onDelete: Restrict)
 
   status       CashRegisterSessionStatus @default(OPEN)
   opened_at    DateTime                  @default(now())
@@ -818,6 +1183,9 @@ model CashRegisterSession {
 
 model CashClosure {
   id             String   @id @default(uuid()) @db.Uuid
+  /// Directo (no vía sesión) porque hay cierres legacy sin sesión de caja
+  branch_id      String   @db.Uuid
+  branch         Branch   @relation(fields: [branch_id], references: [id], onDelete: Restrict)
   closure_number Int      @unique @default(autoincrement())
   date           DateTime @default(now())
   start_date     DateTime // Fecha/hora de inicio del período
@@ -877,6 +1245,7 @@ model CashClosure {
   @@index([status])
   @@index([cashier_id])
   @@index([supervisor_id])
+  @@index([branch_id, date(sort: Desc)])
   @@map("cash_closures")
 }
 
@@ -942,6 +1311,8 @@ model PromotionType {
 
 model Promotion {
   id          String        @id @default(uuid()) @db.Uuid
+  company_id  String        @db.Uuid
+  company     Company       @relation(fields: [company_id], references: [id], onDelete: Restrict)
   name        String        @db.VarChar(150)
   description String?       @db.Text
   type_id     Int
@@ -956,6 +1327,11 @@ model Promotion {
   buy_quantity        Int? // Cantidad a comprar (2x1 = 2)
   get_quantity        Int? // Cantidad gratis (2x1 = 1)
   min_quantity        Int? // Cantidad mínima para aplicar
+
+  // Sucursales donde aplica
+  /// true = toda la empresa. false = solo las sucursales de `branches`.
+  applies_to_all_branches Boolean           @default(true)
+  branches                PromotionBranch[]
 
   // Productos relacionados
   applies_to_all        Boolean             @default(false) // Aplica a todos los productos
@@ -981,22 +1357,38 @@ model Promotion {
   sale_promotions SalePromotion[]
 
   @@index([active, start_date, end_date])
+  @@index([company_id])
   @@map("promotions")
 }
 
 // Códigos de promoción (permite múltiples códigos por promoción)
 model PromotionCode {
   id           Int       @id @default(autoincrement())
-  code         String    @unique @db.VarChar(50)
+  /// Denormalizado desde la promoción para unicidad del código por empresa
+  company_id   String    @db.Uuid
+  company      Company   @relation(fields: [company_id], references: [id], onDelete: Restrict)
+  code         String    @db.VarChar(50)
   promotion_id String    @db.Uuid
   promotion    Promotion @relation(fields: [promotion_id], references: [id], onDelete: Cascade)
   current_uses Int       @default(0)
   active       Boolean   @default(true)
   created_at   DateTime  @default(now())
 
-  @@index([code])
+  @@unique([company_id, code])
   @@index([promotion_id])
   @@map("promotion_codes")
+}
+
+/// Sucursales donde aplica la promoción (solo si applies_to_all_branches = false)
+model PromotionBranch {
+  promotion_id String    @db.Uuid
+  promotion    Promotion @relation(fields: [promotion_id], references: [id], onDelete: Cascade)
+  branch_id    String    @db.Uuid
+  branch       Branch    @relation(fields: [branch_id], references: [id], onDelete: Cascade)
+
+  @@id([promotion_id, branch_id])
+  @@index([branch_id])
+  @@map("promotion_branches")
 }
 
 model PromotionProduct {
@@ -1049,60 +1441,69 @@ enum InventoryCountSessionStatus {
 }
 
 model InventoryCountSession {
-  id             String                      @id @default(uuid()) @db.Uuid
-  name           String?                     @db.VarChar(200)
-  status         InventoryCountSessionStatus @default(DRAFT)
+  id                    String                      @id @default(uuid()) @db.Uuid
+  branch_id             String                      @db.Uuid
+  branch                Branch                      @relation(fields: [branch_id], references: [id], onDelete: Restrict)
+  /// Acota el conteo a un almacén. Sin él, la sesión cubre toda la sucursal.
+  warehouse_id          String?                     @db.Uuid
+  warehouse             Warehouse?                  @relation(fields: [warehouse_id], references: [id], onDelete: SetNull)
+  name                  String?                     @db.VarChar(200)
+  status                InventoryCountSessionStatus @default(DRAFT)
   /// Alcance y opciones: categoryIds?, supplierIds?, abcClasses? (A|B|C por valor en bodega),
   /// samplePercent? (1–99 muestreo aleatorio reproducible), doubleCount? (segunda lectura obligatoria)
-  scope_json     Json?
+  scope_json            Json?
   /// Si true: primera aprobación → PENDING_SECOND_APPROVAL; segunda aplica stock (otro usuario).
-  dual_approval  Boolean                     @default(false)
+  dual_approval         Boolean                     @default(false)
   /// Motivo obligatorio al enviar a revisión
-  submit_reason  String?                     @db.Text
-  created_by_id  String                      @db.Uuid
-  createdBy      User                        @relation("InventoryCountCreatedBy", fields: [created_by_id], references: [id])
-  started_at     DateTime?
-  submitted_at   DateTime?
+  submit_reason         String?                     @db.Text
+  created_by_id         String                      @db.Uuid
+  createdBy             User                        @relation("InventoryCountCreatedBy", fields: [created_by_id], references: [id])
+  started_at            DateTime?
+  submitted_at          DateTime?
   first_approved_at     DateTime?
   first_approved_by_id  String?                     @db.Uuid
   firstApprovedBy       User?                       @relation("InventoryCountFirstApprovedBy", fields: [first_approved_by_id], references: [id])
   first_approval_reason String?                     @db.Text
   final_approval_reason String?                     @db.Text
-  approved_at    DateTime?
-  approved_by_id String?                     @db.Uuid
-  approvedBy     User?                       @relation("InventoryCountApprovedBy", fields: [approved_by_id], references: [id])
-  cancelled_at   DateTime?
-  cancel_reason  String?                     @db.Text
-  notes          String?                     @db.Text
-  lines          InventoryCountLine[]
-  created_at     DateTime                    @default(now())
-  updated_at     DateTime                    @updatedAt
+  approved_at           DateTime?
+  approved_by_id        String?                     @db.Uuid
+  approvedBy            User?                       @relation("InventoryCountApprovedBy", fields: [approved_by_id], references: [id])
+  cancelled_at          DateTime?
+  cancel_reason         String?                     @db.Text
+  notes                 String?                     @db.Text
+  lines                 InventoryCountLine[]
+  created_at            DateTime                    @default(now())
+  updated_at            DateTime                    @updatedAt
 
   @@index([created_by_id])
   @@index([created_at(sort: Desc)], map: "idx_inventory_count_sessions_created_at")
   /// Cubre filtro por status (prefijo) + orden por fecha del listado
   @@index([status, created_at(sort: Desc)], map: "idx_inventory_count_sessions_status_created")
+  @@index([branch_id])
   @@map("inventory_count_sessions")
 }
 
 model InventoryCountLine {
-  id             String                @id @default(uuid()) @db.Uuid
-  session_id     String                @db.Uuid
-  session        InventoryCountSession @relation(fields: [session_id], references: [id], onDelete: Cascade)
-  product_id     String                @db.Uuid
-  product        Product               @relation(fields: [product_id], references: [id])
-  stock_snapshot Int
-  qty_counted    Int?
-  counted_at     DateTime?
-  counted_by_id  String?               @db.Uuid
-  countedBy      User?                 @relation("InventoryCountLineCountedBy", fields: [counted_by_id], references: [id])
-  qty_counted_secondary    Int?
-  counted_secondary_at     DateTime?
-  counted_secondary_by_id  String?               @db.Uuid
-  countedSecondaryBy       User?                 @relation("InventoryCountLineSecondaryCountedBy", fields: [counted_secondary_by_id], references: [id])
-  note           String?               @db.VarChar(500)
+  id                      String                @id @default(uuid()) @db.Uuid
+  session_id              String                @db.Uuid
+  session                 InventoryCountSession @relation(fields: [session_id], references: [id], onDelete: Cascade)
+  product_id              String                @db.Uuid
+  product                 Product               @relation(fields: [product_id], references: [id])
+  /// Se cuenta ubicación por ubicación: un producto en dos anaqueles son dos líneas.
+  location_id             String                @db.Uuid
+  location                StockLocation         @relation(fields: [location_id], references: [id], onDelete: Restrict)
+  stock_snapshot          Int
+  qty_counted             Int?
+  counted_at              DateTime?
+  counted_by_id           String?               @db.Uuid
+  countedBy               User?                 @relation("InventoryCountLineCountedBy", fields: [counted_by_id], references: [id])
+  qty_counted_secondary   Int?
+  counted_secondary_at    DateTime?
+  counted_secondary_by_id String?               @db.Uuid
+  countedSecondaryBy      User?                 @relation("InventoryCountLineSecondaryCountedBy", fields: [counted_secondary_by_id], references: [id])
+  note                    String?               @db.VarChar(500)
 
-  @@unique([session_id, product_id])
+  @@unique([session_id, product_id, location_id])
   @@index([session_id])
   @@index([product_id])
   @@map("inventory_count_lines")
@@ -1114,12 +1515,15 @@ model InventoryCountLine {
 
 model SystemSetting {
   id          Int      @id @default(autoincrement())
-  key         String   @unique @db.VarChar(100)
+  company_id  String   @db.Uuid
+  company     Company  @relation(fields: [company_id], references: [id], onDelete: Cascade)
+  key         String   @db.VarChar(100)
   value       String   @db.Text
-  type        String?  @db.VarChar(50)   // string, json, number
+  type        String?  @db.VarChar(50) // string, json, number
   description String?  @db.VarChar(255)
   updated_at  DateTime @updatedAt
 
+  @@unique([company_id, key])
   @@map("system_settings")
 }
 
@@ -1148,43 +1552,56 @@ enum JournalSourceType {
   PURCHASE
   PURCHASE_PAYMENT
   CLOSING
+  /// Ajustes de inventario: manuales, diferencias de conteo y bajas de lote.
+  /// Va al final: ADD VALUE lo agrega ahí y el orden del enum es el de la base.
+  STOCK_ADJUSTMENT
 }
 
 /// Cuenta contable (catálogo). `is_group` = agrupadora, no recibe movimientos.
 model Account {
-  id        Int           @id @default(autoincrement())
-  code      String        @unique @db.VarChar(20)
-  name      String        @db.VarChar(150)
-  type      AccountType
-  parent_id Int?
-  parent    Account?      @relation("AccountHierarchy", fields: [parent_id], references: [id], onDelete: SetNull)
-  children  Account[]     @relation("AccountHierarchy")
-  is_group  Boolean       @default(false)
-  active    Boolean       @default(true)
+  id         Int           @id @default(autoincrement())
+  company_id String        @db.Uuid
+  company    Company       @relation(fields: [company_id], references: [id], onDelete: Restrict)
+  code       String        @db.VarChar(20)
+  name       String        @db.VarChar(150)
+  type       AccountType
+  parent_id  Int?
+  parent     Account?      @relation("AccountHierarchy", fields: [parent_id], references: [id], onDelete: SetNull)
+  children   Account[]     @relation("AccountHierarchy")
+  is_group   Boolean       @default(false)
+  active     Boolean       @default(true)
   /// Usada por el posteo automático; no se puede desactivar ni eliminar
-  system    Boolean       @default(false)
-  lines     JournalLine[]
+  system     Boolean       @default(false)
+  lines      JournalLine[]
 
+  @@unique([company_id, code])
   @@map("accounts")
 }
 
 model AccountingPeriod {
-  id        Int                    @id @default(autoincrement())
-  year      Int
-  month     Int
-  status    AccountingPeriodStatus @default(OPEN)
-  closed_at DateTime?
-  closed_by String?                @db.Uuid
-  closedBy  User?                  @relation("PeriodClosedBy", fields: [closed_by], references: [id], onDelete: SetNull)
+  id         Int                    @id @default(autoincrement())
+  company_id String                 @db.Uuid
+  company    Company                @relation(fields: [company_id], references: [id], onDelete: Restrict)
+  year       Int
+  month      Int
+  status     AccountingPeriodStatus @default(OPEN)
+  closed_at  DateTime?
+  closed_by  String?                @db.Uuid
+  closedBy   User?                  @relation("PeriodClosedBy", fields: [closed_by], references: [id], onDelete: SetNull)
 
-  @@unique([year, month])
+  @@unique([company_id, year, month])
   @@map("accounting_periods")
 }
 
 /// Asiento contable. Inmutable una vez creado; se anula con contra-asiento.
 model JournalEntry {
   id             String            @id @default(uuid()) @db.Uuid
-  entry_number   String            @unique @db.VarChar(20) // A-000001
+  company_id     String            @db.Uuid
+  company        Company           @relation(fields: [company_id], references: [id], onDelete: Restrict)
+  /// Sucursal que originó el asiento. NULL = asiento de empresa (manual, cierre anual, importación).
+  branch_id      String?           @db.Uuid
+  branch         Branch?           @relation(fields: [branch_id], references: [id], onDelete: SetNull)
+  entry_number   String            @db.VarChar(20) // A-000001
   date           DateTime
   description    String            @db.VarChar(255)
   source_type    JournalSourceType @default(MANUAL)
@@ -1198,8 +1615,10 @@ model JournalEntry {
   lines          JournalLine[]
 
   /// Idempotencia del motor de posteo
-  @@unique([source_type, source_id])
+  @@unique([company_id, source_type, source_id])
+  @@unique([company_id, entry_number])
   @@index([date])
+  @@index([branch_id])
   @@map("journal_entries")
 }
 

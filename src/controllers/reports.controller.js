@@ -23,6 +23,172 @@ const BRAND = {
 }
 
 // Utility: parse period range (supports: week, month, quarter, semester, year, all)
+const { branchWhere } = require('../middlewares/tenant')
+const { inTransitTotals } = require('../services/inTransit')
+
+/** Sucursales que alcanza el reporte: la activa, o todas en vista consolidada. */
+function scopeBranchIds(req) {
+  return req.branchId ? [req.branchId] : (req.branchIds || [])
+}
+
+/**
+ * Identifica el alcance del reporte para imprimirlo en el documento: una
+ * sucursal concreta o el consolidado de la empresa (con los nombres de todas).
+ */
+async function reportScope(req) {
+  const ids = scopeBranchIds(req)
+  const branches = ids.length
+    ? await prisma.branch.findMany({
+        where: { id: { in: ids } },
+        select: { id: true, name: true },
+        orderBy: { name: 'asc' },
+      })
+    : []
+  const consolidated = !req.branchId
+  const names = branches.map((b) => b.name)
+  return {
+    consolidated,
+    branches,
+    label: consolidated
+      ? `Todas las sucursales — consolidado (${names.join(', ') || 'sin sucursales'})`
+      : names[0] || 'Sucursal',
+  }
+}
+
+/** Almacén y ubicación por los que el modal acotó el reporte, si los hay. */
+function warehouseFilter(req) {
+  const wid = req.query?.warehouse_id ? String(req.query.warehouse_id) : null
+  const lid = req.query?.location_id ? String(req.query.location_id) : null
+  return { wid, lid, active: Boolean(wid || lid) }
+}
+
+/**
+ * Inventario desglosado por almacén. Gemelo de `stockByBranch`, pero un nivel
+ * más abajo: aquí sí tiene sentido fuera del consolidado, porque una sola
+ * sucursal puede tener bodega, sala y vitrina.
+ */
+async function stockByWarehouse(req) {
+  const ids = scopeBranchIds(req)
+  if (!ids.length) return []
+  const { wid, lid } = warehouseFilter(req)
+  const rows = await prisma.productStockLocation.findMany({
+    where: {
+      stock: { not: 0 },
+      product: { deleted: false, deleted_at: null },
+      location: {
+        ...(lid ? { id: lid } : {}),
+        warehouse: { branch_id: { in: ids }, active: true, ...(wid ? { id: wid } : {}) },
+      },
+    },
+    select: {
+      stock: true,
+      product: { select: { cost: true } },
+      location: { select: { warehouse: { select: { name: true }, }, }, },
+    },
+  })
+  const agg = new Map()
+  for (const r of rows) {
+    const name = r.location.warehouse.name
+    const a = agg.get(name) || { warehouse: name, skus: 0, units: 0, value: 0 }
+    a.skus += 1
+    a.units += number(r.stock)
+    a.value += number(r.stock) * number(r.product?.cost)
+    agg.set(name, a)
+  }
+  const out = [...agg.values()].map((a) => ({ ...a, value: Number(a.value.toFixed(2)) }))
+  // Con un solo almacén el desglose no dice nada que no diga el total.
+  return out.length > 1 ? out.sort((a, b) => b.value - a.value) : []
+}
+
+/**
+ * Dónde está lo poco que queda: la ubicación con más existencia de cada
+ * producto. Para que "faltan 3" venga con el "y los 2 que hay están en la
+ * vitrina", que es lo que decide si se compra o se mueve.
+ */
+async function topLocationByProduct(req, productIds) {
+  const ids = scopeBranchIds(req)
+  const pids = [...new Set((productIds || []).filter(Boolean))]
+  if (!ids.length || !pids.length) return new Map()
+  const rows = await prisma.productStockLocation.findMany({
+    where: {
+      product_id: { in: pids },
+      stock: { gt: 0 },
+      location: { warehouse: { branch_id: { in: ids }, active: true } },
+    },
+    select: {
+      product_id: true, stock: true,
+      location: { select: { code: true, warehouse: { select: { name: true } } } },
+    },
+    orderBy: { stock: 'desc' },
+  })
+  const out = new Map()
+  for (const r of rows) {
+    if (out.has(r.product_id)) continue
+    out.set(r.product_id, `${r.location.warehouse.name} · ${r.location.code} (${r.stock})`)
+  }
+  return out
+}
+
+/** Sustituye p.stock por el stock de las sucursales del reporte (in place). */
+async function overlayReportBranchStock(products, req) {
+  const ids = scopeBranchIds(req)
+  if (!ids.length || !products?.length) return
+  const { wid, lid, active } = warehouseFilter(req)
+  if (active) {
+    // Acotado a un almacén o ubicación: el stock del reporte es el de ahí.
+    const rows = await prisma.productStockLocation.findMany({
+      where: {
+        product_id: { in: products.map((p) => p.id) },
+        location: {
+          ...(lid ? { id: lid } : {}),
+          warehouse: { branch_id: { in: ids }, ...(wid ? { id: wid } : {}) },
+        },
+      },
+      select: { product_id: true, stock: true },
+    })
+    const at = new Map()
+    for (const r of rows) at.set(r.product_id, (at.get(r.product_id) || 0) + r.stock)
+    for (const p of products) p.stock = at.get(p.id) ?? 0
+    return
+  }
+  const rows = await prisma.productStock.findMany({
+    where: { branch_id: { in: ids }, product_id: { in: products.map((p) => p.id) } },
+    select: { product_id: true, stock: true },
+  })
+  const byId = new Map()
+  for (const r of rows) byId.set(r.product_id, (byId.get(r.product_id) || 0) + r.stock)
+  for (const p of products) p.stock = byId.get(p.id) ?? 0
+}
+
+/**
+ * Inventario desglosado por sucursal. Vacío fuera del consolidado: ahí el
+ * reporte entero ya es de una sola sucursal y el desglose sobraría.
+ */
+async function stockByBranch(req, scope) {
+  if (!scope.consolidated || !scope.branches.length) return []
+  const rows = await prisma.productStock.findMany({
+    where: {
+      branch_id: { in: scope.branches.map((b) => b.id) },
+      product: { deleted: false, deleted_at: null },
+    },
+    select: { branch_id: true, stock: true, min_stock: true, product: { select: { cost: true } } },
+  })
+  const agg = new Map(
+    scope.branches.map((b) => [b.id, { branch: b.name, skus: 0, units: 0, value: 0, sinStock: 0, bajoMin: 0 }])
+  )
+  for (const r of rows) {
+    const a = agg.get(r.branch_id)
+    if (!a) continue
+    const st = number(r.stock)
+    a.skus += 1
+    a.units += st
+    a.value += st * number(r.product?.cost)
+    if (st === 0) a.sinStock += 1
+    else if (st <= number(r.min_stock)) a.bajoMin += 1
+  }
+  return [...agg.values()].map((a) => ({ ...a, value: Number(a.value.toFixed(2)) }))
+}
+
 function periodRange(period, yearParam, opts = {}, zone = 'America/Guatemala') {
   const now = DateTime.now().setZone(zone)
   const isAll = String(yearParam || '').toLowerCase() === 'all'
@@ -127,7 +293,7 @@ function ensureSpace(doc, needed) {
   if (doc.y + needed > bottom) addPageWithBand(doc)
 }
 
-function header(doc, title, periodLabel, companyName = 'Depósito', logoBuffer = null) {
+function header(doc, title, periodLabel, companyName = 'Depósito', logoBuffer = null, scopeLabel = null) {
   const left = doc.page.margins.left
   const right = doc.page.width - doc.page.margins.right
   let titleX = left
@@ -145,6 +311,9 @@ function header(doc, title, periodLabel, companyName = 'Depósito', logoBuffer =
 
   doc.fillColor(BRAND.primary).fontSize(20).text(title, titleX, titleY, { align: 'left', width: Math.max(80, right - titleX) })
   doc.fontSize(9).fillColor(BRAND.muted).text(`Generado: ${DateTime.now().setZone('America/Guatemala').toFormat('yyyy-LL-dd HH:mm')}  |  Período: ${periodLabel}`, titleX, doc.y + 2, { align: 'left', width: Math.max(80, right - titleX) })
+  if (scopeLabel) {
+    doc.fontSize(9).fillColor(BRAND.muted).text(`Sucursal: ${scopeLabel}`, titleX, doc.y + 1, { align: 'left', width: Math.max(80, right - titleX) })
+  }
   doc.moveTo(left, doc.y + 4).lineTo(right, doc.y + 4).lineWidth(1).strokeColor(BRAND.border).stroke()
   doc.moveDown(0.6)
 }
@@ -408,12 +577,13 @@ function drawSuppliersGrid(doc, suppliers) {
   })
 }
 
-async function getSalesData(startUtc, endUtc) {
+async function getSalesData(startUtc, endUtc, req) {
   const status = await prisma.saleStatus.findFirst({ where: { name: 'Completada' } })
+  const tenantSales = branchWhere(req)
 
   // Obtener sale_items (productos / categorías / costos)
   const items = await prisma.saleItem.findMany({
-    where: { sale: { date: { gte: startUtc, lte: endUtc }, ...(status ? { status_id: status.id } : {}) } },
+    where: { sale: { ...tenantSales, date: { gte: startUtc, lte: endUtc }, ...(status ? { status_id: status.id } : {}) } },
     include: {
       product: { include: { category: true } },
       sale: {
@@ -432,11 +602,13 @@ async function getSalesData(startUtc, endUtc) {
   // También obtener ventas a nivel cabecera para conteos rápidos
   const sales = await prisma.sale.findMany({
     where: {
+      ...tenantSales,
       date: { gte: startUtc, lte: endUtc },
       ...(status ? { status_id: status.id } : {})
     },
     select: {
       id: true,
+      branch_id: true,
       date: true,
       total: true,
       total_returned: true,
@@ -456,6 +628,7 @@ async function getSalesData(startUtc, endUtc) {
   const paymentAgg = {}
   const timeAgg = {}   // key: 'YYYY-MM-DD' o 'YYYY-MM'
   const cashierAgg = {}
+  const branchAgg = new Map() // solo se usa en consolidado
   // Para agregar ingresos por cabecera (una vez por venta) pero unidades desde sale_items
   const unitsBySaleId = new Map()
 
@@ -520,6 +693,13 @@ async function getSalesData(startUtc, endUtc) {
     timeAgg[tKey].ventas += 1
     timeAgg[tKey].unidades += units
     timeAgg[tKey].revenue += adjusted
+
+    const bKey = String(sale.branch_id)
+    const bAgg = branchAgg.get(bKey) || { ventas: 0, unidades: 0, revenue: 0 }
+    bAgg.ventas += 1
+    bAgg.unidades += units
+    bAgg.revenue += adjusted
+    branchAgg.set(bKey, bAgg)
   })
 
   const totalRevenue = totalRevenueGross - totalReturned
@@ -565,7 +745,18 @@ async function getSalesData(startUtc, endUtc) {
   const unidadesTotales = items.reduce((acc, i) => acc + number(i.qty), 0)
   const ticketPromedio = tickets > 0 ? totalRevenue / tickets : 0
 
+  // En consolidado los totales suman varias sucursales: hay que poder ver cuál es cuál.
+  let salesByBranch = []
+  if (!req.branchId) {
+    const scope = await reportScope(req)
+    salesByBranch = scope.branches.map((b) => {
+      const a = branchAgg.get(b.id) || { ventas: 0, unidades: 0, revenue: 0 }
+      return { branch: b.name, ventas: a.ventas, unidades: a.unidades, revenue: Number(a.revenue.toFixed(2)) }
+    })
+  }
+
   return {
+    salesByBranch,
     totalRevenue: Number(totalRevenue.toFixed(2)),              // Neto (con devoluciones)
     totalRevenueGross: Number(totalRevenueGross.toFixed(2)),    // Bruto (sin devoluciones)
     totalReturned: Number(totalReturned.toFixed(2)),            // Total devuelto
@@ -587,13 +778,14 @@ async function getSalesData(startUtc, endUtc) {
  * Datos para reporte financiero: P&L del período + inventario a la fecha + compras registradas.
  * No sustituye al reporte de ventas (sin desglose operativo por cajero/método/top productos).
  */
-async function getFinancialData(startUtc, endUtc) {
-  const sales = await getSalesData(startUtc, endUtc)
+async function getFinancialData(startUtc, endUtc, req) {
+  const sales = await getSalesData(startUtc, endUtc, req)
 
   const products = await prisma.product.findMany({
-    where: { deleted: false, deleted_at: null },
-    select: { stock: true, cost: true }
+    where: { deleted: false, deleted_at: null, company_id: req.companyId },
+    select: { id: true, stock: true, cost: true }
   })
+  await overlayReportBranchStock(products, req)
   let inventoryValue = 0
   let inventoryUnits = 0
   for (const p of products) {
@@ -602,8 +794,17 @@ async function getFinancialData(startUtc, endUtc) {
     inventoryUnits += st
   }
 
+  // Lo enviado y no recibido no está en ningún anaquel, así que no aparece
+  // arriba, pero sigue siendo de la empresa: sin esta línea la valuación queda
+  // corta y no cuadra contra la cuenta contable de Inventario. Acotado a un
+  // almacén o ubicación no aplica: el tránsito no vive en ninguno.
+  const { active: filtradoPorAlmacen } = warehouseFilter(req)
+  const enTransito = filtradoPorAlmacen
+    ? { units: 0, value: 0 }
+    : await inTransitTotals(req.companyId, products, { branchIds: scopeBranchIds(req) })
+
   const purchaseLogs = await prisma.purchaseLog.findMany({
-    where: { date: { gte: startUtc, lte: endUtc } },
+    where: { date: { gte: startUtc, lte: endUtc }, product: { company_id: req.companyId } },
     select: {
       qty: true,
       cost: true,
@@ -636,6 +837,7 @@ async function getFinancialData(startUtc, endUtc) {
   const saleItems = await prisma.saleItem.findMany({
     where: {
       sale: {
+        ...branchWhere(req),
         date: { gte: startUtc, lte: endUtc },
         ...(status ? { status_id: status.id } : {})
       }
@@ -684,6 +886,11 @@ async function getFinancialData(startUtc, endUtc) {
     inventoryValue: Number(inventoryValue.toFixed(2)),
     inventoryUnits,
     inventorySkuCount: products.length,
+    inTransitUnits: enTransito.units,
+    inTransitValue: Number(enTransito.value.toFixed(2)),
+    // Lo que la empresa posee: anaqueles + camioneta. Es la cifra que se compara
+    // contra la cuenta contable de Inventario.
+    inventoryValueOwned: Number((inventoryValue + enTransito.value).toFixed(2)),
     purchasesPeriod: Number(purchasesTotal.toFixed(2)),
     purchaseLogLines: purchaseLogs.length,
     purchasesBySupplier: purchasesBySupplierList,
@@ -695,9 +902,9 @@ async function getFinancialData(startUtc, endUtc) {
 }
 
 /** Agrega por proveedor: conteo de SKUs activos, unidades en stock y valor de inventario (stock × costo). */
-async function getSuppliersReportData() {
+async function getSuppliersReportData(req) {
   const suppliers = await prisma.supplier.findMany({
-    where: { deleted: false, party_type: 'SUPPLIER' },
+    where: { deleted: false, party_type: 'SUPPLIER', company_id: req.companyId },
     include: {
       supplier_payment_terms: {
         include: { payment_term: true },
@@ -708,9 +915,10 @@ async function getSuppliersReportData() {
   })
 
   const productRows = await prisma.product.findMany({
-    where: { deleted: false, deleted_at: null },
-    select: { supplier_id: true, stock: true, cost: true }
+    where: { deleted: false, deleted_at: null, company_id: req.companyId },
+    select: { id: true, supplier_id: true, stock: true, cost: true }
   })
+  await overlayReportBranchStock(productRows, req)
 
   const aggBySupplier = new Map()
   for (const p of productRows) {
@@ -816,18 +1024,20 @@ function sendCsv(res, filename, headerLines = [], sections = []) {
 
 async function salesReport(req, res, next) {
   try {
-  const branding = await getBrandingForPdf(prisma)
+  const branding = await getBrandingForPdf(prisma, req.companyId)
   const companyName = branding.company_name
   const logoBuffer = branding.logoBuffer
   const money = makeMoney(branding.currency_code)
   const { period='month', year, format='pdf', month, quarter, semester } = req.query
   const { startUtc, endUtc, label } = periodRange(period, year, { month, quarter, semester })
-    const data = await getSalesData(startUtc, endUtc)
+    const data = await getSalesData(startUtc, endUtc, req)
+    const scope = await reportScope(req)
     if (String(format).toLowerCase() === 'csv' || String(format).toLowerCase() === 'excel') {
       const total = data.totalRevenueGross || 1
       sendCsv(res, 'reporte-ventas', [
         'REPORTE DE VENTAS',
         `Periodo,${label}`,
+        `Sucursal,${scope.label}`,
         `Generado,${DateTime.now().setZone('America/Guatemala').toFormat('yyyy-LL-dd HH:mm')}`,
         `Ventas Brutas,${money(data.totalRevenueGross)}`,
         `Devoluciones,${money(data.totalReturned)}`,
@@ -838,6 +1048,11 @@ async function salesReport(req, res, next) {
         `Unidades Vendidas,${data.unidadesTotales}`,
         `Ticket Promedio,${money(data.ticketPromedio)}`
       ], [
+        ...(data.salesByBranch.length ? [{
+          title: 'Ventas por Sucursal',
+          columns: ['Sucursal','Tickets','Unidades','Ingresos'],
+          rows: data.salesByBranch.map(b => [b.branch, b.ventas, b.unidades, money(b.revenue)])
+        }] : []),
         { title: 'Top Productos', columns: ['Producto','Unidades','Ingresos'], rows: data.topProducts.map(p=>[p.name, p.ventas, money(p.revenue)]) },
         { title: 'Categorias', columns: ['Categoría','Ingresos','%'], rows: data.categories.map(c=>[c.category, money(c.revenue), Math.round((c.revenue/total)*100)+'%']) },
         {
@@ -859,7 +1074,7 @@ async function salesReport(req, res, next) {
       return
     }
     const doc = newDoc(res, 'Reporte de Ventas')
-    header(doc, 'Reporte de Ventas', label, companyName, logoBuffer)
+    header(doc, 'Reporte de Ventas', label, companyName, logoBuffer, scope.label)
     sectionTitle(doc, 'Resumen')
     drawSummaryCards(doc, [
       { label: 'Ventas Brutas', value: money(data.totalRevenueGross) },
@@ -871,6 +1086,17 @@ async function salesReport(req, res, next) {
       { label: 'Unidades Vendidas', value: String(data.unidadesTotales) },
       { label: 'Ticket Promedio', value: money(data.ticketPromedio) },
     ])
+    if (data.salesByBranch.length) {
+      sectionTitle(doc, 'Ventas por sucursal')
+      drawTable(
+        doc,
+        ['Sucursal','Tickets','Unidades','Ingresos'],
+        data.salesByBranch.map(b => [b.branch, b.ventas, b.unidades, money(b.revenue)]),
+        [150,60,60,80],
+        { align: ['left','right','right','right'], headerAlign: ['left','right','right','right'] }
+      )
+    }
+
     sectionTitle(doc, 'Top Productos (por ingresos)')
     drawTable(
       doc,
@@ -925,28 +1151,54 @@ async function salesReport(req, res, next) {
 
 async function inventoryReport(req,res,next){
   try {
-    const branding = await getBrandingForPdf(prisma)
+    const branding = await getBrandingForPdf(prisma, req.companyId)
     const companyName = branding.company_name
     const logoBuffer = branding.logoBuffer
     const money = makeMoney(branding.currency_code)
     const { format='pdf' } = req.query
-    const products = await prisma.product.findMany({ where:{ deleted_at: null }, include:{ category:true } })
+    // Solo lo que se maneja en el alcance: el catálogo es de la empresa, pero el
+    // reporte de inventario es de sucursal(es) y no debe listar productos ajenos.
+    const products = await prisma.product.findMany({
+      where: {
+        deleted_at: null,
+        company_id: req.companyId,
+        branch_stocks: { some: { branch_id: { in: scopeBranchIds(req) } } },
+      },
+      include:{ category:true },
+    })
+    await overlayReportBranchStock(products, req)
+    const scope = await reportScope(req)
+    const byBranch = await stockByBranch(req, scope)
+    const byWarehouse = await stockByWarehouse(req)
     if (String(format).toLowerCase() === 'csv' || String(format).toLowerCase() === 'excel') {
       const totalValue = products.reduce((acc,p)=>acc+ number(p.stock)* number(p.cost),0)
       sendCsv(res, 'reporte-inventario', [
         'REPORTE DE INVENTARIO',
+        `Sucursal,${scope.label}`,
         `Generado,${DateTime.now().setZone('America/Guatemala').toFormat('yyyy-LL-dd HH:mm')}`,
         `Total Productos,${products.length}`,
         `Valor Total,${money(totalValue)}`
-      ], [{
-        title:'Detalle',
-        columns:['Producto','Categoría','Stock','Costo','Valor'],
-        rows: products.map(p=>[p.name, p.category?.name||'—', p.stock, money(number(p.cost)), money(number(p.stock)*number(p.cost))])
-      }])
+      ], [
+        ...(byBranch.length ? [{
+          title:'Inventario por Sucursal',
+          columns:['Sucursal','SKUs','Unidades','Valor'],
+          rows: byBranch.map(b=>[b.branch, b.skus, b.units, money(b.value)])
+        }] : []),
+        ...(byWarehouse.length ? [{
+          title:'Inventario por Almacén',
+          columns:['Almacén','SKUs','Unidades','Valor'],
+          rows: byWarehouse.map(w=>[w.warehouse, w.skus, w.units, money(w.value)])
+        }] : []),
+        {
+          title:'Detalle',
+          columns:['Producto','Categoría','Stock','Costo','Valor'],
+          rows: products.map(p=>[p.name, p.category?.name||'—', p.stock, money(number(p.cost)), money(number(p.stock)*number(p.cost))])
+        }
+      ])
       return
     }
     const doc = newDoc(res, 'Reporte de Inventario')
-    header(doc, 'Reporte de Inventario', 'Actual', companyName, logoBuffer)
+    header(doc, 'Reporte de Inventario', 'Actual', companyName, logoBuffer, scope.label)
     sectionTitle(doc, 'Resumen')
     const totalProducts = products.length
     const totalValue = products.reduce((acc,p)=>acc+ number(p.stock)* number(p.cost),0)
@@ -956,6 +1208,26 @@ async function inventoryReport(req,res,next){
       { label: 'Valor Inventario', value: money(totalValue) },
       { label: 'Stock Bajo', value: String(lowStock) },
     ])
+  if (byBranch.length) {
+    sectionTitle(doc, 'Inventario por sucursal')
+    drawTable(
+      doc,
+      ['Sucursal','SKUs','Unidades','Valor'],
+      byBranch.map(b=>[b.branch, b.skus, b.units, money(b.value)]),
+      [170,70,70,90],
+      { align: ['left','right','right','right'], headerAlign: ['left','right','right','right'] }
+    )
+  }
+  if (byWarehouse.length) {
+    sectionTitle(doc, 'Inventario por almacén')
+    drawTable(
+      doc,
+      ['Almacén','SKUs','Unidades','Valor'],
+      byWarehouse.map(w=>[w.warehouse, w.skus, w.units, money(w.value)]),
+      [170,70,70,90],
+      { align: ['left','right','right','right'], headerAlign: ['left','right','right','right'] }
+    )
+  }
   sectionTitle(doc,'Detalle de Inventario')
   drawTable(doc, ['Producto','Categoría','Stock','Costo','Valor'], products.slice(0,100).map(p=>[p.name, p.category?.name||'—', p.stock, money(number(p.cost)), money(number(p.stock)*number(p.cost))]), [170,110,50,70,80], { align: ['left','left','right','right','right'], headerAlign: ['left','left','right','right','right'] })
     footer(doc, companyName)
@@ -965,13 +1237,14 @@ async function inventoryReport(req,res,next){
 
 async function suppliersReport(req, res, next) {
   try {
-    const branding = await getBrandingForPdf(prisma)
+    const branding = await getBrandingForPdf(prisma, req.companyId)
     const companyName = branding.company_name
     const logoBuffer = branding.logoBuffer
     const money = makeMoney(branding.currency_code)
     const { format = 'pdf' } = req.query
-    const data = await getSuppliersReportData()
+    const data = await getSuppliersReportData(req)
     const { suppliers, summary } = data
+    const scope = await reportScope(req)
     const fmtLast = (d) =>
       d ? DateTime.fromJSDate(d).setZone('America/Guatemala').toFormat('yyyy-LL-dd') : '—'
 
@@ -1030,6 +1303,7 @@ async function suppliersReport(req, res, next) {
       }
       sendCsv(res, 'reporte-proveedores', [
         'REPORTE DE PROVEEDORES',
+        `Sucursal,${scope.label}`,
         `Generado,${DateTime.now().setZone('America/Guatemala').toFormat('yyyy-LL-dd HH:mm')}`,
         `Total proveedores,${summary.totalSuppliers}`,
         `Activos,${summary.activeSuppliers}`,
@@ -1043,7 +1317,7 @@ async function suppliersReport(req, res, next) {
     }
 
     const doc = newDoc(res, 'Reporte de Proveedores')
-    header(doc, 'Reporte de Proveedores', 'Actual', companyName, logoBuffer)
+    header(doc, 'Reporte de Proveedores', 'Actual', companyName, logoBuffer, scope.label)
     sectionTitle(doc, 'Resumen')
     drawSummaryCards(doc, [
       { label: 'Total proveedores', value: String(summary.totalSuppliers) },
@@ -1115,13 +1389,16 @@ async function suppliersReport(req, res, next) {
 
 async function financialReport(req, res, next) {
   try {
-    const branding = await getBrandingForPdf(prisma)
+    const branding = await getBrandingForPdf(prisma, req.companyId)
     const companyName = branding.company_name
     const logoBuffer = branding.logoBuffer
     const money = makeMoney(branding.currency_code)
     const { period = 'month', year, format = 'pdf', month, quarter, semester } = req.query
     const { startUtc, endUtc, label } = periodRange(period, year, { month, quarter, semester })
-    const data = await getFinancialData(startUtc, endUtc)
+    const data = await getFinancialData(startUtc, endUtc, req)
+    const scope = await reportScope(req)
+    const byBranch = await stockByBranch(req, scope)
+    const byWarehouse = await stockByWarehouse(req)
 
     const rotTxt = data.inventoryTurnover != null ? String(data.inventoryTurnover) : '—'
     const dInvTxt = data.daysOfInventoryApprox != null ? String(data.daysOfInventoryApprox) : '—'
@@ -1131,10 +1408,16 @@ async function financialReport(req, res, next) {
         'REPORTE FINANCIERO',
         'Alcance,Resultados del período seleccionado e inventario a la fecha de generación',
         `Periodo,${label}`,
+        `Sucursal,${scope.label}`,
         `Generado,${DateTime.now().setZone('America/Guatemala').toFormat('yyyy-LL-dd HH:mm')}`,
         `Valor inventario (fecha generación),${money(data.inventoryValue)}`,
         `Unidades en stock,${data.inventoryUnits}`,
         `SKUs activos,${data.inventorySkuCount}`,
+        ...(data.inTransitUnits > 0 ? [
+          `En tránsito (enviado sin recibir),${money(data.inTransitValue)}`,
+          `Unidades en tránsito,${data.inTransitUnits}`,
+          `Valor total propiedad de la empresa,${money(data.inventoryValueOwned)}`,
+        ] : []),
         `Compras registradas período,${money(data.purchasesPeriod)}`,
         `Líneas de compra (movimientos),${data.purchaseLogLines}`,
         `Ingresos brutos ventas,${money(data.totalRevenueGross)}`,
@@ -1146,6 +1429,21 @@ async function financialReport(req, res, next) {
         `Rotación inventario (CMV / valor inv.),${rotTxt}`,
         `Días aprox. de inventario,${dInvTxt}`
       ], [
+        ...(data.salesByBranch.length ? [{
+          title: 'Ventas por Sucursal (período)',
+          columns: ['Sucursal', 'Tickets', 'Unidades', 'Ingresos'],
+          rows: data.salesByBranch.map((b) => [b.branch, b.ventas, b.unidades, money(b.revenue)])
+        }] : []),
+        ...(byBranch.length ? [{
+          title: 'Inventario por Sucursal',
+          columns: ['Sucursal', 'SKUs', 'Unidades', 'Valor'],
+          rows: byBranch.map((b) => [b.branch, b.skus, b.units, money(b.value)])
+        }] : []),
+        ...(byWarehouse.length ? [{
+          title: 'Valor de Inventario por Almacén',
+          columns: ['Almacén', 'SKUs', 'Unidades', 'Valor'],
+          rows: byWarehouse.map((w) => [w.warehouse, w.skus, w.units, money(w.value)])
+        }] : []),
         {
           title: 'Estado de resultado (período)',
           columns: ['Concepto', 'Monto'],
@@ -1178,7 +1476,7 @@ async function financialReport(req, res, next) {
     }
 
     const doc = newDoc(res, 'Reporte Financiero')
-    header(doc, 'Reporte Financiero', label, companyName, logoBuffer)
+    header(doc, 'Reporte Financiero', label, companyName, logoBuffer, scope.label)
 
     sectionTitle(doc, 'Resumen - inventario, compras y margen')
     drawSummaryCards(doc, [
@@ -1196,6 +1494,10 @@ async function financialReport(req, res, next) {
       .fillColor(BRAND.muted)
       .text(
         `Stock: ${data.inventoryUnits} u. | SKUs: ${data.inventorySkuCount} | ` +
+          (data.inTransitUnits > 0
+            ? `En tránsito: ${data.inTransitUnits} u. (${money(data.inTransitValue)}) | ` +
+              `Total propiedad de la empresa: ${money(data.inventoryValueOwned)} | `
+            : '') +
           `Movimientos de compra: ${data.purchaseLogLines} | ` +
           `Rotación (CMV / valor inv.): ${rotTxt} | Días aprox. de inventario: ${dInvTxt}`,
         doc.page.margins.left,
@@ -1203,6 +1505,39 @@ async function financialReport(req, res, next) {
         { width: doc.page.width - doc.page.margins.left - doc.page.margins.right }
       )
     doc.moveDown(1.1)
+
+    if (data.salesByBranch.length || byBranch.length) {
+      sectionTitle(doc, 'Desglose por sucursal')
+      if (data.salesByBranch.length) {
+        drawTable(
+          doc,
+          ['Sucursal', 'Tickets', 'Unidades', 'Ingresos'],
+          data.salesByBranch.map((b) => [b.branch, b.ventas, b.unidades, money(b.revenue)]),
+          [170, 70, 70, 90],
+          { align: ['left', 'right', 'right', 'right'], headerAlign: ['left', 'right', 'right', 'right'] }
+        )
+      }
+      if (byBranch.length) {
+        drawTable(
+          doc,
+          ['Sucursal', 'SKUs', 'Unidades stock', 'Valor inventario'],
+          byBranch.map((b) => [b.branch, b.skus, b.units, money(b.value)]),
+          [170, 70, 90, 100],
+          { align: ['left', 'right', 'right', 'right'], headerAlign: ['left', 'right', 'right', 'right'] }
+        )
+      }
+    }
+
+    if (byWarehouse.length) {
+      sectionTitle(doc, 'Valor de inventario por almacén')
+      drawTable(
+        doc,
+        ['Almacén', 'SKUs', 'Unidades stock', 'Valor inventario'],
+        byWarehouse.map((w) => [w.warehouse, w.skus, w.units, money(w.value)]),
+        [170, 70, 90, 100],
+        { align: ['left', 'right', 'right', 'right'], headerAlign: ['left', 'right', 'right', 'right'] }
+      )
+    }
 
     sectionTitle(doc, 'Estado de resultado del período')
     drawTable(
@@ -1269,11 +1604,12 @@ async function financialReport(req, res, next) {
 }
 
 /** Stock, categoría, proveedor, brechas de reposición y alertas del sistema abiertas. */
-async function getAlertsReportData() {
+async function getAlertsReportData(req) {
   const products = await prisma.product.findMany({
-    where: { deleted: false, deleted_at: null },
+    where: { deleted: false, deleted_at: null, company_id: req.companyId },
     include: { category: true, supplier: true, status: true }
   })
+  await overlayReportBranchStock(products, req)
 
   const gapUnits = (p) => Math.max(0, number(p.min_stock) - number(p.stock))
 
@@ -1345,23 +1681,27 @@ async function getAlertsReportData() {
 
 async function alertsReport(req, res, next) {
   try {
-    const branding = await getBrandingForPdf(prisma)
+    const branding = await getBrandingForPdf(prisma, req.companyId)
     const companyName = branding.company_name
     const logoBuffer = branding.logoBuffer
     const money = makeMoney(branding.currency_code)
     const { format = 'pdf' } = req.query
     const zone = 'America/Guatemala'
-    const data = await getAlertsReportData()
+    const data = await getAlertsReportData(req)
     const { summary, categoryBreakdown, actionList, critical, systemAlerts } = data
+    const scope = await reportScope(req)
+    const byBranch = await stockByBranch(req, scope)
 
     const gapUnits = (p) => Math.max(0, number(p.min_stock) - number(p.stock))
     const fmtTs = (d) =>
       d ? DateTime.fromJSDate(d).setZone(zone).toFormat('yyyy-LL-dd HH:mm') : '—'
 
+    const whereIs = await topLocationByProduct(req, actionList.map((p) => p.id))
     const rowPrioridad = (p) => [
       p.name,
       p.category?.name || '—',
       number(p.stock),
+      whereIs.get(p.id) || '—',
       number(p.min_stock),
       gapUnits(p),
       money(gapUnits(p) * number(p.cost)),
@@ -1370,6 +1710,11 @@ async function alertsReport(req, res, next) {
 
     if (String(format).toLowerCase() === 'csv' || String(format).toLowerCase() === 'excel') {
       const sections = [
+        ...(byBranch.length ? [{
+          title: 'Riesgo por Sucursal',
+          columns: ['Sucursal', 'SKUs', 'Sin stock', 'Bajo mín. c/stock', 'Unidades', 'Valor'],
+          rows: byBranch.map((b) => [b.branch, b.skus, b.sinStock, b.bajoMin, b.units, money(b.value)])
+        }] : []),
         {
           title: 'Concentración por categoría (SKUs en riesgo)',
           columns: ['Categoría', 'En riesgo', 'Sin stock', 'Bajo mín. c/stock'],
@@ -1386,6 +1731,7 @@ async function alertsReport(req, res, next) {
             'Producto',
             'Categoría',
             'Stock',
+            'Dónde está',
             'Mín.',
             'Faltante',
             'Valor faltante',
@@ -1422,6 +1768,7 @@ async function alertsReport(req, res, next) {
       }
       const headerLines = [
         'REPORTE DE ALERTAS E INVENTARIO CRÍTICO',
+        `Sucursal,${scope.label}`,
         `Generado,${DateTime.now().setZone(zone).toFormat('yyyy-LL-dd HH:mm')}`,
         `SKUs activos totales,${summary.totalSkus}`,
         `Sin stock (crítico),${summary.criticalCount}`,
@@ -1441,7 +1788,7 @@ async function alertsReport(req, res, next) {
     }
 
     const doc = newDoc(res, 'Reporte de Alertas')
-    header(doc, 'Reporte de Alertas', 'Actual', companyName, logoBuffer)
+    header(doc, 'Reporte de Alertas', 'Actual', companyName, logoBuffer, scope.label)
 
     sectionTitle(doc, 'Resumen - riesgo de stock y seguimiento')
     drawSummaryCards(doc, [
@@ -1464,6 +1811,20 @@ async function alertsReport(req, res, next) {
       )
     doc.moveDown(1)
 
+    if (byBranch.length) {
+      sectionTitle(doc, 'Riesgo por sucursal')
+      drawTable(
+        doc,
+        ['Sucursal', 'SKUs', 'Sin stock', 'Bajo mín.', 'Unidades', 'Valor'],
+        byBranch.map((b) => [b.branch, b.skus, b.sinStock, b.bajoMin, b.units, money(b.value)]),
+        [140, 55, 65, 65, 65, 82],
+        {
+          align: ['left', 'right', 'right', 'right', 'right', 'right'],
+          headerAlign: ['left', 'right', 'right', 'right', 'right', 'right']
+        }
+      )
+    }
+
     if (categoryBreakdown.length) {
       sectionTitle(doc, 'Concentración por categoría')
       drawTable(
@@ -1482,12 +1843,12 @@ async function alertsReport(req, res, next) {
       sectionTitle(doc, 'Prioridad de reposición')
       drawTable(
         doc,
-        ['Producto', 'Categoría', 'Stock', 'Mín.', 'Faltante', 'Valor falt.', 'Proveedor'],
+        ['Producto', 'Categoría', 'Stock', 'Dónde está', 'Mín.', 'Faltante', 'Valor falt.', 'Proveedor'],
         actionList.slice(0, 120).map(rowPrioridad),
-        [118, 68, 34, 34, 46, 72, 102],
+        [104, 50, 32, 84, 32, 40, 62, 70],
         {
-          align: ['left', 'left', 'right', 'right', 'right', 'right', 'left'],
-          headerAlign: ['left', 'left', 'right', 'right', 'right', 'right', 'left']
+          align: ['left', 'left', 'right', 'left', 'right', 'right', 'right', 'left'],
+          headerAlign: ['left', 'left', 'right', 'left', 'right', 'right', 'right', 'left']
         }
       )
       if (actionList.length > 120) {
@@ -1574,11 +1935,12 @@ async function alertsReport(req, res, next) {
 }
 
 /** Catálogo: márgenes, valor a costo vs precio público, mix por categoría y proveedor. */
-async function getProductsAnalysisData() {
+async function getProductsAnalysisData(req) {
   const products = await prisma.product.findMany({
-    where: { deleted: false, deleted_at: null },
+    where: { deleted: false, deleted_at: null, company_id: req.companyId },
     include: { category: true, supplier: true, status: true }
   })
+  await overlayReportBranchStock(products, req)
 
   let inventoryValue = 0
   let retailInventoryValue = 0
@@ -1691,14 +2053,17 @@ async function getProductsAnalysisData() {
 
 async function productsReport(req, res, next) {
   try {
-    const branding = await getBrandingForPdf(prisma)
+    const branding = await getBrandingForPdf(prisma, req.companyId)
     const companyName = branding.company_name
     const logoBuffer = branding.logoBuffer
     const money = makeMoney(branding.currency_code)
     const zone = 'America/Guatemala'
     const { format = 'pdf' } = req.query
-    const data = await getProductsAnalysisData()
+    const data = await getProductsAnalysisData(req)
     const { products, summary, categoryRows, supplierRows, topByInv, topByRetail, tightMargins } = data
+    const scope = await reportScope(req)
+    const byBranch = await stockByBranch(req, scope)
+    const byWarehouse = await stockByWarehouse(req)
 
     const rowDetalle = (p) => [
       p.name,
@@ -1800,8 +2165,23 @@ async function productsReport(req, res, next) {
           ])
         }
       ]
+      if (byWarehouse.length) {
+        sections.unshift({
+          title: 'Existencias por Almacén',
+          columns: ['Almacén', 'SKUs', 'Unidades', 'Valor inv.'],
+          rows: byWarehouse.map((w) => [w.warehouse, w.skus, w.units, money(w.value)])
+        })
+      }
+      if (byBranch.length) {
+        sections.unshift({
+          title: 'Existencias por Sucursal',
+          columns: ['Sucursal', 'SKUs', 'Unidades', 'Valor inv.'],
+          rows: byBranch.map((b) => [b.branch, b.skus, b.units, money(b.value)])
+        })
+      }
       sendCsv(res, 'reporte-productos', [
         'ANÁLISIS DE PRODUCTOS Y CATÁLOGO',
+        `Sucursal,${scope.label}`,
         `Generado,${DateTime.now().setZone(zone).toFormat('yyyy-LL-dd HH:mm')}`,
         `SKUs activos,${summary.totalSkus}`,
         `Categorías,${summary.categoryCount}`,
@@ -1815,7 +2195,29 @@ async function productsReport(req, res, next) {
     }
 
     const doc = newDoc(res, 'Análisis de Productos')
-    header(doc, 'Análisis de Productos', 'Actual', companyName, logoBuffer)
+    header(doc, 'Análisis de Productos', 'Actual', companyName, logoBuffer, scope.label)
+
+    if (byBranch.length) {
+      sectionTitle(doc, 'Existencias por sucursal')
+      drawTable(
+        doc,
+        ['Sucursal', 'SKUs', 'Unidades', 'Valor inv.'],
+        byBranch.map((b) => [b.branch, b.skus, b.units, money(b.value)]),
+        [170, 70, 70, 90],
+        { align: ['left', 'right', 'right', 'right'], headerAlign: ['left', 'right', 'right', 'right'] }
+      )
+    }
+
+    if (byWarehouse.length) {
+      sectionTitle(doc, 'Existencias por almacén')
+      drawTable(
+        doc,
+        ['Almacén', 'SKUs', 'Unidades', 'Valor inv.'],
+        byWarehouse.map((w) => [w.warehouse, w.skus, w.units, money(w.value)]),
+        [170, 70, 70, 90],
+        { align: ['left', 'right', 'right', 'right'], headerAlign: ['left', 'right', 'right', 'right'] }
+      )
+    }
 
     sectionTitle(doc, 'Resumen - catálogo y rentabilidad de existencias')
     drawSummaryCards(doc, [
@@ -1974,8 +2376,8 @@ async function inventoryCountSessionReport(req, res, next) {
     const { id } = req.params
     const format = String(req.query.format || 'pdf').toLowerCase()
 
-    const session = await prisma.inventoryCountSession.findUnique({
-      where: { id },
+    const session = await prisma.inventoryCountSession.findFirst({
+      where: { id, branch: { company_id: req.companyId } },
       include: {
         createdBy: { select: { name: true, email: true } },
         approvedBy: { select: { name: true, email: true } },
@@ -1988,7 +2390,7 @@ async function inventoryCountSessionReport(req, res, next) {
 
     const lines = await prisma.inventoryCountLine.findMany({
       where: { session_id: id },
-      orderBy: { product: { name: 'asc' } },
+      orderBy: [{ location: { code: 'asc' } }, { product: { name: 'asc' } }],
       include: {
         product: {
           select: {
@@ -1998,10 +2400,11 @@ async function inventoryCountSessionReport(req, res, next) {
             category: { select: { name: true } },
           },
         },
+        location: { select: { code: true, warehouse: { select: { name: true } } } },
       },
     })
 
-    const branding = await getBrandingForPdf(prisma)
+    const branding = await getBrandingForPdf(prisma, req.companyId)
     const companyName = branding.company_name
     const logoBuffer = branding.logoBuffer
     const money = makeMoney(branding.currency_code)
@@ -2016,6 +2419,7 @@ async function inventoryCountSessionReport(req, res, next) {
         return [
           L.product.name,
           L.product.barcode || '—',
+          `${L.location.warehouse.name} · ${L.location.code}`,
           L.product.category?.name || '—',
           L.stock_snapshot,
           L.qty_counted ?? '—',
@@ -2048,7 +2452,7 @@ async function inventoryCountSessionReport(req, res, next) {
         [
           {
             title: 'Líneas',
-            columns: ['Producto', 'Código', 'Categoría', 'Teórico', 'Contado', '2.ª lectura', 'Diferencia', 'Valor diff.', 'Nota'],
+            columns: ['Producto', 'Código', 'Ubicación', 'Categoría', 'Teórico', 'Contado', '2.ª lectura', 'Diferencia', 'Valor diff.', 'Nota'],
             rows,
           },
         ]
@@ -2100,7 +2504,8 @@ async function inventoryCountSessionReport(req, res, next) {
       return [
         String(L.product.name).slice(0, 22),
         L.product.barcode || '—',
-        String(L.product.category?.name || '—').slice(0, 10),
+        // En un conteo físico importa más dónde está que de qué categoría es.
+        String(L.location.code).slice(0, 10),
         L.stock_snapshot,
         L.qty_counted ?? '—',
         L.qty_counted_secondary ?? '—',
@@ -2112,7 +2517,7 @@ async function inventoryCountSessionReport(req, res, next) {
     sectionTitle(doc, 'Detalle de líneas')
     drawTable(
       doc,
-      ['Producto', 'Cód.', 'Cat.', 'Teór.', 'C1', 'C2', 'Diff.', 'Valor'],
+      ['Producto', 'Cód.', 'Ubic.', 'Teór.', 'C1', 'C2', 'Diff.', 'Valor'],
       tableRows.slice(0, 100),
       [102, 54, 48, 30, 28, 28, 28, 48],
       {
@@ -2150,7 +2555,7 @@ function inventoryCountStatusLabel(status) {
  */
 async function inventoryCountsHistoryReport(req, res, next) {
   try {
-    const branding = await getBrandingForPdf(prisma)
+    const branding = await getBrandingForPdf(prisma, req.companyId)
     const companyName = branding.company_name
     const logoBuffer = branding.logoBuffer
     const money = makeMoney(branding.currency_code)
@@ -2322,16 +2727,20 @@ async function inventoryCountsHistoryReport(req, res, next) {
 
 async function merchandiseReport(req, res, next) {
   try {
-    const branding = await getBrandingForPdf(prisma)
+    const branding = await getBrandingForPdf(prisma, req.companyId)
     const companyName = branding.company_name
     const logoBuffer = branding.logoBuffer
     const money = makeMoney(branding.currency_code)
     const { period = 'month', year, format = 'pdf', month, quarter, semester } = req.query
     const { startUtc, endUtc, label } = periodRange(period, year, { month, quarter, semester })
 
+    const scope = await reportScope(req)
     const records = await prisma.incomingMerchandise.findMany({
-      where: { date: { gte: startUtc, lte: endUtc } },
+      // Sin este filtro el reporte mezclaba los ingresos de todas las sucursales
+      // (y de todas las empresas).
+      where: { ...branchWhere(req), date: { gte: startUtc, lte: endUtc } },
       include: {
+        branch: { select: { name: true } },
         supplier: { select: { name: true } },
         registeredBy: { select: { name: true } },
         items: { select: { quantity: true, unit_cost: true } },
@@ -2357,6 +2766,7 @@ async function merchandiseReport(req, res, next) {
       bySupplier.set(sName, agg)
       return {
         date: DateTime.fromJSDate(r.date).setZone('America/Guatemala').toFormat('yyyy-LL-dd'),
+        branch: r.branch?.name || '—',
         supplier: sName,
         registeredBy: r.registeredBy?.name || '—',
         status: statusLabel(r.payment_status),
@@ -2367,10 +2777,21 @@ async function merchandiseReport(req, res, next) {
       .sort((a, b) => b[1].amount - a[1].amount)
       .map(([name, v]) => [name, String(v.count), money(v.amount)])
 
+    // En consolidado cada ingreso lleva su sucursal; en una sola sobra la columna.
+    const detailColumns = scope.consolidated
+      ? ['Fecha', 'Sucursal', 'Proveedor', 'Registrado por', 'Estado', 'Total']
+      : ['Fecha', 'Proveedor', 'Registrado por', 'Estado', 'Total']
+    const detailRows = detail.map((d) =>
+      scope.consolidated
+        ? [d.date, d.branch, d.supplier, d.registeredBy, d.status, money(d.total)]
+        : [d.date, d.supplier, d.registeredBy, d.status, money(d.total)]
+    )
+
     if (String(format).toLowerCase() === 'csv' || String(format).toLowerCase() === 'excel') {
       sendCsv(res, 'reporte-mercancia', [
         'REPORTE DE INGRESOS DE MERCANCÍA',
         `Periodo,${label}`,
+        `Sucursal,${scope.label}`,
         `Generado,${DateTime.now().setZone('America/Guatemala').toFormat('yyyy-LL-dd HH:mm')}`,
         `Registros,${records.length}`,
         `Monto Total,${money(totalAmount)}`,
@@ -2378,14 +2799,14 @@ async function merchandiseReport(req, res, next) {
         `Pago parcial,${partialCount}`,
         `Pendientes,${pendingCount}`,
       ], [
-        { title: 'Detalle de Ingresos', columns: ['Fecha', 'Proveedor', 'Registrado por', 'Estado', 'Total'], rows: detail.map((d) => [d.date, d.supplier, d.registeredBy, d.status, money(d.total)]) },
+        { title: 'Detalle de Ingresos', columns: detailColumns, rows: detailRows },
         { title: 'Por Proveedor', columns: ['Proveedor', 'Registros', 'Monto'], rows: supplierRows },
       ])
       return
     }
 
     const doc = newDoc(res, 'Reporte de Mercancía')
-    header(doc, 'Reporte de Ingresos de Mercancía', label, companyName, logoBuffer)
+    header(doc, 'Reporte de Ingresos de Mercancía', label, companyName, logoBuffer, scope.label)
     sectionTitle(doc, 'Resumen')
     drawSummaryCards(doc, [
       { label: 'Registros', value: String(records.length) },
@@ -2397,10 +2818,12 @@ async function merchandiseReport(req, res, next) {
     sectionTitle(doc, 'Detalle de Ingresos')
     drawTable(
       doc,
-      ['Fecha', 'Proveedor', 'Registrado por', 'Estado', 'Total'],
-      detail.map((d) => [d.date, d.supplier, d.registeredBy, d.status, money(d.total)]),
-      [70, 150, 110, 80, 80],
-      { align: ['left', 'left', 'left', 'left', 'right'], headerAlign: ['left', 'left', 'left', 'left', 'right'] }
+      detailColumns,
+      detailRows,
+      scope.consolidated ? [65, 95, 120, 90, 70, 70] : [70, 150, 110, 80, 80],
+      scope.consolidated
+        ? { align: ['left', 'left', 'left', 'left', 'left', 'right'], headerAlign: ['left', 'left', 'left', 'left', 'left', 'right'] }
+        : { align: ['left', 'left', 'left', 'left', 'right'], headerAlign: ['left', 'left', 'left', 'left', 'right'] }
     )
     sectionTitle(doc, 'Por Proveedor')
     drawTable(
@@ -2416,7 +2839,23 @@ async function merchandiseReport(req, res, next) {
 }
 
 module.exports = {
+  // Ladrillos compartidos con stockReports.controller.js: los reportes nuevos
+  // usan el mismo papel y las mismas tablas, no una copia parecida.
+  reportScope,
+  scopeBranchIds,
+  periodRange,
+  number,
+  makeMoney,
+  newDoc,
+  header,
+  footer,
+  sectionTitle,
+  drawTable,
+  drawSummaryCards,
+  sendCsv,
   salesReport,
+  // Expuesto para probarlo sin armar un PDF.
+  getFinancialData,
   inventoryReport,
   suppliersReport,
   financialReport,

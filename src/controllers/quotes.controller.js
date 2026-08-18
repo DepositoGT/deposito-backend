@@ -15,6 +15,11 @@ const {
   VALID_CHANNELS,
 } = require('../services/priceResolution')
 const { nextDocumentReference } = require('../services/referenceGenerator')
+const { targetBranch, branchWhere } = require('../middlewares/tenant')
+
+async function loadBranch(tx, branchId) {
+  return tx.branch.findUnique({ where: { id: branchId }, select: { id: true, code: true, seq: true } })
+}
 const {
   appendCommercialDocSearchFilter,
 } = require('../services/commercialDocumentSearch')
@@ -28,13 +33,17 @@ const {
 const QUOTE_DOC_TYPE = 'QUOTE'
 const ORDER_DOC_TYPE = 'ORDER'
 
+const BRANCH_SELECT = { select: { id: true, name: true, code: true } }
+
 const QUOTE_LIST_INCLUDE = {
+  branch: BRANCH_SELECT,
   customerContact: { select: { id: true, name: true, tax_id: true } },
   createdBy: { select: { id: true, name: true } },
   _count: { select: { lines: true } },
 }
 
 const QUOTE_DETAIL_INCLUDE = {
+  branch: BRANCH_SELECT,
   customerContact: {
     select: { id: true, name: true, tax_id: true, email: true, phone: true },
   },
@@ -124,7 +133,8 @@ async function applyQuoteSoftHold(tx, quote, userId) {
 
   await assertLinesAvailable(
     tx,
-    lines.map((l) => ({ product_id: l.product_id, qty: l.qty }))
+    lines.map((l) => ({ product_id: l.product_id, qty: l.qty })),
+    { branchId: quote.branch_id }
   )
   await releaseByDocument(tx, quote.id, { status: 'RELEASED' })
   const expiresAt = await defaultQuoteSoftHoldExpiresAt(tx)
@@ -134,6 +144,7 @@ async function applyQuoteSoftHold(tx, quote, userId) {
     expiresAt,
     createdBy: userId,
     reservationKind: 'QUOTE_SOFT',
+    branchId: quote.branch_id,
   })
 }
 
@@ -189,7 +200,9 @@ exports.getPublicByToken = async (req, res, next) => {
 exports.getShareLink = async (req, res, next) => {
   try {
     const where = quoteWhereIdOrReference(req.params.id)
-    const quote = await prisma.commercialDocument.findFirst({ where })
+    const quote = await prisma.commercialDocument.findFirst({
+      where: { ...where, branch: { company_id: req.companyId } },
+    })
     if (!quote) return res.status(404).json({ message: 'Cotización no encontrada' })
 
     const token = await prisma.$transaction(async (tx) => ensurePublicToken(tx, quote.id))
@@ -317,7 +330,14 @@ exports.list = async (req, res, next) => {
     const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 25)))
     const searchTerm = String(search || '').trim()
 
-    const where = { doc_type: QUOTE_DOC_TYPE }
+    const where = { doc_type: QUOTE_DOC_TYPE, ...branchWhere(req) }
+    // Filtrar por una sucursal solo tiene sentido en la vista consolidada, y solo
+    // dentro de las que esa vista ya alcanza: un id suelto ensancharía el alcance
+    // a otra empresa.
+    const wantedBranch = req.query.branch_id ? String(req.query.branch_id) : null
+    if (!req.branchId && wantedBranch && (req.branchIds || []).includes(wantedBranch)) {
+      where.branch_id = wantedBranch
+    }
     let searchMeta = null
     if (status && String(status).toUpperCase() !== 'ALL' && !searchTerm) {
       where.status = String(status).toUpperCase()
@@ -368,7 +388,7 @@ exports.list = async (req, res, next) => {
 
 exports.getById = async (req, res, next) => {
   try {
-    const where = quoteWhereIdOrReference(req.params.id)
+    const where = { ...quoteWhereIdOrReference(req.params.id), branch: { company_id: req.companyId } }
     const doc = await prisma.commercialDocument.findFirst({
       where,
       include: QUOTE_DETAIL_INCLUDE,
@@ -404,6 +424,8 @@ exports.create = async (req, res, next) => {
       customerContactId = String(customerContactIdRaw).trim()
     }
 
+    const branchId = targetBranch(req, req.body?.branch_id)
+
     const created = await prismaTransaction.$transaction(async (tx) => {
       await validateCustomerContact(tx, customerContactId)
       const { lines, subtotal, total } = await resolveQuoteLines(tx, items, {
@@ -414,7 +436,8 @@ exports.create = async (req, res, next) => {
 
       await assertLinesAvailable(
         tx,
-        lines.map((l) => ({ product_id: l.product_id, qty: l.qty }))
+        lines.map((l) => ({ product_id: l.product_id, qty: l.qty })),
+        { branchId }
       )
 
       let validUntil = null
@@ -429,10 +452,12 @@ exports.create = async (req, res, next) => {
         validUntil = await defaultValidUntilFromSettings(tx)
       }
 
-      const reference = await nextDocumentReference(tx, 'Q')
+      const branch = await loadBranch(tx, branchId)
+      const reference = await nextDocumentReference(tx, 'Q', branch)
 
       const doc = await tx.commercialDocument.create({
         data: {
+          branch_id: branchId,
           reference,
           doc_type: QUOTE_DOC_TYPE,
           status: 'DRAFT',
@@ -465,7 +490,7 @@ exports.update = async (req, res, next) => {
     const user = req.user
     if (!user?.sub) return res.status(401).json({ message: 'Usuario no autenticado' })
 
-    const where = quoteWhereIdOrReference(req.params.id)
+    const where = { ...quoteWhereIdOrReference(req.params.id), branch: { company_id: req.companyId } }
     const existing = await prisma.commercialDocument.findFirst({ where })
     if (!existing) return res.status(404).json({ message: 'Cotización no encontrada' })
     if (existing.status !== 'DRAFT') {
@@ -504,7 +529,8 @@ exports.update = async (req, res, next) => {
 
       await assertLinesAvailable(
         tx,
-        lines.map((l) => ({ product_id: l.product_id, qty: l.qty }))
+        lines.map((l) => ({ product_id: l.product_id, qty: l.qty })),
+        { branchId: existing.branch_id }
       )
 
       let validUntil = existing.valid_until
@@ -558,7 +584,7 @@ exports.updateStatus = async (req, res, next) => {
     const newStatus = String(newStatusRaw || '').toUpperCase()
     if (!newStatus) return res.status(400).json({ message: 'status requerido' })
 
-    const where = quoteWhereIdOrReference(req.params.id)
+    const where = { ...quoteWhereIdOrReference(req.params.id), branch: { company_id: req.companyId } }
     const existing = await prisma.commercialDocument.findFirst({
       where,
       include: { _count: { select: { lines: true } } },
@@ -609,7 +635,7 @@ exports.convertToOrder = async (req, res, next) => {
     const user = req.user
     if (!user?.sub) return res.status(401).json({ message: 'Usuario no autenticado' })
 
-    const where = quoteWhereIdOrReference(req.params.id)
+    const where = { ...quoteWhereIdOrReference(req.params.id), branch: { company_id: req.companyId } }
     const quote = await prisma.commercialDocument.findFirst({
       where,
       include: { lines: { orderBy: { sort_order: 'asc' } } },
@@ -635,7 +661,9 @@ exports.convertToOrder = async (req, res, next) => {
 
     const order = await prismaTransaction.$transaction(async (tx) => {
       await releaseByDocument(tx, quote.id, { status: 'RELEASED' })
-      const reference = await nextDocumentReference(tx, 'P')
+      // El pedido hereda la sucursal de la cotización
+      const branch = await loadBranch(tx, quote.branch_id)
+      const reference = await nextDocumentReference(tx, 'P', branch)
       const lines = quote.lines.map((l, idx) => ({
         product_id: l.product_id,
         qty: l.qty,
@@ -646,6 +674,7 @@ exports.convertToOrder = async (req, res, next) => {
 
       return tx.commercialDocument.create({
         data: {
+          branch_id: quote.branch_id,
           reference,
           doc_type: ORDER_DOC_TYPE,
           status: 'DRAFT',

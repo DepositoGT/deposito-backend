@@ -21,6 +21,13 @@ const {
   inventoryCountSessionReport,
   inventoryCountsHistoryReport,
 } = require('../controllers/reports.controller')
+const {
+  stockByLocationReport,
+  kardexReport,
+  internalMovesReport,
+  replenishmentReport,
+  occupancyReport,
+} = require('../controllers/stockReports.controller')
 
 const router = Router()
 
@@ -32,6 +39,14 @@ router.get('/suppliers', Auth, canViewReports, suppliersReport)
 router.get('/financial', Auth, canViewReports, financialReport)
 router.get('/alerts', Auth, canViewReports, alertsReport)
 router.get('/products', Auth, canViewReports, productsReport)
+// Almacenes y ubicaciones: se ven con permiso de reportes o de movimientos.
+const canViewStock = hasPermission('reports.view', 'stock_moves.view')
+router.get('/stock-by-location', Auth, canViewStock, stockByLocationReport)
+router.get('/kardex', Auth, canViewStock, kardexReport)
+router.get('/internal-moves', Auth, canViewStock, internalMovesReport)
+router.get('/replenishment', Auth, canViewStock, replenishmentReport)
+router.get('/occupancy', Auth, canViewStock, occupancyReport)
+
 router.get(
   '/merchandise',
   Auth,

@@ -20,12 +20,24 @@ const {
   refreshCookieOptions,
 } = require('../config/security')
 const { generateUserTemplate } = require('../services/userTemplate')
+const { IMPLIES, expandPermissions } = require('../config/permissionDeps')
 const { bulkValidateUsers, bulkCreateUsers } = require('../services/userBulkImport')
+const { requireCompany } = require('../middlewares/tenant')
 
 // Consulta reutilizable de usuario con rol + permisos para el login/refresh/me.
 const userWithPerms = {
   role: { include: { permissions: { include: { permission: true } } } },
   cashRegister: { select: { id: true, name: true, code: true, active: true } },
+  user_companies: {
+    select: {
+      company: { select: { id: true, name: true, code: true, logo_url: true, active: true } },
+    },
+  },
+  user_branches: {
+    select: {
+      branch: { select: { id: true, company_id: true, name: true, code: true, active: true, is_default: true } },
+    },
+  },
 }
 
 function serializeUser(user) {
@@ -42,9 +54,18 @@ function serializeUser(user) {
     hire_date: user.hire_date,
     cash_register_id: user.cash_register_id,
     cash_register: user.cashRegister || null,
-    permissions: Array.isArray(user.role?.permissions)
-      ? user.role.permissions.map((rp) => rp.permission?.code).filter(Boolean)
+    companies: Array.isArray(user.user_companies)
+      ? user.user_companies.map((uc) => uc.company).filter((c) => c && c.active)
       : [],
+    branches: Array.isArray(user.user_branches)
+      ? user.user_branches.map((ub) => ub.branch).filter((b) => b && b.active)
+      : [],
+    default_branch_id: user.default_branch_id || null,
+    permissions: expandPermissions(
+      Array.isArray(user.role?.permissions)
+        ? user.role.permissions.map((rp) => rp.permission?.code).filter(Boolean)
+        : []
+    ),
   }
 }
 
@@ -74,18 +95,36 @@ exports.list = async (req, res, next) => {
     const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 20)))
     
     // Filtros opcionales
-    const { role_id, search } = req.query || {}
-    const where = {}
-    
-    if (role_id) {
-      where.role_id = Number(role_id)
+    const { role_id, search, branch_id } = req.query || {}
+    // Usuarios de la empresa activa, MÁS los que quedaron sin ninguna empresa:
+    // esos no son de nadie y, si no salen aquí, no hay forma de recuperarlos
+    // desde la aplicación aunque sigan existiendo en la base.
+    const companyId = requireCompany(req)
+    const where = {
+      AND: [
+        {
+          OR: [
+            { user_companies: { some: { company_id: companyId } } },
+            { user_companies: { none: {} } },
+          ],
+        },
+      ],
     }
-    
+    if (branch_id) {
+      where.AND.push({ user_branches: { some: { branch_id: String(branch_id) } } })
+    }
+
+    if (role_id) {
+      where.AND.push({ role_id: Number(role_id) })
+    }
+
     if (search) {
-      where.OR = [
-        { name: { contains: String(search), mode: 'insensitive' } },
-        { email: { contains: String(search), mode: 'insensitive' } }
-      ]
+      where.AND.push({
+        OR: [
+          { name: { contains: String(search), mode: 'insensitive' } },
+          { email: { contains: String(search), mode: 'insensitive' } }
+        ],
+      })
     }
     
     const totalItems = await prisma.user.count({ where })
@@ -94,7 +133,15 @@ exports.list = async (req, res, next) => {
     
     const users = await prisma.user.findMany({
       where,
-      include: { role: true, cashRegister: { select: { id: true, name: true, code: true, active: true } } },
+      include: {
+        role: true,
+        cashRegister: { select: { id: true, name: true, code: true, active: true } },
+        user_branches: {
+          where: { branch: { company_id: req.companyId } },
+          select: { branch: { select: { id: true, name: true, code: true, active: true } } },
+        },
+        user_companies: { select: { company_id: true } },
+      },
       orderBy: { name: 'asc' },
       skip: (safePage - 1) * pageSize,
       take: pageSize
@@ -117,6 +164,11 @@ exports.list = async (req, res, next) => {
         hire_date: u.hire_date,
         cash_register_id: u.cash_register_id,
         cash_register: u.cashRegister,
+        default_branch_id: u.default_branch_id,
+        branches: u.user_branches.map((ub) => ub.branch),
+        // Sin empresa no puede entrar a ninguna; sin sucursal entra pero no
+        // puede operar. La pantalla lo marca para que se pueda arreglar.
+        in_company: u.user_companies.some((uc) => uc.company_id === companyId),
         created_at: u.created_at,
         updated_at: u.updated_at
       })),
@@ -165,6 +217,14 @@ exports.register = async (req, res, next) => {
         }
       }
     })
+    // El usuario nuevo nace en la empresa/sucursal del request (si hay contexto)
+    if (req.companyId) {
+      await prisma.userCompany.create({ data: { user_id: user.id, company_id: req.companyId } }).catch(() => {})
+      if (req.branchId) {
+        await prisma.userBranch.create({ data: { user_id: user.id, branch_id: req.branchId } }).catch(() => {})
+        await prisma.user.update({ where: { id: user.id }, data: { default_branch_id: req.branchId } }).catch(() => {})
+      }
+    }
     const token = crearToken(user)
     res.status(201).json({
       user: {
@@ -178,9 +238,11 @@ exports.register = async (req, res, next) => {
         phone: user.phone,
         address: user.address,
         hire_date: user.hire_date,
-        permissions: Array.isArray(user.role?.permissions)
-          ? user.role.permissions.map((rp) => rp.permission?.code).filter(Boolean)
-          : [],
+        permissions: expandPermissions(
+          Array.isArray(user.role?.permissions)
+            ? user.role.permissions.map((rp) => rp.permission?.code).filter(Boolean)
+            : []
+        ),
       },
       token,
     })
@@ -247,9 +309,27 @@ exports.logout = async (req, res, next) => {
 exports.getById = async (req, res, next) => {
   try {
     const { id } = req.params
-    const user = await prisma.user.findUnique({
-      where: { id },
-      include: { role: true, cashRegister: { select: { id: true, name: true, code: true, active: true } } }
+    const companyId = requireCompany(req)
+    const user = await prisma.user.findFirst({
+      where: {
+        id,
+        OR: [
+          { user_companies: { some: { company_id: companyId } } },
+          // Huérfano: hay que poder abrir su ficha para devolverle el acceso.
+          { user_companies: { none: {} } },
+        ],
+      },
+      include: {
+        role: true,
+        cashRegister: { select: { id: true, name: true, code: true, active: true } },
+        user_branches: {
+          where: { branch: { company_id: req.companyId } },
+          select: { branch: { select: { id: true, name: true, code: true, active: true } } },
+        },
+        user_companies: {
+          select: { company: { select: { id: true, name: true, code: true } } },
+        },
+      }
     })
 
     if (!user) {
@@ -269,6 +349,9 @@ exports.getById = async (req, res, next) => {
       hire_date: user.hire_date,
       cash_register_id: user.cash_register_id,
       cash_register: user.cashRegister,
+      default_branch_id: user.default_branch_id,
+      branches: user.user_branches.map((ub) => ub.branch),
+      companies: user.user_companies.map((uc) => uc.company),
       created_at: user.created_at,
       updated_at: user.updated_at
     })
@@ -281,8 +364,10 @@ exports.update = async (req, res, next) => {
     const { id } = req.params
     const { name, email, role_id, password, is_employee, photo_url, phone, address, hire_date, cash_register_id } = req.body || {}
 
-    // Validar que el usuario existe
-    const existingUser = await prisma.user.findUnique({ where: { id } })
+    // Validar que el usuario existe y pertenece a la empresa activa
+    const existingUser = await prisma.user.findFirst({
+      where: { id, user_companies: { some: { company_id: requireCompany(req) } } }
+    })
     if (!existingUser) {
       return res.status(404).json({ message: 'Usuario no encontrado' })
     }
@@ -308,7 +393,7 @@ exports.update = async (req, res, next) => {
     if (cash_register_id !== undefined) {
       if (cash_register_id) {
         const register = await prisma.cashRegister.findFirst({
-          where: { id: String(cash_register_id), active: true }
+          where: { id: String(cash_register_id), active: true, branch: { company_id: req.companyId } }
         })
         if (!register) {
           return res.status(400).json({ message: 'La caja indicada no existe o está inactiva' })
@@ -355,8 +440,10 @@ exports.delete = async (req, res, next) => {
   try {
     const { id } = req.params
 
-    // Validar que el usuario existe
-    const user = await prisma.user.findUnique({ where: { id } })
+    // Validar que el usuario existe y pertenece a la empresa activa
+    const user = await prisma.user.findFirst({
+      where: { id, user_companies: { some: { company_id: requireCompany(req) } } }
+    })
     if (!user) {
       return res.status(404).json({ message: 'Usuario no encontrado' })
     }
@@ -387,7 +474,9 @@ exports.getPermissions = async (req, res, next) => {
     const permissions = await prisma.permission.findMany({
       orderBy: { code: 'asc' }
     })
-    res.json(permissions)
+    // `implies` viaja con el catálogo: la pantalla de roles no tiene que
+    // mantener su propia copia de las dependencias.
+    res.json(permissions.map((p) => ({ ...p, implies: IMPLIES[p.code] || [] })))
   } catch (e) { next(e) }
 }
 
@@ -500,8 +589,9 @@ exports.createRole = async (req, res, next) => {
     const role = await prisma.role.create({ data: { name } })
 
     if (Array.isArray(permissions) && permissions.length > 0) {
+      // Se guarda lo marcado MÁS lo que arrastra: "editar" sin "ver" no sirve.
       const perms = await prisma.permission.findMany({
-        where: { code: { in: permissions.map(String) } }
+        where: { code: { in: expandPermissions(permissions) } }
       })
       if (perms.length) {
         await prisma.rolePermission.createMany({
@@ -563,7 +653,7 @@ exports.updateRole = async (req, res, next) => {
 
         if (permissions.length > 0) {
           const perms = await prisma.permission.findMany({
-            where: { code: { in: permissions.map(String) } }
+            where: { code: { in: expandPermissions(permissions) } }
           })
           if (perms.length) {
             await prisma.rolePermission.createMany({

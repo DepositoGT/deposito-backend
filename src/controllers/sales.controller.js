@@ -14,6 +14,7 @@ const { DateTime } = require('luxon')
 const { getTimezone } = require('../utils/getTimezone')
 const { ensureStockAlertsBatch } = require('../services/stockAlerts')
 const { consumeLotsFEFO, restoreLotsFEFO } = require('../services/lots')
+const { dispatchedByRef } = require('../services/stockLocations')
 const { salesOperationLimiter } = require('../utils/concurrencyLimiter')
 const {
   assertPartyAction,
@@ -27,20 +28,25 @@ const {
 } = require('../services/saleSearch')
 const { expandLinesToStockMap, deductStockMap, restoreStockMap, getAvailabilityBatchWithKits } = require('../services/bomStock')
 const { nextDocumentReference } = require('../services/referenceGenerator')
+const { requireBranch, branchWhere } = require('../middlewares/tenant')
 
 /** Caja de la venta: la explícita (POS) > la asignada al usuario > la predeterminada. */
-async function resolveSaleRegister (client, explicitId, userId) {
+async function resolveSaleRegister (client, explicitId, userId, branchId) {
   if (explicitId) {
-    return client.cashRegister.findFirst({ where: { id: String(explicitId), active: true } })
+    return client.cashRegister.findFirst({
+      where: { id: String(explicitId), active: true, branch_id: branchId },
+    })
   }
   if (userId) {
     const u = await client.user.findUnique({
       where: { id: String(userId) },
-      select: { cashRegister: { select: { id: true, active: true } } }
+      select: { cashRegister: { select: { id: true, active: true, branch_id: true } } }
     })
-    if (u?.cashRegister?.active) return u.cashRegister
+    if (u?.cashRegister?.active && u.cashRegister.branch_id === branchId) return u.cashRegister
   }
-  return client.cashRegister.findFirst({ where: { is_default: true, active: true } })
+  return client.cashRegister.findFirst({
+    where: { is_default: true, active: true, branch_id: branchId },
+  })
 }
 
 /** Include ligero para listados (tabla / búsqueda). Detalle completo en GET /sales/:id */
@@ -104,7 +110,7 @@ exports.list = async (req, res, next) => {
     let startDate
     let endDate
     if (period && !searchTerm) {
-      const tz = await getTimezone(prisma)
+      const tz = await getTimezone(prisma, req.companyId)
       const nowGt = DateTime.now().setZone(tz)
       let startGt
       let endGt
@@ -152,7 +158,7 @@ exports.list = async (req, res, next) => {
       }
     }
 
-    const where = {}
+    const where = { ...branchWhere(req) }
     if (startDate && endDate) {
       where.date = { gte: startDate, lte: endDate }
     }
@@ -311,7 +317,12 @@ const saleWhereIdOrReference = (idOrRef) => {
 exports.getById = async (req, res, next) => {
   try {
     const { id: idOrRef } = req.params
-    const where = saleWhereIdOrReference(idOrRef)
+    // Lectura a nivel empresa: una venta de otra sucursal de la misma empresa
+    // se puede consultar (p. ej. escanear un recibo), de otra empresa no.
+    const where = {
+      ...saleWhereIdOrReference(idOrRef),
+      branch: { company_id: req.companyId },
+    }
 
     const sale = await prisma.sale.findFirst({
       where,
@@ -340,11 +351,17 @@ exports.create = async (req, res, next) => {
       promotion_codes = [],
       customer_contact_id: customerContactIdRaw,
       sales_channel: salesChannelRaw,
+      idempotency_key: idempotencyKeyRaw,
       ...saleData
     } = req.body
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ message: 'items es requerido' })
     }
+
+    // Clave del intento de cobro: la manda el POS (cabecera o cuerpo) y se
+    // repite tal cual al reintentar. Sin ella todo funciona como antes.
+    const idempotencyKey = String(req.get?.('Idempotency-Key') || idempotencyKeyRaw || '')
+      .trim().slice(0, 64) || null
 
     const totalItems = items.reduce((acc, it) => acc + Number(it.qty || 0), 0)
 
@@ -358,12 +375,29 @@ exports.create = async (req, res, next) => {
     // Convertir admin_authorized_products a Set para búsqueda rápida
     const adminAuthorizedSet = new Set(admin_authorized_products || [])
 
+    const branchId = requireBranch(req)
+
+    // El reintento evidente: la venta anterior ya entró y el navegador volvió a
+    // mandar. La carrera (dos envíos a la vez) la corta el índice único, más
+    // abajo.
+    if (idempotencyKey) {
+      const yaExiste = await prisma.sale.findFirst({
+        where: { branch_id: branchId, idempotency_key: idempotencyKey },
+        include: SALE_DETAIL_INCLUDE,
+      })
+      if (yaExiste) return res.status(200).json(yaExiste)
+    }
+
     const created = await prismaTransaction.$transaction(async (tx) => {
       let cashSessionIdForSale = null
       const isAdmin = String(user.role?.name || user.role_name || '').toLowerCase() === 'admin'
+      const branch = await tx.branch.findUnique({
+        where: { id: branchId },
+        select: { id: true, code: true, seq: true },
+      })
       // Resolver la caja: la seleccionada en el POS > la asignada al usuario > la predeterminada.
       // Antes se usaba siempre la predeterminada, así que abrir turno en otra caja no contaba.
-      const register = await resolveSaleRegister(tx, saleData.cash_register_id, user.sub)
+      const register = await resolveSaleRegister(tx, saleData.cash_register_id, user.sub, branchId)
       if (!register) {
         const err = new Error('NO_CASH_REGISTER')
         err.status = 503
@@ -406,10 +440,12 @@ exports.create = async (req, res, next) => {
           price_promotion: true,
           promotion_valid_until: true,
           available_for_sale: true,
+          // Para congelar el costo en la línea de venta.
+          cost: true,
         },
       })
       const prodMap = new Map(products.map(p => [String(p.id), p]))
-      const availabilityMap = await getAvailabilityBatchWithKits(productIds, tx)
+      const availabilityMap = await getAvailabilityBatchWithKits(productIds, tx, branchId)
       // Verifica existencia y stock suficiente por producto (considera cantidades sumadas si hay repetidos)
       for (const pid of productIds) {
         const p = prodMap.get(pid)
@@ -433,11 +469,12 @@ exports.create = async (req, res, next) => {
 
         const requested = Number(qtyByProduct.get(pid) || 0)
         const availability = availabilityMap[pid]
-        const available = Number(availability?.available ?? p.stock ?? 0)
+        const available = Number(availability?.available ?? 0)
         if (requested > available) {
           const reserved = Number(availability?.reserved ?? 0)
+          const physical = Number(availability?.stock ?? 0)
           const err = new Error(
-            `Stock insuficiente para ${p.name}. Disponible: ${available}${reserved > 0 ? ` (${Number(p.stock || 0)} físico − ${reserved} reservado)` : ''}, solicitado: ${requested}`
+            `Stock insuficiente para ${p.name}. Disponible: ${available}${reserved > 0 ? ` (${physical} físico − ${reserved} reservado)` : ''}, solicitado: ${requested}`
           )
           err.status = 400
           throw err
@@ -512,10 +549,16 @@ exports.create = async (req, res, next) => {
         const promotionCodeRows = await tx.promotionCode.findMany({
           where: {
             code: { in: requestedCodes },
+            company_id: req.companyId,
             active: true,
             promotion: {
               active: true,
               deleted: false,
+              // Un código de otra sucursal no se puede cobrar aquí
+              OR: [
+                { applies_to_all_branches: true },
+                { branches: { some: { branch_id: branchId } } },
+              ],
             },
           },
           include: {
@@ -609,7 +652,7 @@ exports.create = async (req, res, next) => {
       const completadaStatus = await tx.saleStatus.findFirst({ where: { name: 'Completada' } })
       if (!completadaStatus) throw new Error("No existe el estado 'Completada'")
 
-      const tz = await getTimezone(prisma)
+      const tz = await getTimezone(prisma, req.companyId)
       const nowGt = DateTime.now().setZone(tz);
 
       // Create UTC Date with Guatemala's time values
@@ -627,10 +670,11 @@ exports.create = async (req, res, next) => {
       console.log('[SALE DATE] Guatemala local time:', nowGt.toFormat('yyyy-MM-dd HH:mm:ss'));
       console.log('[SALE DATE] Will be stored in DB as:', DateTime.fromJSDate(saleDate).toUTC().toFormat('yyyy-MM-dd HH:mm:ss'));
 
-      const nextRef = await nextDocumentReference(tx, 'V')
+      const nextRef = await nextDocumentReference(tx, 'V', branch)
 
       const sale = await tx.sale.create({
         data: {
+          branch_id: branchId,
           customer: saleData.customer,
           customer_nit: saleData.customer_nit,
           is_final_consumer: saleData.is_final_consumer,
@@ -651,14 +695,18 @@ exports.create = async (req, res, next) => {
           status_id: completadaStatus.id,
           created_by: user.sub,
           cash_register_session_id: cashSessionIdForSale || undefined,
+          idempotency_key: idempotencyKey,
         },
       })
 
       await tx.saleItem.createMany({
+        // El costo se congela acá: es el de hoy, no el que tenga el producto
+        // cuando alguien contabilice o mire el reporte dentro de seis meses.
         data: resolvedItems.map(it => ({
           sale_id: sale.id,
           product_id: it.product_id,
           price: it.price,
+          unit_cost: prodMap.get(String(it.product_id))?.cost ?? null,
           qty: it.qty,
         })),
       })
@@ -668,9 +716,17 @@ exports.create = async (req, res, next) => {
         tx,
         resolvedItems.map((it) => ({ product_id: it.product_id, qty: it.qty }))
       )
-      const updatedProducts = await deductStockMap(tx, stockMap)
-      await consumeLotsFEFO(tx, stockMap) // advisory: descuenta lotes por caducidad
-      await ensureStockAlertsBatch(tx, updatedProducts)
+      // groupId propio: una venta puede descontar stock más de una vez a lo largo
+      // de su vida (completar → cancelar → completar), y los lotes solo deben
+      // seguir a la salida de ahora.
+      const saleStockCtx = {
+        reason: 'SALE', refType: 'sale', refId: String(sale.id), userId: user.sub,
+        groupId: require('crypto').randomUUID(),
+      }
+      const updatedProducts = await deductStockMap(tx, stockMap, branchId, saleStockCtx)
+      // Advisory: descuenta lotes por caducidad, dentro de la ubicación que despachó.
+      await consumeLotsFEFO(tx, stockMap, branchId, await dispatchedByRef(tx, { groupId: saleStockCtx.groupId }))
+      await ensureStockAlertsBatch(tx, updatedProducts, branchId)
 
       // 3) Guardar promociones con descuento efectivo e incrementar solo esos códigos
       if (promotionRowsToRecord.length > 0) {
@@ -685,10 +741,23 @@ exports.create = async (req, res, next) => {
           })
 
           if (row.usedCodeId) {
-            await tx.promotionCode.update({
-              where: { id: row.usedCodeId },
-              data: { current_uses: { increment: 1 } },
-            })
+            // Incremento condicional en una sola consulta. Leer, comparar y
+            // sumar (que es lo que valida arriba) deja pasar dos ventas
+            // simultáneas con el último uso disponible: ambas leen el mismo
+            // valor y ambas incrementan. Cero filas = el límite ya se alcanzó.
+            const aplicados = await tx.$executeRaw`
+              UPDATE promotion_codes pc
+              SET current_uses = pc.current_uses + 1
+              FROM promotions p
+              WHERE pc.id = ${row.usedCodeId}
+                AND p.id = pc.promotion_id
+                AND (p.max_uses IS NULL OR pc.current_uses < p.max_uses)
+            `
+            if (aplicados === 0) {
+              const err = new Error(`El código ${row.usedCode || ''} alcanzó su límite de usos`.trim())
+              err.status = 400
+              throw err
+            }
           }
         }
       }
@@ -706,6 +775,19 @@ exports.create = async (req, res, next) => {
 
     res.status(201).json(fullSale || created)
   } catch (e) {
+    // Dos envíos a la vez con la misma clave: uno gana el índice único y el
+    // otro devuelve la venta que quedó, no un error al cajero.
+    if (e && e.code === 'P2002' && String(e.meta?.target || '').includes('idempotency')) {
+      const branchId = req.branchId
+      const key = String(req.get?.('Idempotency-Key') || req.body?.idempotency_key || '').trim().slice(0, 64)
+      const yaExiste = key && branchId
+        ? await prisma.sale.findFirst({
+            where: { branch_id: branchId, idempotency_key: key },
+            include: SALE_DETAIL_INCLUDE,
+          })
+        : null
+      if (yaExiste) return res.status(200).json(yaExiste)
+    }
     if (e && e.message === 'CASH_SESSION_REQUIRED') {
       return res.status(403).json({
         code: 'CASH_SESSION_REQUIRED',
@@ -750,10 +832,32 @@ exports.updateStatus = async (req, res, next) => {
       return await prismaTransaction.$transaction(async (tx) => {
         // Cargar venta actual con su status e items (por id o por reference)
         const current = await tx.sale.findFirst({
-          where,
-          include: { status: true, sale_items: true }
+          where: { ...where, branch: { company_id: req.companyId } },
+          // Las devoluciones ya devolvieron su parte del stock: sin ellas a la
+          // vista, cancelar devolvía la venta completa y duplicaba lo devuelto.
+          include: {
+            status: true,
+            sale_items: { include: { return_items: { select: { qty_returned: true } } } },
+            cashRegisterSession: { select: { status: true } },
+          },
         })
         if (!current) throw new Error('Venta no encontrada')
+
+        // El cierre guardó el teórico recorriendo las ventas del turno. Cambiar
+        // una de ellas después deja la diferencia contra el conteo físico sin
+        // explicación posible. La devolución sí se permite: es un movimiento
+        // nuevo, con su fecha, que no reescribe el arqueo de ayer.
+        if (current.cashRegisterSession?.status === 'CLOSED') {
+          const err = new Error(
+            `La venta ${current.reference || ''} pertenece a un turno de caja ya cerrado y no se puede cambiar de estado. `.trim() +
+            'Registre una devolución en el turno actual.'
+          )
+          err.status = 409
+          err.code = 'CASH_SESSION_CLOSED'
+          throw err
+        }
+        // El stock se ajusta en la sucursal DONDE SE VENDIÓ, no en la del request
+        const saleBranchId = current.branch_id
 
         const prevStatusName = current.status?.name || ''
         // Obtener nombre del nuevo status para comparar lógicamente
@@ -773,15 +877,20 @@ exports.updateStatus = async (req, res, next) => {
             tx,
             current.sale_items.map((si) => ({ product_id: si.product_id, qty: si.qty }))
           )
-          const updatedProducts = await deductStockMap(tx, stockMap)
-          await consumeLotsFEFO(tx, stockMap) // advisory: descuenta lotes por caducidad
+          const stockCtx = {
+            reason: 'SALE', refType: 'sale', refId: String(id), userId: req.user?.sub || null,
+            groupId: require('crypto').randomUUID(),
+          }
+          const updatedProducts = await deductStockMap(tx, stockMap, saleBranchId, stockCtx)
+          // Advisory: descuenta lotes por caducidad, dentro de la ubicación que despachó.
+          await consumeLotsFEFO(tx, stockMap, saleBranchId, await dispatchedByRef(tx, { groupId: stockCtx.groupId }))
 
           updatedProducts.forEach(p => {
             console.log(`[STOCK ADJUSTMENT] ${p.name}: nuevo stock = ${p.stock}`)
           })
 
           // Procesar alertas en lote (mucho más eficiente)
-          await ensureStockAlertsBatch(tx, updatedProducts)
+          await ensureStockAlertsBatch(tx, updatedProducts, saleBranchId)
           console.log(`[STOCK ADJUSTMENT] Alertas de stock actualizadas`)
         }
 
@@ -789,19 +898,26 @@ exports.updateStatus = async (req, res, next) => {
         if (wasCompleted && willBeCancelled) {
           console.log(`[STOCK REVERT] Venta ${id}: Completada -> Cancelada. Revirtiendo ajustes de stock...`)
 
-          const stockMap = await expandLinesToStockMap(
-            tx,
-            current.sale_items.map((si) => ({ product_id: si.product_id, qty: si.qty }))
-          )
-          const updatedProducts = await restoreStockMap(tx, stockMap)
-          await restoreLotsFEFO(tx, stockMap) // advisory: devuelve cantidad a los lotes
+          // Solo se devuelve lo que el cliente todavía tiene: lo ya devuelto
+          // volvió al inventario cuando se aprobó la devolución.
+          const porDevolver = current.sale_items
+            .map((si) => {
+              const devuelto = (si.return_items || []).reduce((n, r) => n + Number(r.qty_returned || 0), 0)
+              return { product_id: si.product_id, qty: Math.max(0, Number(si.qty) - devuelto) }
+            })
+            .filter((l) => l.qty > 0)
+          const stockMap = await expandLinesToStockMap(tx, porDevolver)
+          const updatedProducts = await restoreStockMap(tx, stockMap, saleBranchId, {
+            reason: 'SALE_RETURN', refType: 'sale', refId: String(id), userId: req.user?.sub || null,
+          })
+          await restoreLotsFEFO(tx, stockMap, saleBranchId) // advisory: devuelve cantidad a los lotes
 
           updatedProducts.forEach(p => {
             console.log(`[STOCK REVERT] ${p.name}: stock restaurado = ${p.stock}`)
           })
 
           // Actualizar alertas de stock (puede resolver alertas si el stock volvió a niveles normales)
-          await ensureStockAlertsBatch(tx, updatedProducts)
+          await ensureStockAlertsBatch(tx, updatedProducts, saleBranchId)
           console.log(`[STOCK REVERT] Alertas de stock actualizadas después de reversión`)
         }
 

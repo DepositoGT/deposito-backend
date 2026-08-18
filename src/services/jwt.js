@@ -11,6 +11,7 @@
 const jwt_simple = require('jwt-simple')
 const moment = require('moment')
 const { secret, ACCESS_TOKEN_MINUTES } = require('../config/security')
+const { expandPermissions } = require('../config/permissionDeps')
 
 exports.crearToken = function (usuario) {
   // prefer a full role object when available, otherwise fallback to role_id/role_name
@@ -29,6 +30,10 @@ exports.crearToken = function (usuario) {
   } else if (Array.isArray(usuario.permissions)) {
     permissions = usuario.permissions
   }
+
+  // El token lleva los permisos ya expandidos: quien puede editar puede ver,
+  // sin que cada middleware tenga que acordarse de la dependencia.
+  permissions = expandPermissions(permissions)
 
   const payload = {
     sub: usuario.id,

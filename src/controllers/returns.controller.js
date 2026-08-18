@@ -17,25 +17,28 @@ const {
   deductStockMap,
   getAvailabilityBatchWithKits,
 } = require('../services/bomStock')
+const { branchWhere } = require('../middlewares/tenant')
 
-async function restoreReturnItemsStock(tx, returnItems) {
+// El stock de una devolución/cambio se mueve en la sucursal DONDE SE VENDIÓ
+// (sale.branch_id), no en la del request.
+async function restoreReturnItemsStock(tx, returnItems, branchId, ctx) {
   const stockMap = await expandLinesToStockMap(
     tx,
     returnItems.map((item) => ({ product_id: item.product_id, qty: item.qty_returned }))
   )
-  const updatedProducts = await restoreStockMap(tx, stockMap)
-  await ensureStockAlertsBatch(tx, updatedProducts)
+  const updatedProducts = await restoreStockMap(tx, stockMap, branchId, { reason: 'SALE_RETURN', ...ctx })
+  await ensureStockAlertsBatch(tx, updatedProducts, branchId)
   return updatedProducts
 }
 
 /** Descuenta stock de los productos que el cliente se lleva en un cambio (EXCHANGE). */
-async function deductReplacementStock(tx, replacementItems) {
+async function deductReplacementStock(tx, replacementItems, branchId, ctx) {
   const stockMap = await expandLinesToStockMap(
     tx,
     replacementItems.map((item) => ({ product_id: item.product_id, qty: item.qty }))
   )
-  const updatedProducts = await deductStockMap(tx, stockMap)
-  await ensureStockAlertsBatch(tx, updatedProducts)
+  const updatedProducts = await deductStockMap(tx, stockMap, branchId, { reason: 'SALE_RETURN', ...ctx })
+  await ensureStockAlertsBatch(tx, updatedProducts, branchId)
   return updatedProducts
 }
 
@@ -66,15 +69,14 @@ async function applyRefundToSale(tx, currentReturn) {
 }
 
 /** Resuelve sale_id (UUID o referencia ej. V-000001) al id interno de la venta */
-async function resolveSaleId(saleIdOrRef) {
+async function resolveSaleId(saleIdOrRef, scope) {
   if (!saleIdOrRef) return null
   const s = String(saleIdOrRef).trim()
   const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s)
-  if (isUuid) {
-    const sale = await prisma.sale.findUnique({ where: { id: s }, select: { id: true } })
-    return sale?.id ?? null
-  }
-  const sale = await prisma.sale.findFirst({ where: { reference: s }, select: { id: true } })
+  const sale = await prisma.sale.findFirst({
+    where: isUuid ? { id: s, ...scope } : { reference: s, ...scope },
+    select: { id: true },
+  })
   return sale?.id ?? null
 }
 
@@ -89,14 +91,15 @@ exports.list = async (req, res, next) => {
     const page = Math.max(1, Number(req.query.page ?? 1))
     const pageSize = Math.min(1000, Math.max(1, Number(req.query.pageSize ?? 50)))
 
-    const where = {}
+    // Una devolución "vive" en la sucursal de su venta.
+    const where = { sale: { ...branchWhere(req) } }
 
     if (status) {
       where.status = { name: String(status) }
     }
 
     if (sale_id) {
-      const resolvedId = await resolveSaleId(sale_id)
+      const resolvedId = await resolveSaleId(sale_id, branchWhere(req))
       if (resolvedId) where.sale_id = resolvedId
     }
 
@@ -110,7 +113,8 @@ exports.list = async (req, res, next) => {
         sale: {
           include: {
             status: true,
-            payment_method: true
+            payment_method: true,
+            branch: { select: { id: true, name: true, code: true } }
           }
         },
         status: true,
@@ -168,13 +172,14 @@ exports.getById = async (req, res, next) => {
   try {
     const { id } = req.params
 
-    const returnRecord = await prisma.return.findUnique({
-      where: { id },
+    const returnRecord = await prisma.return.findFirst({
+      where: { id, sale: { ...branchWhere(req) } },
       include: {
         sale: {
           include: {
             status: true,
             payment_method: true,
+            branch: { select: { id: true, name: true, code: true } },
             sale_items: {
               include: {
                 product: true
@@ -229,15 +234,15 @@ exports.create = async (req, res, next) => {
       })
     }
 
-    const sale_id = await resolveSaleId(saleIdOrRef)
+    const sale_id = await resolveSaleId(saleIdOrRef, branchWhere(req))
     if (!sale_id) {
       return res.status(404).json({ message: 'Venta no encontrada' })
     }
 
     const created = await prismaTransaction.$transaction(async (tx) => {
       // 1. Validar que la venta existe y está completada
-      const sale = await tx.sale.findUnique({
-        where: { id: sale_id },
+      const sale = await tx.sale.findFirst({
+        where: { id: sale_id, ...branchWhere(req) },
         include: {
           status: true,
           sale_items: {
@@ -334,7 +339,7 @@ exports.create = async (req, res, next) => {
           select: { id: true, name: true }
         })
         const productById = new Map(products.map((p) => [p.id, p]))
-        const availability = await getAvailabilityBatchWithKits(ids, tx)
+        const availability = await getAvailabilityBatchWithKits(ids, tx, sale.branch_id)
 
         for (const rep of replacements) {
           const product_id = String(rep.product_id || '')
@@ -449,7 +454,8 @@ exports.create = async (req, res, next) => {
         sale: {
           include: {
             status: true,
-            payment_method: true
+            payment_method: true,
+            branch: { select: { id: true, name: true, code: true } }
           }
         },
         status: true,
@@ -495,9 +501,10 @@ exports.updateStatus = async (req, res, next) => {
 
     const result = await prismaTransaction.$transaction(async (tx) => {
       // 1. Cargar devolución actual
-      const currentReturn = await tx.return.findUnique({
-        where: { id },
+      const currentReturn = await tx.return.findFirst({
+        where: { id, sale: { ...branchWhere(req) } },
         include: {
+          sale: { select: { branch_id: true } },
           status: true,
           return_items: {
             include: {
@@ -531,6 +538,8 @@ exports.updateStatus = async (req, res, next) => {
 
       const prevStatusName = currentReturn.status.name
       const newStatusName = newStatus.name
+      const saleBranchId = currentReturn.sale?.branch_id
+      const ledgerCtx = { refType: 'return', refId: String(id), userId: req.user?.sub || null }
 
       // 3. Validar transición de estados
       if (prevStatusName === 'Completada' || prevStatusName === 'Rechazada') {
@@ -568,20 +577,20 @@ exports.updateStatus = async (req, res, next) => {
         }
 
         console.log(`[RETURN STOCK RESTORE] Return ${id}: restaurando stock de devueltos al completar...`)
-        const restored = await restoreReturnItemsStock(tx, currentReturn.return_items)
+        const restored = await restoreReturnItemsStock(tx, currentReturn.return_items, saleBranchId, ledgerCtx)
         restored.forEach((p) => console.log(`[RETURN STOCK RESTORE] ${p.name}: stock = ${p.stock}`))
       }
 
       // Cambios: al completar, descontar el stock de los productos de reemplazo.
       if (isExchange && (isCompletingFromApproved || isCompletingFromPending)) {
-        const deducted = await deductReplacementStock(tx, currentReturn.replacement_items)
+        const deducted = await deductReplacementStock(tx, currentReturn.replacement_items, saleBranchId, ledgerCtx)
         deducted.forEach((p) => console.log(`[EXCHANGE STOCK] ${p.name}: stock = ${p.stock}`))
       }
 
       // CASO 3: Si se aprueba desde "Pendiente", restaurar stock solo si restore_stock es true
       if (isApproving && shouldRestoreStock) {
         console.log(`[RETURN STOCK RESTORE] Return ${id}: ${prevStatusName} -> ${newStatusName}. Restaurando stock solamente...`)
-        const updatedProducts = await restoreReturnItemsStock(tx, currentReturn.return_items)
+        const updatedProducts = await restoreReturnItemsStock(tx, currentReturn.return_items, saleBranchId, ledgerCtx)
         updatedProducts.forEach((p) => {
           console.log(`[RETURN STOCK RESTORE] ${p.name}: stock restaurado = ${p.stock}`)
         })

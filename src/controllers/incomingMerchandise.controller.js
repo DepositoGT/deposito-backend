@@ -304,7 +304,8 @@ exports.list = async (req, res, next) => {
     const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 20)))
     const { supplier_id, start_date, end_date, search, payment_status } = req.query || {}
 
-    const where = {}
+    const { branchWhere } = require('../middlewares/tenant')
+    const where = { ...branchWhere(req) }
 
     // Filter by supplier
     if (supplier_id) {
@@ -451,8 +452,8 @@ exports.getById = async (req, res, next) => {
   try {
     const { id } = req.params
 
-    const record = await prisma.incomingMerchandise.findUnique({
-      where: { id },
+    const record = await prisma.incomingMerchandise.findFirst({
+      where: { id, branch: { company_id: req.companyId } },
       include: incomingDetailInclude
     })
 
@@ -475,8 +476,8 @@ exports.updatePayment = async (req, res, next) => {
     const { id } = req.params
     const body = req.body || {}
 
-    const existing = await prisma.incomingMerchandise.findUnique({
-      where: { id },
+    const existing = await prisma.incomingMerchandise.findFirst({
+      where: { id, branch: { company_id: req.companyId } },
       include: {
         supplier: {
           include: {
@@ -685,7 +686,7 @@ exports.generateReport = async (req, res, next) => {
     res.setHeader('Content-Disposition', 'attachment; filename="reporte-mercancia.pdf"')
     doc.pipe(res)
 
-    const branding = await getBrandingForPdf(prisma)
+    const branding = await getBrandingForPdf(prisma, req.companyId)
     const companyName = branding.company_name
     if (branding.logoBuffer) {
       try {

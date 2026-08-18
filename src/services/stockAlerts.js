@@ -38,9 +38,14 @@ async function getCatalogs(tx) {
   return catalogCache
 }
 
-// Procesamiento en lote para múltiples productos
-async function ensureStockAlertsBatch(tx, products) {
+// Procesamiento en lote para múltiples productos. Las alertas de stock son
+// POR SUCURSAL: stock/min_stock vienen de product_stocks de esa sucursal.
+async function ensureStockAlertsBatch(tx, products, branchId) {
   if (!products || products.length === 0) return
+  if (!branchId) {
+    console.error('[ensureStockAlertsBatch] branchId faltante; alertas omitidas')
+    return
+  }
 
   try {
     // Obtener catálogos una sola vez para todo el lote
@@ -65,10 +70,11 @@ async function ensureStockAlertsBatch(tx, products) {
     // Operación 1: Resolver alertas de productos saludables en una sola query
     if (healthyProductIds.length > 0) {
       await tx.alert.updateMany({
-        where: { 
-          product_id: { in: healthyProductIds }, 
-          status_id: statusActive.id, 
-          resolved: 0 
+        where: {
+          product_id: { in: healthyProductIds },
+          branch_id: branchId,
+          status_id: statusActive.id,
+          resolved: 0
         },
         data: { status_id: statusResolved.id, resolved: 1 }
       })
@@ -81,6 +87,7 @@ async function ensureStockAlertsBatch(tx, products) {
     const existingAlerts = await tx.alert.findMany({
       where: {
         product_id: { in: unhealthyProducts.map(p => p.id) },
+        branch_id: branchId,
         status_id: statusActive.id,
         resolved: 0
       },
@@ -138,6 +145,7 @@ async function ensureStockAlertsBatch(tx, products) {
         // Preparar para crear nueva alerta
         createData.push({
           product_id: productId,
+          branch_id: branchId,
           ...alertData,
           status_id: statusActive.id,
           assigned_to: null,
@@ -161,8 +169,8 @@ async function ensureStockAlertsBatch(tx, products) {
 }
 
 // Versión individual (mantener por compatibilidad)
-async function ensureStockAlert(tx, productId, newStock, minStock) {
-  return ensureStockAlertsBatch(tx, [{ id: productId, stock: newStock, min_stock: minStock }])
+async function ensureStockAlert(tx, productId, newStock, minStock, branchId) {
+  return ensureStockAlertsBatch(tx, [{ id: productId, stock: newStock, min_stock: minStock }], branchId)
 }
 
 module.exports = { ensureStockAlert, ensureStockAlertsBatch }

@@ -14,6 +14,7 @@
  */
 const XLSX = require('xlsx')
 const { prisma } = require('../models/prisma')
+const { applyBranchDelta } = require('./stockLocations')
 
 function normalizeImportOptions(raw) {
     const o = raw && typeof raw === 'object' ? raw : {}
@@ -249,9 +250,15 @@ function validateRow(row, i, categoriesMap, suppliersMap, existingBarcodes, batc
 
     // Optional: barcode (must be unique if provided)
     const barcode = String(normalizedRow.barcode || '').trim()
+    let existingProductId = null
     if (barcode) {
         if (existingBarcodes.has(barcode)) {
-            errors.push(`El código de barras "${barcode}" ya existe en el sistema`)
+            // El catálogo es de la empresa: que el producto ya exista no es un
+            // error, es que esta sucursal todavía no lo maneja (o ya lo maneja y
+            // se está recargando su existencia). Ver `bulkCreateProducts`.
+            existingProductId = existingBarcodes.get(barcode)
+            data.barcode = barcode
+            batchBarcodes.add(barcode)
         } else if (batchBarcodes.has(barcode)) {
             errors.push(`El código de barras "${barcode}" está duplicado en el archivo`)
         } else {
@@ -281,6 +288,8 @@ function validateRow(row, i, categoriesMap, suppliersMap, existingBarcodes, batc
         data,
         rowIndex: i + 2,
         hints,
+        // Con id, la fila no crea producto: le carga existencia en la sucursal.
+        existingProductId,
     }
 }
 
@@ -288,24 +297,30 @@ function validateRow(row, i, categoriesMap, suppliersMap, existingBarcodes, batc
  * @param {Object[]} rows
  * @param {object} [importOptionsRaw]
  */
-async function validateBulkData(rows, importOptionsRaw) {
+async function validateBulkData(rows, importOptionsRaw, ctx = {}) {
     const importOptions = normalizeImportOptions(importOptionsRaw)
+    const { companyId } = ctx
 
     const [categories, suppliers, products] = await Promise.all([
         prisma.productCategory.findMany({
-            where: { deleted: false },
+            where: { deleted: false, company_id: companyId },
             select: { id: true, name: true },
         }),
         prisma.supplier.findMany({
-            where: { deleted: false, party_type: 'SUPPLIER' },
+            where: { deleted: false, party_type: 'SUPPLIER', company_id: companyId },
             select: { id: true, name: true },
         }),
-        prisma.product.findMany({ select: { barcode: true } }),
+        prisma.product.findMany({
+            where: { company_id: companyId, deleted: false },
+            select: { id: true, barcode: true },
+        }),
     ])
 
     const categoriesMap = new Map(categories.map(c => [c.name.toLowerCase(), c.id]))
     const suppliersMap = new Map(suppliers.map(s => [s.name.toLowerCase(), s.id]))
-    const existingBarcodes = new Set(products.filter(p => p.barcode).map(p => p.barcode))
+    const existingBarcodes = new Map(
+        products.filter((p) => p.barcode).map((p) => [p.barcode, p.id])
+    )
     const batchBarcodes = new Set()
 
     const validRows = []
@@ -354,32 +369,32 @@ async function validateBulkData(rows, importOptionsRaw) {
     }
 }
 
-async function getIdForSupplierPlaceholderCategory() {
+async function getIdForSupplierPlaceholderCategory(companyId) {
     const found = await prisma.productCategory.findFirst({
-        where: { deleted: false },
+        where: { deleted: false, company_id: companyId },
         orderBy: { id: 'asc' },
     })
     if (found) return found.id
-    const created = await prisma.productCategory.create({ data: { name: 'General' } })
+    const created = await prisma.productCategory.create({ data: { name: 'General', company_id: companyId } })
     return created.id
 }
 
-async function ensureProductCategoryIdImport(name, cache) {
+async function ensureProductCategoryIdImport(name, cache, companyId) {
     const trimmed = String(name || '').trim()
     if (!trimmed) throw new Error('Categoría vacía')
     const key = trimmed.toLowerCase()
     if (cache.has(key)) return cache.get(key)
     let cat = await prisma.productCategory.findFirst({
-        where: { deleted: false, name: { equals: trimmed, mode: 'insensitive' } },
+        where: { deleted: false, company_id: companyId, name: { equals: trimmed, mode: 'insensitive' } },
     })
     if (!cat) {
-        cat = await prisma.productCategory.create({ data: { name: trimmed.slice(0, 100) } })
+        cat = await prisma.productCategory.create({ data: { name: trimmed.slice(0, 100), company_id: companyId } })
     }
     cache.set(key, cat.id)
     return cat.id
 }
 
-async function ensureSupplierIdForProductImport(name, cache) {
+async function ensureSupplierIdForProductImport(name, cache, companyId) {
     const trimmed = String(name || '').trim()
     if (!trimmed) throw new Error('Proveedor vacío')
     const key = trimmed.toLowerCase()
@@ -388,6 +403,7 @@ async function ensureSupplierIdForProductImport(name, cache) {
         where: {
             deleted: false,
             party_type: 'SUPPLIER',
+            company_id: companyId,
             name: { equals: trimmed, mode: 'insensitive' },
         },
     })
@@ -396,14 +412,15 @@ async function ensureSupplierIdForProductImport(name, cache) {
         return sup.id
     }
     const defaultPt = await prisma.paymentTerm.findFirst({
-        where: { deleted: false },
+        where: { deleted: false, company_id: companyId },
         orderBy: { id: 'asc' },
     })
     if (!defaultPt) throw new Error('No hay términos de pago en el sistema')
-    const catIdForSupplier = await getIdForSupplierPlaceholderCategory()
+    const catIdForSupplier = await getIdForSupplierPlaceholderCategory(companyId)
     const safeName = trimmed.slice(0, 150)
     sup = await prisma.supplier.create({
         data: {
+            company_id: companyId,
             party_type: 'SUPPLIER',
             entity_kind: 'ORGANIZATION',
             name: safeName,
@@ -425,25 +442,59 @@ async function ensureSupplierIdForProductImport(name, cache) {
 /**
  * @param {Object[]} validRows
  */
-async function bulkCreateProducts(validRows) {
+async function bulkCreateProducts(validRows, ctx = {}) {
+    const { companyId, branchId, locationId } = ctx
     const errors = []
     let created = 0
+    let adopted = 0
     let skipped = 0
     const categoryCache = new Map()
     const supplierCache = new Map()
 
     for (const row of validRows) {
         try {
-            const d = { ...row.data }
+            const d = { ...row.data, company_id: companyId }
+            // Ya está en el catálogo de la empresa: no se duplica el producto, se
+            // le fija la existencia en ESTA sucursal (lo que trae el archivo).
+            if (row.existingProductId) {
+                const initialStock = Number(d.stock || 0)
+                const initialMin = Number(d.min_stock || 0)
+                await adoptIntoBranch(row.existingProductId, branchId, initialStock, initialMin, locationId)
+                adopted++
+                continue
+            }
             if (d.category_create_name) {
-                d.category_id = await ensureProductCategoryIdImport(d.category_create_name, categoryCache)
+                d.category_id = await ensureProductCategoryIdImport(d.category_create_name, categoryCache, companyId)
                 delete d.category_create_name
             }
             if (d.supplier_create_name) {
-                d.supplier_id = await ensureSupplierIdForProductImport(d.supplier_create_name, supplierCache)
+                d.supplier_id = await ensureSupplierIdForProductImport(d.supplier_create_name, supplierCache, companyId)
                 delete d.supplier_create_name
             }
-            await prisma.product.create({ data: d })
+            // El stock del archivo entra a la sucursal activa; products.stock es espejo
+            const initialStock = Number(d.stock || 0)
+            const initialMin = Number(d.min_stock || 0)
+            d.stock = 0
+            const prod = await prisma.product.create({ data: d })
+            await prisma.productStock.create({
+                data: {
+                    product_id: prod.id,
+                    branch_id: branchId,
+                    stock: initialStock,
+                    min_stock: initialMin,
+                },
+            })
+            if (initialStock !== 0) {
+                await prisma.product.update({
+                    where: { id: prod.id },
+                    data: { stock: { increment: initialStock } },
+                })
+                // El stock inicial también aterriza en una ubicación real.
+                await applyBranchDelta(prisma, [[prod.id, initialStock]], branchId, 1, {
+                    reason: 'INITIAL', refType: 'product', refId: prod.id,
+                    ...(locationId ? { locationId } : {}),
+                })
+            }
             created++
         } catch (err) {
             skipped++
@@ -454,7 +505,34 @@ async function bulkCreateProducts(validRows) {
         }
     }
 
-    return { created, skipped, errors }
+    return { created, adopted, skipped, errors }
+}
+
+/**
+ * Deja el producto (que ya existe en la empresa) con la existencia que trae el
+ * archivo EN ESTA SUCURSAL. Fija, no suma: un archivo de existencias describe
+ * cómo está la bodega, así que volver a importarlo no debe duplicar nada.
+ */
+async function adoptIntoBranch(productId, branchId, stock, minStock, locationId) {
+    const key = { product_id_branch_id: { product_id: productId, branch_id: branchId } }
+    const actual = await prisma.productStock.findUnique({ where: key })
+    const previo = Number(actual?.stock || 0)
+    if (!actual) {
+        await prisma.productStock.create({
+            data: { product_id: productId, branch_id: branchId, stock: 0, min_stock: minStock },
+        })
+    } else if (minStock) {
+        await prisma.productStock.update({ where: key, data: { min_stock: minStock } })
+    }
+
+    const delta = stock - previo
+    if (delta === 0) return
+    await prisma.productStock.update({ where: key, data: { stock } })
+    await prisma.product.update({ where: { id: productId }, data: { stock: { increment: delta } } })
+    await applyBranchDelta(prisma, [[productId, Math.abs(delta)]], branchId, Math.sign(delta), {
+        reason: 'INITIAL', refType: 'product', refId: productId, adjust: true,
+        ...(locationId ? { locationId } : {}),
+    })
 }
 
 /**
@@ -510,15 +588,15 @@ function generateTemplate() {
  * Generate Excel template with catalogs sheet
  * @returns {Promise<Buffer>} Excel file buffer
  */
-async function generateTemplateWithCatalogs() {
+async function generateTemplateWithCatalogs(companyId) {
     const [categories, suppliers] = await Promise.all([
         prisma.productCategory.findMany({
-            where: { deleted: false },
+            where: { deleted: false, company_id: companyId },
             select: { name: true },
             orderBy: { name: 'asc' },
         }),
         prisma.supplier.findMany({
-            where: { deleted: false, party_type: 'SUPPLIER' },
+            where: { deleted: false, party_type: 'SUPPLIER', company_id: companyId },
             select: { name: true },
             orderBy: { name: 'asc' },
         }),

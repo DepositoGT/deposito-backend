@@ -1,5 +1,8 @@
 /**
- * Disponibilidad de stock: físico − reservas ACTIVE.
+ * Disponibilidad de stock POR SUCURSAL: físico (product_stocks) − reservas ACTIVE.
+ *
+ * Todas las funciones exigen `branchId`; si falta se lanza error en lugar de
+ * operar sobre un stock global que ya no existe.
  */
 
 const { prisma } = require('../models/prisma')
@@ -7,31 +10,66 @@ const { Prisma } = require('@prisma/client')
 
 const ACTIVE = 'ACTIVE'
 
-async function sumActiveReservedQty(tx, productId) {
+function requireBranchId(branchId) {
+  if (!branchId) {
+    const err = new Error('branchId es obligatorio para operaciones de stock')
+    err.status = 500
+    throw err
+  }
+  return String(branchId)
+}
+
+/**
+ * Upsert perezoso: garantiza que exista la fila product_stocks de cada
+ * producto en la sucursal (stock 0 si nunca la tocó).
+ */
+async function ensureBranchStockRows(tx, productIds, branchId) {
   const client = tx || prisma
+  const b = requireBranchId(branchId)
+  const ids = [...new Set(productIds.filter(Boolean).map(String))]
+  if (ids.length === 0) return
+  await client.$executeRaw`
+    INSERT INTO product_stocks (id, product_id, branch_id, stock, min_stock)
+    SELECT gen_random_uuid(), p.id, ${b}::uuid, 0, 0
+    FROM products p
+    WHERE p.id IN (${Prisma.join(ids.map((id) => Prisma.sql`${id}::uuid`))})
+    ON CONFLICT (product_id, branch_id) DO NOTHING
+  `
+}
+
+async function sumActiveReservedQty(tx, productId, branchId) {
+  const client = tx || prisma
+  const b = requireBranchId(branchId)
   const agg = await client.stockReservation.aggregate({
-    where: { product_id: productId, status: ACTIVE },
+    where: { product_id: productId, branch_id: b, status: ACTIVE },
     _sum: { qty: true },
   })
   return Number(agg._sum.qty || 0)
 }
 
-async function getProductStockForUpdate(tx, productId) {
-  const rows = await lockProductsForUpdate(tx, [productId])
+async function getProductStockForUpdate(tx, productId, branchId) {
+  const rows = await lockProductsForUpdate(tx, [productId], branchId)
   return rows.get(String(productId)) || null
 }
 
-/** Bloquea filas de productos en una sola consulta (evita N round-trips en transacciones). */
-async function lockProductsForUpdate(tx, productIds) {
+/**
+ * Bloquea las filas product_stocks de la sucursal en una sola consulta.
+ * Solo bloquea la fila de ESTA sucursal: dos sucursales vendiendo el mismo
+ * producto no se estorban.
+ */
+async function lockProductsForUpdate(tx, productIds, branchId) {
+  const b = requireBranchId(branchId)
   const ids = [...new Set(productIds.filter(Boolean).map(String))]
   const out = new Map()
   if (ids.length === 0) return out
 
+  await ensureBranchStockRows(tx, ids, b)
   const rows = await tx.$queryRaw`
-    SELECT id, stock, min_stock, name, available_for_sale, deleted
-    FROM products
-    WHERE id IN (${Prisma.join(ids.map((id) => Prisma.sql`${id}::uuid`))})
-    FOR UPDATE
+    SELECT p.id, ps.stock, ps.min_stock, p.name, p.available_for_sale, p.deleted
+    FROM products p
+    JOIN product_stocks ps ON ps.product_id = p.id AND ps.branch_id = ${b}::uuid
+    WHERE p.id IN (${Prisma.join(ids.map((id) => Prisma.sql`${id}::uuid`))})
+    FOR UPDATE OF ps
   `
   for (const row of rows) {
     out.set(String(row.id), row)
@@ -42,34 +80,43 @@ async function lockProductsForUpdate(tx, productIds) {
 /**
  * @returns {{ stock: number, reserved: number, available: number }}
  */
-async function getAvailability(productId, tx) {
+async function getAvailability(productId, tx, branchId) {
   const client = tx || prisma
+  const b = requireBranchId(branchId)
   const product = await client.product.findUnique({
     where: { id: productId },
-    select: { stock: true },
+    select: {
+      id: true,
+      branch_stocks: { where: { branch_id: b }, select: { stock: true } },
+    },
   })
   if (!product) {
     const err = new Error('Producto no encontrado')
     err.status = 404
     throw err
   }
-  const stock = Number(product.stock || 0)
-  const reserved = await sumActiveReservedQty(client, productId)
+  const stock = Number(product.branch_stocks[0]?.stock || 0)
+  const reserved = await sumActiveReservedQty(client, productId, b)
   return { stock, reserved, available: Math.max(0, stock - reserved) }
 }
 
-async function getAvailabilityBatch(productIds, tx, { excludeDocumentId } = {}) {
+async function getAvailabilityBatch(productIds, tx, { excludeDocumentId, branchId } = {}) {
   const client = tx || prisma
+  const b = requireBranchId(branchId)
   const ids = [...new Set(productIds.filter(Boolean))]
   if (ids.length === 0) return {}
 
   const products = await client.product.findMany({
     where: { id: { in: ids } },
-    select: { id: true, stock: true },
+    select: {
+      id: true,
+      branch_stocks: { where: { branch_id: b }, select: { stock: true } },
+    },
   })
 
   const reservationWhere = {
     product_id: { in: ids },
+    branch_id: b,
     status: ACTIVE,
   }
   if (excludeDocumentId) {
@@ -87,7 +134,7 @@ async function getAvailabilityBatch(productIds, tx, { excludeDocumentId } = {}) 
 
   const out = {}
   for (const p of products) {
-    const stock = Number(p.stock || 0)
+    const stock = Number(p.branch_stocks[0]?.stock || 0)
     const reserved = reservedMap.get(p.id) || 0
     out[p.id] = { stock, reserved, available: Math.max(0, stock - reserved) }
   }
@@ -98,7 +145,8 @@ async function getAvailabilityBatch(productIds, tx, { excludeDocumentId } = {}) 
  * Valida disponibilidad agregada por producto (líneas duplicadas).
  * @param {Array<{ product_id: string, qty: number }>} lines
  */
-async function assertLinesAvailable(tx, lines, { skipProductIds = [], excludeDocumentId } = {}) {
+async function assertLinesAvailable(tx, lines, { skipProductIds = [], excludeDocumentId, branchId } = {}) {
+  const b = requireBranchId(branchId)
   const { expandLinesToStockMap, stockMapToLines } = require('./bomStock')
   const skip = new Set(skipProductIds.map(String))
   const stockMap = await expandLinesToStockMap(tx, lines)
@@ -114,8 +162,8 @@ async function assertLinesAvailable(tx, lines, { skipProductIds = [], excludeDoc
   const productIds = [...byProduct.keys()]
   if (productIds.length === 0) return
 
-  const locked = await lockProductsForUpdate(tx, productIds)
-  const availabilityMap = await getAvailabilityBatch(productIds, tx, { excludeDocumentId })
+  const locked = await lockProductsForUpdate(tx, productIds, b)
+  const availabilityMap = await getAvailabilityBatch(productIds, tx, { excludeDocumentId, branchId: b })
 
   for (const [productId, requested] of byProduct.entries()) {
     const row = locked.get(productId)
@@ -148,7 +196,9 @@ async function reserveForDocument(tx, {
   expiresAt,
   createdBy,
   reservationKind = 'ORDER',
+  branchId,
 }) {
+  const b = requireBranchId(branchId)
   const { loadProductsWithBom } = require('./bomStock')
   const prodMap = await loadProductsWithBom(
     tx,
@@ -168,6 +218,7 @@ async function reserveForDocument(tx, {
       for (const comp of product.kit_components) {
         rows.push({
           product_id: comp.component_product_id,
+          branch_id: b,
           document_id: documentId,
           document_line_id: line.id,
           qty: line.qty * Math.max(1, Number(comp.qty_per_unit || 1)),
@@ -181,6 +232,7 @@ async function reserveForDocument(tx, {
     } else {
       rows.push({
         product_id: line.product_id,
+        branch_id: b,
         document_id: documentId,
         document_line_id: line.id,
         qty: line.qty,
@@ -324,6 +376,8 @@ async function hasActiveReservations(tx, documentId) {
 
 module.exports = {
   ACTIVE,
+  requireBranchId,
+  ensureBranchStockRows,
   getAvailability,
   getAvailabilityBatch,
   assertLinesAvailable,

@@ -35,6 +35,7 @@ exports.list = async (req, res, next) => {
     const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 20)))
     const { includeDeleted } = req.query
     const where = includeDeleted === 'true' ? {} : { deleted: false }
+    where.company_id = req.companyId
     
     const totalItems = await prisma.paymentTerm.count({ where })
     const totalPages = Math.max(1, Math.ceil(totalItems / pageSize))
@@ -105,7 +106,7 @@ exports.create = async (req, res, next) => {
       netDaysVal = Math.floor(n)
     }
     const created = await prisma.paymentTerm.create({
-      data: { name: name.trim(), net_days: netDaysVal },
+      data: { name: name.trim(), net_days: netDaysVal, company_id: req.companyId },
     })
     res.status(201).json(created)
   } catch (e) {
@@ -167,6 +168,11 @@ exports.update = async (req, res, next) => {
         data.net_days = Math.floor(n)
       }
     }
+    const owned = await prisma.paymentTerm.findFirst({
+      where: { id: Number(id), company_id: req.companyId },
+      select: { id: true },
+    })
+    if (!owned) return res.status(404).json({ message: 'Término de pago no encontrado' })
     const updated = await prisma.paymentTerm.update({
       where: { id: Number(id) },
       data,
@@ -219,6 +225,12 @@ exports.remove = async (req, res, next) => {
       })
     }
     
+    const ownedForDelete = await prisma.paymentTerm.findFirst({
+      where: { id: Number(id), company_id: req.companyId },
+      select: { id: true },
+    })
+    if (!ownedForDelete) return res.status(404).json({ message: 'Término de pago no encontrado' })
+
     // Soft delete
     const deleted = await prisma.paymentTerm.update({
       where: { id: Number(id) },
@@ -256,6 +268,11 @@ exports.remove = async (req, res, next) => {
 exports.restore = async (req, res, next) => {
   try {
     const { id } = req.params
+    const owned = await prisma.paymentTerm.findFirst({
+      where: { id: Number(id), company_id: req.companyId },
+      select: { id: true },
+    })
+    if (!owned) return res.status(404).json({ message: 'Término de pago no encontrado' })
     const restored = await prisma.paymentTerm.update({
       where: { id: Number(id) },
       data: { deleted: false }
@@ -312,7 +329,7 @@ exports.validateImportMapped = async (req, res, next) => {
     }
 
     // Validate without importing
-    const validation = await bulkValidateCatalogs(items, 'payment-terms')
+    const validation = await bulkValidateCatalogs(items, 'payment-terms', req.companyId)
 
     res.json({
       ok: true,
@@ -348,7 +365,7 @@ exports.bulkImportMapped = async (req, res, next) => {
     }
 
     // Validate all payment terms
-    const validation = await bulkValidateCatalogs(items, 'payment-terms')
+    const validation = await bulkValidateCatalogs(items, 'payment-terms', req.companyId)
 
     if (validation.invalidRows.length > 0) {
       return res.status(400).json({
@@ -358,7 +375,7 @@ exports.bulkImportMapped = async (req, res, next) => {
     }
 
     // All valid, proceed to import
-    const result = await bulkCreateCatalogs(validation.validRows, 'payment-terms')
+    const result = await bulkCreateCatalogs(validation.validRows, 'payment-terms', req.companyId)
 
     res.json({
       ok: true,

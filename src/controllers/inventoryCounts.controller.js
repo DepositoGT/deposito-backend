@@ -14,6 +14,25 @@ function userId(req) {
 
 const MIN_REASON_LEN = 5
 
+/** Lo que la UI necesita de cada línea, incluida la ubicación que se cuenta. */
+const LINE_INCLUDE = {
+  product: {
+    select: {
+      id: true,
+      name: true,
+      barcode: true,
+      stock: true,
+      cost: true,
+      category: { select: { id: true, name: true } },
+    },
+  },
+  location: {
+    select: { id: true, code: true, name: true, warehouse: { select: { id: true, name: true, code: true } } },
+  },
+  countedBy: { select: { id: true, name: true } },
+  countedSecondaryBy: { select: { id: true, name: true } },
+}
+
 /** Transacciones interactivas: el default de Prisma (~5s) puede fallar con P2028 al aplicar muchas líneas. */
 const INVENTORY_APPROVE_TX_OPTIONS = { maxWait: 15_000, timeout: 120_000 }
 
@@ -128,14 +147,21 @@ function seededShuffleIds(ids, seedStr) {
   return a
 }
 
-async function resolveProductsForCountStart(session) {
+async function resolveProductsForCountStart(session, companyId) {
   const scope = session.scope_json || {}
   const where = buildProductWhereFromScope(scope)
+  if (companyId) where.company_id = companyId
   const rows = await prisma.product.findMany({
     where,
-    select: { id: true, stock: true, cost: true, category_id: true },
+    select: { id: true, cost: true, category_id: true },
   })
-  let list = rows
+  // El snapshot es el stock de LA SUCURSAL de la sesión, no el espejo global
+  const branchRows = await prisma.productStock.findMany({
+    where: { branch_id: session.branch_id, product_id: { in: rows.map((p) => p.id) } },
+    select: { product_id: true, stock: true },
+  })
+  const stockByProduct = new Map(branchRows.map((r) => [r.product_id, r.stock]))
+  let list = rows.map((p) => ({ ...p, stock: stockByProduct.get(p.id) ?? 0 }))
   const abc = scopeAbcClasses(scope)
   if (abc) {
     const tagged = assignAbcByInventoryValue(list)
@@ -174,10 +200,11 @@ function buildProductWhereFromScope(scope) {
   return where
 }
 
-async function assertNoBlockingSession(exceptId) {
+async function assertNoBlockingSession(exceptId, branchId) {
   const blocking = await prisma.inventoryCountSession.findFirst({
     where: {
       status: { in: ['IN_PROGRESS', 'IN_REVIEW', 'PENDING_SECOND_APPROVAL'] },
+      ...(branchId ? { branch_id: branchId } : {}),
       ...(exceptId ? { id: { not: exceptId } } : {}),
     },
     select: { id: true, name: true, status: true },
@@ -192,10 +219,30 @@ async function assertNoBlockingSession(exceptId) {
 }
 
 /**
+ * Ubicaciones que entran en el conteo: las del almacén elegido, o todas las de
+ * la sucursal. Si la sucursal aún no tiene ninguna, se le arma la de siempre.
+ */
+async function countScopeLocations(session) {
+  const where = { active: true, warehouse: { branch_id: session.branch_id, active: true } }
+  if (session.warehouse_id) where.warehouse.id = session.warehouse_id
+  const rows = await prisma.stockLocation.findMany({
+    where,
+    select: { id: true, is_default: true, warehouse: { select: { is_default: true } } },
+    orderBy: [{ dispatch_priority: 'asc' }, { code: 'asc' }],
+  })
+  if (rows.length) return rows
+  const { defaultLocationId } = require('../services/stockLocations')
+  const id = await prisma.$transaction((tx) => defaultLocationId(tx, session.branch_id))
+  return [{ id, is_default: true, warehouse: { is_default: true } }]
+}
+
+/**
  * Aplica qty_counted al stock de productos dentro de una transacción.
+ * La diferencia se aplica en LA UBICACIÓN de cada línea: lo que sobra en un
+ * anaquel y falta en otro deja de verse como descuadre de la sucursal.
  * @returns {Promise<string[]>} IDs de productos afectados
  */
-async function applyStockTransaction(tx, sessionId) {
+async function applyStockTransaction(tx, sessionId, branchId) {
   const lines = await tx.inventoryCountLine.findMany({
     where: { session_id: sessionId, qty_counted: { not: null } },
     include: { product: { select: { min_stock: true, kind: true, stock_assembled: true } } },
@@ -210,29 +257,74 @@ async function applyStockTransaction(tx, sessionId) {
     err.statusCode = 500
     throw err
   }
-  await Promise.all(
-    lines.map((L) => {
-      if (L.product.kind === 'KIT' && !L.product.stock_assembled) {
-        return tx.product.update({
-          where: { id: L.product_id },
-          data: { stock: 0 },
-        })
-      }
-      const stock = L.qty_counted
-      const minStock = Number(L.product.min_stock) || 0
-      let status_id = idDisponible
-      if (stock === 0 && idAgotado) status_id = idAgotado
-      else if (stock < minStock && idBajo) status_id = idBajo
-      return tx.product.update({
-        where: { id: L.product_id },
-        data: { stock, status_id },
-      })
-    })
+
+  const { ensureBranchStockRows } = require('../services/stockAvailability')
+  const { deductStockMap, restoreStockMap } = require('../services/bomStock')
+  const productIds = [...new Set(lines.map((l) => l.product_id))]
+  await ensureBranchStockRows(tx, productIds, branchId)
+
+  // Lo contado se compara contra lo que hay AHORA en esa ubicación, no contra
+  // el snapshot: si algo salió mientras se contaba, el conteo no lo revive.
+  const current = await tx.productStockLocation.findMany({
+    where: {
+      product_id: { in: productIds },
+      location_id: { in: [...new Set(lines.map((l) => l.location_id))] },
+    },
+    select: { product_id: true, location_id: true, stock: true },
+  })
+  const stockAt = new Map(current.map((r) => [`${r.product_id}|${r.location_id}`, Number(r.stock)]))
+
+  const ups = new Map() // location_id → Map(product_id, unidades que faltan)
+  const downs = new Map()
+  for (const L of lines) {
+    const isVirtualKit = L.product.kind === 'KIT' && !L.product.stock_assembled
+    const target = isVirtualKit ? 0 : Number(L.qty_counted)
+    const delta = target - (stockAt.get(`${L.product_id}|${L.location_id}`) ?? 0)
+    if (delta === 0) continue
+    const bucket = delta > 0 ? ups : downs
+    if (!bucket.has(L.location_id)) bucket.set(L.location_id, new Map())
+    bucket.get(L.location_id).set(String(L.product_id), Math.abs(delta))
+  }
+
+  // El grupo hace que el cierre del conteo sea UN asiento contable, no uno por
+  // producto ajustado.
+  const countCtx = {
+    reason: 'COUNT_ADJUST', refType: 'inventory_count', refId: String(sessionId),
+    groupId: require('crypto').randomUUID(),
+  }
+  for (const [location_id, map] of ups) {
+    await restoreStockMap(tx, map, branchId, { ...countCtx, locationId: location_id })
+  }
+  for (const [location_id, map] of downs) {
+    await deductStockMap(tx, map, branchId, { ...countCtx, locationId: location_id })
+  }
+
+  // El estado del producto mira el total de la sucursal ya ajustado.
+  const virtualKits = new Set(
+    lines.filter((L) => L.product.kind === 'KIT' && !L.product.stock_assembled).map((L) => L.product_id)
   )
-  return lines.map((l) => l.product_id)
+  const minByProduct = new Map(lines.map((L) => [L.product_id, Number(L.product.min_stock) || 0]))
+  const after = await tx.productStock.findMany({
+    where: { branch_id: branchId, product_id: { in: productIds } },
+    select: { product_id: true, stock: true },
+  })
+  await Promise.all(
+    after
+      .filter((r) => !virtualKits.has(r.product_id))
+      .map((r) => {
+        const stock = Number(r.stock)
+        let status_id = idDisponible
+        if (stock === 0 && idAgotado) status_id = idAgotado
+        else if (stock < (minByProduct.get(r.product_id) || 0) && idBajo) status_id = idBajo
+        return tx.product.update({ where: { id: r.product_id }, data: { status_id } })
+      })
+  )
+
+  return productIds
 }
 
 const sessionIncludeSummary = {
+  warehouse: { select: { id: true, name: true, code: true } },
   createdBy: { select: { id: true, name: true, email: true } },
   approvedBy: { select: { id: true, name: true, email: true } },
   firstApprovedBy: { select: { id: true, name: true, email: true } },
@@ -247,7 +339,8 @@ exports.list = async (req, res, next) => {
     const status = req.query.status
     const take = Math.min(Number(req.query.limit) || 50, 100)
     const skip = Number(req.query.offset) || 0
-    const where = {}
+    const { branchWhere } = require('../middlewares/tenant')
+    const where = { ...branchWhere(req) }
     if (status && String(status).trim()) {
       where.status = String(status).toUpperCase()
     }
@@ -295,8 +388,8 @@ exports.list = async (req, res, next) => {
 exports.getById = async (req, res, next) => {
   try {
     const { id } = req.params
-    const session = await prisma.inventoryCountSession.findUnique({
-      where: { id },
+    const session = await prisma.inventoryCountSession.findFirst({
+      where: { id, branch: { company_id: req.companyId } },
       include: {
         ...sessionIncludeSummary,
       },
@@ -354,9 +447,9 @@ exports.getById = async (req, res, next) => {
 exports.listLines = async (req, res, next) => {
   try {
     const { id } = req.params
-    const session = await prisma.inventoryCountSession.findUnique({
-      where: { id },
-      select: { id: true, scope_json: true },
+    const session = await prisma.inventoryCountSession.findFirst({
+      where: { id, branch: { company_id: req.companyId } },
+      select: { id: true, branch_id: true, scope_json: true },
     })
     if (!session) return res.status(404).json({ message: 'Sesión no encontrada' })
 
@@ -386,28 +479,17 @@ exports.listLines = async (req, res, next) => {
         andFilters.push({ qty_counted: null })
       }
     }
+    // Se cuenta parado frente a un anaquel: filtrar por ubicación es lo normal.
+    if (req.query.location_id) where.location_id = String(req.query.location_id)
     if (andFilters.length) where.AND = andFilters
 
     const [lines, total] = await Promise.all([
       prisma.inventoryCountLine.findMany({
         where,
-        orderBy: { product: { name: 'asc' } },
+        orderBy: [{ location: { code: 'asc' } }, { product: { name: 'asc' } }],
         take,
         skip,
-        include: {
-          product: {
-            select: {
-              id: true,
-              name: true,
-              barcode: true,
-              stock: true,
-              cost: true,
-              category: { select: { id: true, name: true } },
-            },
-          },
-          countedBy: { select: { id: true, name: true } },
-          countedSecondaryBy: { select: { id: true, name: true } },
-        },
+        include: LINE_INCLUDE,
       }),
       prisma.inventoryCountLine.count({ where }),
     ])
@@ -460,8 +542,21 @@ exports.create = async (req, res, next) => {
     ) {
       return res.status(400).json({ message: 'Clases ABC inválidas. Use A, B y/o C.' })
     }
+    const { requireBranch } = require('../middlewares/tenant')
+    const branchId = requireBranch(req)
+    // Acotar a un almacén es opcional; si viene, tiene que ser de esta sucursal.
+    const warehouseId = req.body?.warehouse_id ? String(req.body.warehouse_id) : null
+    if (warehouseId) {
+      const own = await prisma.warehouse.findFirst({
+        where: { id: warehouseId, branch_id: branchId },
+        select: { id: true },
+      })
+      if (!own) return res.status(404).json({ message: 'Almacén no encontrado en esta sucursal' })
+    }
     const session = await prisma.inventoryCountSession.create({
       data: {
+        branch_id: branchId,
+        warehouse_id: warehouseId,
         name: name ? String(name).slice(0, 200) : null,
         scope_json: scopeClean,
         notes: notes ? String(notes).slice(0, 2000) : null,
@@ -482,8 +577,8 @@ exports.create = async (req, res, next) => {
 exports.start = async (req, res, next) => {
   try {
     const { id } = req.params
-    const session = await prisma.inventoryCountSession.findUnique({
-      where: { id },
+    const session = await prisma.inventoryCountSession.findFirst({
+      where: { id, branch: { company_id: req.companyId } },
       include: { _count: { select: { lines: true } } },
     })
     if (!session) return res.status(404).json({ message: 'Sesión no encontrada' })
@@ -494,9 +589,9 @@ exports.start = async (req, res, next) => {
       return res.status(400).json({ message: 'La sesión ya tiene líneas generadas' })
     }
 
-    await assertNoBlockingSession(id)
+    await assertNoBlockingSession(id, session.branch_id)
 
-    const products = await resolveProductsForCountStart(session)
+    const products = await resolveProductsForCountStart(session, req.companyId)
     if (!products.length) {
       return res.status(400).json({
         message:
@@ -504,22 +599,45 @@ exports.start = async (req, res, next) => {
       })
     }
 
+    // Una línea por (producto, ubicación con existencias). El producto que no
+    // está en ninguna cae en la ubicación por defecto: encontrar de más también
+    // es un hallazgo del conteo.
+    const locations = await countScopeLocations(session)
+    const fallback = (locations.find((l) => l.is_default && l.warehouse.is_default) || locations[0]).id
+    const stocks = await prisma.productStockLocation.findMany({
+      where: {
+        product_id: { in: products.map((p) => p.id) },
+        location_id: { in: locations.map((l) => l.id) },
+        stock: { not: 0 },
+      },
+      select: { product_id: true, location_id: true, stock: true },
+    })
+    const byProduct = new Map()
+    for (const s of stocks) {
+      if (!byProduct.has(s.product_id)) byProduct.set(s.product_id, [])
+      byProduct.get(s.product_id).push(s)
+    }
+    const lineData = products.flatMap((p) => {
+      const rows = byProduct.get(p.id) || []
+      if (!rows.length) return [{ session_id: id, product_id: p.id, location_id: fallback, stock_snapshot: 0 }]
+      return rows.map((r) => ({
+        session_id: id,
+        product_id: p.id,
+        location_id: r.location_id,
+        stock_snapshot: Number(r.stock),
+      }))
+    })
+
     await prisma.$transaction([
-      prisma.inventoryCountLine.createMany({
-        data: products.map((p) => ({
-          session_id: id,
-          product_id: p.id,
-          stock_snapshot: p.stock,
-        })),
-      }),
+      prisma.inventoryCountLine.createMany({ data: lineData }),
       prisma.inventoryCountSession.update({
         where: { id },
         data: { status: 'IN_PROGRESS', started_at: new Date() },
       }),
     ])
 
-    const updated = await prisma.inventoryCountSession.findUnique({
-      where: { id },
+    const updated = await prisma.inventoryCountSession.findFirst({
+      where: { id, branch: { company_id: req.companyId } },
       include: sessionIncludeSummary,
     })
     res.json(updated)
@@ -539,9 +657,9 @@ exports.updateLine = async (req, res, next) => {
     const uid = userId(req)
     if (!uid) return res.status(401).json({ message: 'Usuario no identificado' })
 
-    const session = await prisma.inventoryCountSession.findUnique({
-      where: { id },
-      select: { status: true, scope_json: true },
+    const session = await prisma.inventoryCountSession.findFirst({
+      where: { id, branch: { company_id: req.companyId } },
+      select: { status: true, branch_id: true, scope_json: true },
     })
     if (!session) return res.status(404).json({ message: 'Sesión no encontrada' })
     if (session.status !== 'IN_PROGRESS') {
@@ -559,39 +677,13 @@ exports.updateLine = async (req, res, next) => {
       if (req.body?.note !== undefined) {
         const lineOnly = await prisma.inventoryCountLine.findFirst({
           where: { id: lineId, session_id: id },
-          include: {
-            product: {
-              select: {
-                id: true,
-                name: true,
-                barcode: true,
-                stock: true,
-                cost: true,
-                category: { select: { id: true, name: true } },
-              },
-            },
-            countedBy: { select: { id: true, name: true } },
-            countedSecondaryBy: { select: { id: true, name: true } },
-          },
+          include: LINE_INCLUDE,
         })
         if (!lineOnly) return res.status(404).json({ message: 'Línea no encontrada' })
         const updatedNote = await prisma.inventoryCountLine.update({
           where: { id: lineId },
           data: { note: note || null },
-          include: {
-            product: {
-              select: {
-                id: true,
-                name: true,
-                barcode: true,
-                stock: true,
-                cost: true,
-                category: { select: { id: true, name: true } },
-              },
-            },
-            countedBy: { select: { id: true, name: true } },
-            countedSecondaryBy: { select: { id: true, name: true } },
-          },
+          include: LINE_INCLUDE,
         })
         const mismatch =
           doubleCount &&
@@ -623,20 +715,7 @@ exports.updateLine = async (req, res, next) => {
 
     const line = await prisma.inventoryCountLine.findFirst({
       where: { id: lineId, session_id: id },
-      include: {
-        product: {
-          select: {
-            id: true,
-            name: true,
-            barcode: true,
-            stock: true,
-            cost: true,
-            category: { select: { id: true, name: true } },
-          },
-        },
-        countedBy: { select: { id: true, name: true } },
-        countedSecondaryBy: { select: { id: true, name: true } },
-      },
+      include: LINE_INCLUDE,
     })
     if (!line) return res.status(404).json({ message: 'Línea no encontrada' })
 
@@ -656,20 +735,7 @@ exports.updateLine = async (req, res, next) => {
     const updated = await prisma.inventoryCountLine.update({
       where: { id: lineId },
       data,
-      include: {
-        product: {
-          select: {
-            id: true,
-            name: true,
-            barcode: true,
-            stock: true,
-            cost: true,
-            category: { select: { id: true, name: true } },
-          },
-        },
-        countedBy: { select: { id: true, name: true } },
-        countedSecondaryBy: { select: { id: true, name: true } },
-      },
+      include: LINE_INCLUDE,
     })
 
     const mismatch =
@@ -708,8 +774,8 @@ exports.submit = async (req, res, next) => {
     }
     const reasonStr = String(reason).trim().slice(0, 2000)
 
-    const session = await prisma.inventoryCountSession.findUnique({
-      where: { id },
+    const session = await prisma.inventoryCountSession.findFirst({
+      where: { id, branch: { company_id: req.companyId } },
       include: { _count: { select: { lines: true } } },
     })
     if (!session) return res.status(404).json({ message: 'Sesión no encontrada' })
@@ -785,10 +851,11 @@ exports.approve = async (req, res, next) => {
     }
     const reasonStr = String(reason).trim().slice(0, 2000)
 
-    const session = await prisma.inventoryCountSession.findUnique({
-      where: { id },
+    const session = await prisma.inventoryCountSession.findFirst({
+      where: { id, branch: { company_id: req.companyId } },
       select: {
         status: true,
+        branch_id: true,
         dual_approval: true,
         first_approved_by_id: true,
         scope_json: true,
@@ -828,7 +895,7 @@ exports.approve = async (req, res, next) => {
       } else {
         await prismaTransaction.$transaction(
           async (tx) => {
-            affectedProductIds = await applyStockTransaction(tx, id)
+            affectedProductIds = await applyStockTransaction(tx, id, session.branch_id)
             await tx.inventoryCountSession.update({
               where: { id },
               data: {
@@ -850,7 +917,7 @@ exports.approve = async (req, res, next) => {
       }
       await prismaTransaction.$transaction(
         async (tx) => {
-          affectedProductIds = await applyStockTransaction(tx, id)
+          affectedProductIds = await applyStockTransaction(tx, id, session.branch_id)
           await tx.inventoryCountSession.update({
             where: { id },
             data: {
@@ -867,18 +934,20 @@ exports.approve = async (req, res, next) => {
 
     if (affectedProductIds.length) {
       try {
-        const refreshed = await prisma.product.findMany({
-          where: { id: { in: affectedProductIds } },
-          select: { id: true, stock: true, min_stock: true },
+        // Alertas con el stock/min de la sucursal de la sesión
+        const branchRows = await prisma.productStock.findMany({
+          where: { branch_id: session.branch_id, product_id: { in: affectedProductIds } },
+          select: { product_id: true, stock: true, min_stock: true },
         })
-        await ensureStockAlertsBatch(prisma, refreshed)
+        const refreshed = branchRows.map((r) => ({ id: r.product_id, stock: r.stock, min_stock: r.min_stock }))
+        await ensureStockAlertsBatch(prisma, refreshed, session.branch_id)
       } catch (alertErr) {
         console.error('[inventoryCounts.approve] alertas stock:', alertErr.message)
       }
     }
 
-    const updated = await prisma.inventoryCountSession.findUnique({
-      where: { id },
+    const updated = await prisma.inventoryCountSession.findFirst({
+      where: { id, branch: { company_id: req.companyId } },
       include: sessionIncludeSummary,
     })
     res.json(updated)
@@ -899,8 +968,8 @@ exports.cancel = async (req, res, next) => {
       return res.status(400).json({ message: 'Indique el motivo de cancelación' })
     }
 
-    const session = await prisma.inventoryCountSession.findUnique({
-      where: { id },
+    const session = await prisma.inventoryCountSession.findFirst({
+      where: { id, branch: { company_id: req.companyId } },
       select: { status: true },
     })
     if (!session) return res.status(404).json({ message: 'Sesión no encontrada' })

@@ -136,6 +136,8 @@ router.get('/availability', Auth, hasPermission('products.view', 'sales.create',
 router.get('/lots/expiring', Auth, hasPermission('products.view'), Products.lotsExpiring)
 
 /** Corregir / eliminar un lote mal ingresado (cantidad, caducidad, código). Reconcilia stock. */
+// Dar de baja lo que quedó de un lote destruye existencias: mismo permiso que un ajuste.
+router.post('/lots/write-off', Auth, hasPermission('stock_moves.adjust'), Products.writeOffLots)
 router.patch('/lots/:lotId', Auth, hasPermission('products.register_incoming'), Products.updateLot)
 router.delete('/lots/:lotId', Auth, hasPermission('products.register_incoming'), Products.deleteLot)
 
@@ -353,6 +355,42 @@ router.put('/:id', Auth, hasPermission('products.edit'), Products.update)
  *       200: { description: OK }
  */
 router.delete('/:id', Auth, hasPermission('products.delete'), Products.remove)
+
+/**
+ * @openapi
+ * /products/{id}/branch-stock:
+ *   delete:
+ *     tags: [Products]
+ *     summary: Quitar el producto de la sucursal activa (sigue existiendo en las demás)
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         schema: { type: string }
+ *         required: true
+ *     responses:
+ *       200: { description: OK }
+ */
+router.delete('/:id/branch-stock', Auth, hasPermission('products.delete'), Products.removeFromBranch)
+
+/**
+ * @openapi
+ * /products/{id}/branch-stock:
+ *   post:
+ *     tags: [Products]
+ *     summary: Empezar a manejar el producto en la sucursal activa (su stock arranca en 0)
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         schema: { type: string }
+ *         required: true
+ *     responses:
+ *       201: { description: Creado }
+ */
+router.post('/:id/branch-stock', Auth, hasPermission('products.edit', 'products.create'), Products.addToBranch)
 
 /**
  * @openapi

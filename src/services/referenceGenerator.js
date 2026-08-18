@@ -1,5 +1,6 @@
 /**
- * Referencias legibles Q-000001, P-000001, V-000001 (base62).
+ * Referencias legibles POR SUCURSAL: V-SUC1-000001, P-SUC1-000001, T-SUC1-000001 (base62).
+ * Las referencias viejas sin sucursal (V-000001) siguen siendo válidas para búsqueda.
  */
 
 const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
@@ -25,50 +26,66 @@ function fromBase62(s) {
   return n
 }
 
-const REF_LOCK_KEYS = { V: 910001, Q: 910002, P: 910003 }
+// Offset por prefijo dentro del rango de lock de cada sucursal
+const REF_LOCK_OFFSETS = { V: 1, Q: 2, P: 3, T: 4 }
 
 /**
+ * Genera la siguiente referencia del prefijo EN LA SUCURSAL dada.
+ * El advisory lock se deriva de branch.seq, así cada sucursal numera sin
+ * bloquear a las demás: 910000 + seq*10 + offset(prefijo).
+ *
  * @param {import('@prisma/client').Prisma.TransactionClient} tx
- * @param {'V'|'Q'|'P'} prefix
+ * @param {'V'|'Q'|'P'|'T'} prefix
+ * @param {{ id: string, code: string, seq: number }} branch
  */
-async function nextDocumentReference(tx, prefix) {
-  const lockKey = REF_LOCK_KEYS[prefix]
-  if (lockKey != null) {
-    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${lockKey})`
+async function nextDocumentReference(tx, prefix, branch) {
+  if (!branch || !branch.id || !branch.code || !Number.isFinite(Number(branch.seq))) {
+    const err = new Error('nextDocumentReference requiere la sucursal (id, code, seq)')
+    err.status = 500
+    throw err
   }
+  const offset = REF_LOCK_OFFSETS[prefix]
+  const lockKey = 910000 + Number(branch.seq) * 10 + (offset || 0)
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(${lockKey})`
 
-  const pattern = new RegExp(`^${prefix}-([0-9A-Za-z]+)$`)
-  const formatRef = (num) => `${prefix}-${toBase62(num).padStart(6, '0')}`
+  const refPrefix = `${prefix}-${branch.code}-`
+  const pattern = new RegExp(`^${prefix}-${branch.code}-([0-9A-Za-z]+)$`)
+  const formatRef = (num) => `${refPrefix}${toBase62(num).padStart(6, '0')}`
+
+  const findLast = async (where) => {
+    if (prefix === 'V') {
+      const last = await tx.sale.findFirst({ where, orderBy: { reference: 'desc' }, select: { reference: true } })
+      return last?.reference || null
+    }
+    if (prefix === 'T') {
+      const last = await tx.stockTransfer.findFirst({ where, orderBy: { reference: 'desc' }, select: { reference: true } })
+      return last?.reference || null
+    }
+    const last = await tx.commercialDocument.findFirst({ where, orderBy: { reference: 'desc' }, select: { reference: true } })
+    return last?.reference || null
+  }
 
   const referenceExists = async (reference) => {
     if (prefix === 'V') {
       return Boolean(await tx.sale.findFirst({
-        where: { reference },
+        where: { branch_id: branch.id, reference },
+        select: { id: true },
+      }))
+    }
+    if (prefix === 'T') {
+      return Boolean(await tx.stockTransfer.findFirst({
+        where: { from_branch_id: branch.id, reference },
         select: { id: true },
       }))
     }
     return Boolean(await tx.commercialDocument.findFirst({
-      where: { reference },
+      where: { branch_id: branch.id, reference },
       select: { id: true },
     }))
   }
 
-  let lastRef = null
-  if (prefix === 'V') {
-    const last = await tx.sale.findFirst({
-      where: { reference: { startsWith: `${prefix}-` } },
-      orderBy: { reference: 'desc' },
-      select: { reference: true },
-    })
-    lastRef = last?.reference
-  } else {
-    const last = await tx.commercialDocument.findFirst({
-      where: { reference: { startsWith: `${prefix}-` } },
-      orderBy: { reference: 'desc' },
-      select: { reference: true },
-    })
-    lastRef = last?.reference
-  }
+  const branchScope = prefix === 'T' ? { from_branch_id: branch.id } : { branch_id: branch.id }
+  const lastRef = await findLast({ ...branchScope, reference: { startsWith: refPrefix } })
 
   let nextNum = 1
   if (lastRef) {

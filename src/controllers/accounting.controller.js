@@ -40,6 +40,7 @@ function dateRange(req) {
 exports.listAccounts = async (req, res, next) => {
   try {
     const where = req.query.includeInactive === 'true' ? {} : { active: true }
+    where.company_id = req.companyId
     const items = await prisma.account.findMany({ where, orderBy: { code: 'asc' } })
     res.json({ items })
   } catch (e) { next(e) }
@@ -51,10 +52,11 @@ exports.createAccount = async (req, res, next) => {
     if (!code || !name || !ACCOUNT_TYPES.includes(type)) {
       return res.status(400).json({ error: 'code, name y type válidos son requeridos' })
     }
-    const exists = await prisma.account.findUnique({ where: { code: String(code).trim() } })
+    const exists = await prisma.account.findFirst({ where: { code: String(code).trim(), company_id: req.companyId } })
     if (exists) return res.status(400).json({ error: `Ya existe una cuenta con código ${code}` })
     const account = await prisma.account.create({
       data: {
+        company_id: req.companyId,
         code: String(code).trim(),
         name: String(name).trim(),
         type,
@@ -69,7 +71,7 @@ exports.createAccount = async (req, res, next) => {
 exports.updateAccount = async (req, res, next) => {
   try {
     const id = Number(req.params.id)
-    const account = await prisma.account.findUnique({ where: { id } })
+    const account = await prisma.account.findFirst({ where: { id, company_id: req.companyId } })
     if (!account) return res.status(404).json({ error: 'Cuenta no encontrada' })
     const { name, parent_id, active } = req.body || {}
     if (account.system && active === false) {
@@ -92,6 +94,7 @@ exports.updateAccount = async (req, res, next) => {
 exports.listPeriods = async (req, res, next) => {
   try {
     const where = req.query.year ? { year: Number(req.query.year) } : {}
+    where.company_id = req.companyId
     const items = await prisma.accountingPeriod.findMany({
       where,
       orderBy: [{ year: 'desc' }, { month: 'desc' }],
@@ -112,9 +115,9 @@ async function setPeriodStatus(req, res, next, status) {
       closed_by: status === 'CLOSED' ? userId(req) : null,
     }
     const period = await prisma.accountingPeriod.upsert({
-      where: { year_month: { year, month } },
+      where: { company_id_year_month: { company_id: req.companyId, year, month } },
       update: audit,
-      create: { year, month, ...audit },
+      create: { company_id: req.companyId, year, month, ...audit },
     })
     res.json(period)
   } catch (e) { next(e) }
@@ -127,7 +130,7 @@ exports.reopenPeriod = (req, res, next) => setPeriodStatus(req, res, next, 'OPEN
 
 exports.getConfig = async (req, res, next) => {
   try {
-    const setting = await prisma.systemSetting.findUnique({ where: { key: SETTING_KEY } })
+    const setting = await prisma.systemSetting.findFirst({ where: { key: SETTING_KEY, company_id: req.companyId } })
     let defaults = {}
     try { defaults = setting ? JSON.parse(setting.value) : {} } catch { defaults = {} }
     res.json({ defaults, keys: DEFAULT_ACCOUNT_KEYS })
@@ -141,16 +144,16 @@ exports.updateConfig = async (req, res, next) => {
     for (const key of DEFAULT_ACCOUNT_KEYS) {
       const code = incoming[key]
       if (!code) return res.status(400).json({ error: `Falta la cuenta para «${key}»` })
-      const acc = await prisma.account.findUnique({ where: { code: String(code) } })
+      const acc = await prisma.account.findFirst({ where: { code: String(code), company_id: req.companyId } })
       if (!acc || !acc.active || acc.is_group) {
         return res.status(400).json({ error: `Cuenta ${code} inválida para «${key}» (debe existir, activa y no agrupadora)` })
       }
       defaults[key] = String(code)
     }
     await prisma.systemSetting.upsert({
-      where: { key: SETTING_KEY },
+      where: { company_id_key: { company_id: req.companyId, key: SETTING_KEY } },
       update: { value: JSON.stringify(defaults) },
-      create: { key: SETTING_KEY, type: 'json', value: JSON.stringify(defaults), description: 'Mapeo de cuentas por defecto para asientos automáticos' },
+      create: { company_id: req.companyId, key: SETTING_KEY, type: 'json', value: JSON.stringify(defaults), description: 'Mapeo de cuentas por defecto para asientos automáticos' },
     })
     res.json({ defaults, keys: DEFAULT_ACCOUNT_KEYS })
   } catch (e) { next(e) }
@@ -161,6 +164,7 @@ exports.updateConfig = async (req, res, next) => {
 const ENTRY_INCLUDE = {
   lines: { include: { account: { select: { code: true, name: true } } }, orderBy: { id: 'asc' } },
   createdBy: { select: { name: true } },
+  branch: { select: { id: true, name: true, code: true } },
   reversals: { select: { id: true, entry_number: true } },
   reversalOf: { select: { id: true, entry_number: true } },
 }
@@ -171,8 +175,15 @@ exports.listJournal = async (req, res, next) => {
     const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 25)))
     const { from, to } = dateRange(req)
     const where = {
+      company_id: req.companyId,
       ...(from || to ? { date: { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) } } : {}),
       ...(req.query.source ? { source_type: req.query.source } : {}),
+      // 'company' = solo asientos sin sucursal (manuales, cierre, importación)
+      ...(req.query.branch_id === 'company'
+        ? { branch_id: null }
+        : req.query.branch_id
+          ? { branch_id: String(req.query.branch_id) }
+          : {}),
     }
     const totalItems = await prisma.journalEntry.count({ where })
     const totalPages = Math.max(1, Math.ceil(totalItems / pageSize))
@@ -190,8 +201,8 @@ exports.listJournal = async (req, res, next) => {
 
 exports.getJournalEntry = async (req, res, next) => {
   try {
-    const entry = await prisma.journalEntry.findUnique({
-      where: { id: req.params.id },
+    const entry = await prisma.journalEntry.findFirst({
+      where: { id: req.params.id, company_id: req.companyId },
       include: ENTRY_INCLUDE,
     })
     if (!entry) return res.status(404).json({ error: 'Asiento no encontrado' })
@@ -204,7 +215,7 @@ exports.createManualEntry = async (req, res, next) => {
     const { date, description, lines } = req.body || {}
     if (!date || !description) return res.status(400).json({ error: 'Fecha y descripción son requeridas' })
     const entry = await prisma.$transaction((tx) =>
-      createEntry(tx, { date, description, source_type: 'MANUAL', created_by: userId(req), lines }),
+      createEntry(tx, { company_id: req.companyId, branch_id: req.branchId ?? null, date, description, source_type: 'MANUAL', created_by: userId(req), lines }),
     )
     res.status(201).json(entry)
   } catch (e) { handle(e, res, next) }
@@ -212,8 +223,8 @@ exports.createManualEntry = async (req, res, next) => {
 
 exports.reverseEntry = async (req, res, next) => {
   try {
-    const original = await prisma.journalEntry.findUnique({
-      where: { id: req.params.id },
+    const original = await prisma.journalEntry.findFirst({
+      where: { id: req.params.id, company_id: req.companyId },
       include: { lines: true, reversals: { select: { id: true } } },
     })
     if (!original) return res.status(404).json({ error: 'Asiento no encontrado' })
@@ -222,11 +233,13 @@ exports.reverseEntry = async (req, res, next) => {
 
     // Fecha del contra-asiento: la del original si su período sigue abierto; si no, hoy.
     const { year, month } = periodKeyForDate(original.date)
-    const period = await prisma.accountingPeriod.findUnique({ where: { year_month: { year, month } } })
+    const period = await prisma.accountingPeriod.findFirst({ where: { company_id: req.companyId, year, month } })
     const reversalDate = period?.status === 'CLOSED' ? new Date() : original.date
 
     const entry = await prisma.$transaction((tx) =>
       createEntry(tx, {
+        company_id: req.companyId,
+        branch_id: original.branch_id,
         date: reversalDate,
         description: `Anulación de ${original.entry_number}: ${original.description}`.slice(0, 255),
         source_type: 'MANUAL',
@@ -248,7 +261,7 @@ exports.reverseEntry = async (req, res, next) => {
 
 exports.postPending = async (req, res, next) => {
   try {
-    const result = await postPendingOperations(prisma, userId(req))
+    const result = await postPendingOperations(prisma, userId(req), req.companyId)
     res.json(result)
   } catch (e) { handle(e, res, next) }
 }
@@ -260,12 +273,12 @@ exports.closeYear = async (req, res, next) => {
     const year = Number(req.params.year)
     if (!year) return res.status(400).json({ error: 'Año inválido' })
 
-    const closedCount = await prisma.accountingPeriod.count({ where: { year, status: 'CLOSED' } })
+    const closedCount = await prisma.accountingPeriod.count({ where: { year, status: 'CLOSED', company_id: req.companyId } })
     if (closedCount < 12) {
       return res.status(400).json({ error: 'Los 12 períodos del año deben existir y estar cerrados' })
     }
-    const already = await prisma.journalEntry.findUnique({
-      where: { source_type_source_id: { source_type: 'CLOSING', source_id: `year:${year}` } },
+    const already = await prisma.journalEntry.findFirst({
+      where: { company_id: req.companyId, source_type: 'CLOSING', source_id: `year:${year}` },
     })
     if (already) return res.status(400).json({ error: `El año ${year} ya fue cerrado (${already.entry_number})` })
 
@@ -273,7 +286,7 @@ exports.closeYear = async (req, res, next) => {
     const to = new Date(`${year}-12-31T23:59:59.999-06:00`)
     const grouped = await prisma.journalLine.groupBy({
       by: ['account_id'],
-      where: { entry: { date: { gte: from, lte: to } }, account: { type: { in: ['INCOME', 'COST', 'EXPENSE'] } } },
+      where: { entry: { date: { gte: from, lte: to }, company_id: req.companyId }, account: { type: { in: ['INCOME', 'COST', 'EXPENSE'] } } },
       _sum: { debit: true, credit: true },
     })
     const accounts = await prisma.account.findMany({
@@ -282,7 +295,7 @@ exports.closeYear = async (req, res, next) => {
     })
     const typeById = new Map(accounts.map((a) => [a.id, a.type]))
 
-    const defaults = await getDefaultAccounts(prisma)
+    const defaults = await getDefaultAccounts(prisma, req.companyId)
     const lines = []
     let result = 0 // + utilidad, - pérdida
     for (const g of grouped) {
@@ -315,8 +328,9 @@ exports.closeYear = async (req, res, next) => {
 
     const entry = await prisma.$transaction(async (tx) => {
       // Reabrir dic momentáneamente para permitir el asiento de cierre y volver a cerrar
-      await tx.accountingPeriod.update({ where: { year_month: { year, month: 12 } }, data: { status: 'OPEN' } })
+      await tx.accountingPeriod.update({ where: { company_id_year_month: { company_id: req.companyId, year, month: 12 } }, data: { status: 'OPEN' } })
       const created = await createEntry(tx, {
+        company_id: req.companyId,
         date: to,
         description: `Cierre del ejercicio ${year}`,
         source_type: 'CLOSING',
@@ -325,7 +339,7 @@ exports.closeYear = async (req, res, next) => {
         lines,
       })
       await tx.accountingPeriod.update({
-        where: { year_month: { year, month: 12 } },
+        where: { company_id_year_month: { company_id: req.companyId, year, month: 12 } },
         data: { status: 'CLOSED', closed_at: new Date(), closed_by: userId(req) },
       })
       return created

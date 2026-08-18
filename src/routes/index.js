@@ -10,11 +10,25 @@
 
 const { Router } = require('express')
 const router = Router()
+const { resolveTenant } = require('../middlewares/tenant')
 
 // Basic ping
 router.get('/', (req, res) => {
   res.json({ ok: true, message: 'API up' })
 })
+
+// Empresa + sucursal del request (req.companyId / req.branchId) para todas las rutas
+router.use(resolveTenant)
+
+// Empresas y sucursales
+router.use('/companies', require('./companies.routes'))
+router.use('/branches', require('./branches.routes'))
+// Traslados de mercancía entre sucursales
+router.use('/transfers', require('./transfers.routes'))
+// Almacenes y ubicaciones dentro de la sucursal
+router.use('/warehouses', require('./warehouses.routes'))
+// Movimientos internos, ajustes y kardex por ubicación
+router.use('/stock', require('./stock.routes'))
 
 // Mount products routes
 router.use('/products', require('./products.routes'))

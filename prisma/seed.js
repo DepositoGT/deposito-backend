@@ -11,8 +11,28 @@
 const { PrismaClient } = require('@prisma/client')
 const prisma = new PrismaClient()
 
+// Mismos ids que la migración 20260811120000_multi_company_branches, para que
+// un seed sobre una base ya migrada no duplique la empresa principal.
+const DEFAULT_COMPANY_ID = '00000000-0000-4000-8000-000000000001'
+const DEFAULT_BRANCH_ID = '00000000-0000-4000-8000-000000000002'
+
 async function main() {
   console.log('Iniciando seed de base de datos...')
+
+  // ========================================
+  // 0. EMPRESA Y SUCURSAL PRINCIPAL
+  // ========================================
+  const company = await prisma.company.upsert({
+    where: { id: DEFAULT_COMPANY_ID },
+    update: {},
+    create: { id: DEFAULT_COMPANY_ID, name: 'Mi Empresa', code: 'PRIN', is_default: true },
+  })
+  await prisma.branch.upsert({
+    where: { id: DEFAULT_BRANCH_ID },
+    update: {},
+    create: { id: DEFAULT_BRANCH_ID, company_id: company.id, name: 'Principal', code: 'PRIN', is_default: true },
+  })
+  console.log('  Empresa y sucursal principal listas')
 
   // ========================================
   // 1. ROLES
@@ -80,6 +100,20 @@ async function main() {
     { code: 'users.import', name: 'Importar usuarios', description: 'Puede importar usuarios desde archivos' },
     { code: 'roles.view', name: 'Ver roles', description: 'Puede ver roles disponibles' },
     { code: 'roles.manage', name: 'Gestionar roles y permisos', description: 'Puede crear, editar y asignar permisos a roles' },
+
+    // Empresas y sucursales
+    { code: 'companies.manage', name: 'Gestionar empresas', description: 'Puede crear y editar empresas y asignar usuarios' },
+    { code: 'branches.manage', name: 'Gestionar sucursales', description: 'Puede crear y editar sucursales y asignar usuarios' },
+    { code: 'branches.view_all', name: 'Vista consolidada de sucursales', description: 'Puede ver reportes y datos de todas las sucursales de la empresa' },
+    { code: 'transfers.view', name: 'Ver traslados', description: 'Puede ver traslados entre sucursales' },
+    { code: 'transfers.create', name: 'Crear traslados', description: 'Puede enviar mercancía a otra sucursal' },
+    { code: 'transfers.receive', name: 'Recibir traslados', description: 'Puede confirmar la recepción de traslados' },
+    { code: 'transfers.cancel', name: 'Cancelar traslados', description: 'Puede cancelar traslados en tránsito' },
+    { code: 'warehouses.view', name: 'Ver almacenes', description: 'Puede ver almacenes y ubicaciones' },
+    { code: 'warehouses.manage', name: 'Gestionar almacenes', description: 'Puede crear y editar almacenes y ubicaciones' },
+    { code: 'stock_moves.view', name: 'Ver movimientos', description: 'Puede ver movimientos internos y kardex' },
+    { code: 'stock_moves.create', name: 'Mover mercancía', description: 'Puede mover mercancía entre ubicaciones' },
+    { code: 'stock_moves.adjust', name: 'Ajustar existencias', description: 'Puede corregir existencias sin documento (merma, daño)' },
 
     // Productos e inventario
     { code: 'products.view', name: 'Ver productos', description: 'Puede ver el catálogo de productos' },
@@ -327,9 +361,9 @@ async function main() {
   ]
   for (const s of defaultSettings) {
     await prisma.systemSetting.upsert({
-      where: { key: s.key },
+      where: { company_id_key: { company_id: DEFAULT_COMPANY_ID, key: s.key } },
       update: {},
-      create: s
+      create: { ...s, company_id: DEFAULT_COMPANY_ID }
     })
   }
   console.log('  Valores por defecto de configuración listos')
@@ -342,6 +376,7 @@ async function main() {
     update: { name: 'Caja principal', code: 'PRINCIPAL', is_default: true, active: true },
     create: {
       id: 'c0ffee00-0000-4000-8000-000000000001',
+      branch_id: DEFAULT_BRANCH_ID,
       name: 'Caja principal',
       code: 'PRINCIPAL',
       is_default: true,
@@ -384,9 +419,10 @@ async function main() {
   const accountIdByCode = {}
   for (const acc of accountsSeed) {
     const created = await prisma.account.upsert({
-      where: { code: acc.code },
+      where: { company_id_code: { company_id: DEFAULT_COMPANY_ID, code: acc.code } },
       update: {},
       create: {
+        company_id: DEFAULT_COMPANY_ID,
         code: acc.code,
         name: acc.name,
         type: acc.type,
@@ -407,15 +443,18 @@ async function main() {
     pequenoTax: '2103', pequenoTaxExpense: '6105',
     currentEarnings: '3202', retainedEarnings: '3201',
   }
-  const existingDefaults = await prisma.systemSetting.findUnique({ where: { key: 'accounting.defaultAccounts' } })
+  const existingDefaults = await prisma.systemSetting.findUnique({
+    where: { company_id_key: { company_id: DEFAULT_COMPANY_ID, key: 'accounting.defaultAccounts' } },
+  })
   let mergedDefaults = defaultAccountCodes
   if (existingDefaults) {
     try { mergedDefaults = { ...defaultAccountCodes, ...JSON.parse(existingDefaults.value) } } catch { /* JSON corrupto: se restaura el default */ }
   }
   await prisma.systemSetting.upsert({
-    where: { key: 'accounting.defaultAccounts' },
+    where: { company_id_key: { company_id: DEFAULT_COMPANY_ID, key: 'accounting.defaultAccounts' } },
     update: { value: JSON.stringify(mergedDefaults) },
     create: {
+      company_id: DEFAULT_COMPANY_ID,
       key: 'accounting.defaultAccounts',
       type: 'json',
       description: 'Mapeo de cuentas por defecto para asientos automáticos',
@@ -433,19 +472,34 @@ async function main() {
       where: { email: 'admin@ejemplo.com' },
     })
 
-    if (!existingAdmin) {
-      await prisma.user.create({
-        data: {
-          name: 'Admin',
-          email: 'admin@ejemplo.com',
-          password: '7c4a8d09ca3762af61e59520943dc26494f8941b', // DEBE SER REEMPLAZADO CON HASH REAL
-          role_id: adminRole.id,
-        },
-      })
-      console.log('  Usuario admin creado con password temporal. DEBE CAMBIARSE.')
-    } else {
-      console.log('  Usuario admin ya existe')
+    const admin = existingAdmin ?? await prisma.user.create({
+      data: {
+        name: 'Admin',
+        email: 'admin@ejemplo.com',
+        password: '7c4a8d09ca3762af61e59520943dc26494f8941b', // DEBE SER REEMPLAZADO CON HASH REAL
+        role_id: adminRole.id,
+        default_branch_id: DEFAULT_BRANCH_ID,
+      },
+    })
+    console.log(existingAdmin
+      ? '  Usuario admin ya existe'
+      : '  Usuario admin creado con password temporal. DEBE CAMBIARSE.')
+
+    // Sin membresía no puede entrar: el middleware exige al menos una sucursal.
+    await prisma.userCompany.upsert({
+      where: { user_id_company_id: { user_id: admin.id, company_id: DEFAULT_COMPANY_ID } },
+      update: {},
+      create: { user_id: admin.id, company_id: DEFAULT_COMPANY_ID },
+    })
+    await prisma.userBranch.upsert({
+      where: { user_id_branch_id: { user_id: admin.id, branch_id: DEFAULT_BRANCH_ID } },
+      update: {},
+      create: { user_id: admin.id, branch_id: DEFAULT_BRANCH_ID },
+    })
+    if (!admin.default_branch_id) {
+      await prisma.user.update({ where: { id: admin.id }, data: { default_branch_id: DEFAULT_BRANCH_ID } })
     }
+    console.log('  Admin asignado a la empresa y sucursal principal')
   }
 
   console.log('')

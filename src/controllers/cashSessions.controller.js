@@ -75,18 +75,18 @@ function checkCanCloseThisSession (req, session) {
  * Resuelve la caja a usar: 1) la indicada explícitamente, 2) la asignada al
  * usuario (si está activa), 3) la default.
  */
-async function resolveRegister (client, explicitId, userId) {
+async function resolveRegister (client, explicitId, userId, branchId) {
   if (explicitId) {
-    return client.cashRegister.findFirst({ where: { id: String(explicitId), active: true } })
+    return client.cashRegister.findFirst({ where: { id: String(explicitId), active: true, branch_id: branchId } })
   }
   if (userId) {
     const user = await client.user.findUnique({
       where: { id: String(userId) },
-      select: { cashRegister: { select: { id: true, name: true, code: true, is_default: true, active: true } } }
+      select: { cashRegister: { select: { id: true, name: true, code: true, is_default: true, active: true, branch_id: true } } }
     })
-    if (user?.cashRegister?.active) return user.cashRegister
+    if (user?.cashRegister?.active && user.cashRegister.branch_id === branchId) return user.cashRegister
   }
-  return client.cashRegister.findFirst({ where: { is_default: true, active: true } })
+  return client.cashRegister.findFirst({ where: { is_default: true, active: true, branch_id: branchId } })
 }
 
 const sessionInclude = {
@@ -119,10 +119,12 @@ exports.listRegisters = async (req, res, next) => {
     }
     const wantsAll = String(req.query.include_inactive || '') === '1'
     const includeInactive = wantsAll && checkCanManageRegisters(req).allowed
+    const { branchWhere } = require('../middlewares/tenant')
     const rows = await prisma.cashRegister.findMany({
-      where: includeInactive ? {} : { active: true },
+      where: { ...(includeInactive ? {} : { active: true }), ...branchWhere(req) },
       orderBy: [{ is_default: 'desc' }, { name: 'asc' }],
       include: {
+        branch: { select: { id: true, name: true, code: true } },
         assigned_users: { select: { id: true, name: true } },
         sessions: {
           where: { status: 'OPEN' },
@@ -175,13 +177,15 @@ exports.createRegister = async (req, res, next) => {
         .toUpperCase().replace(/[^A-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'CAJA'
     }
 
-    const existing = await prisma.cashRegister.findUnique({ where: { code } })
+    const { requireBranch } = require('../middlewares/tenant')
+    const branchId = requireBranch(req)
+    const existing = await prisma.cashRegister.findFirst({ where: { code, branch_id: branchId } })
     if (existing) {
-      return res.status(409).json({ message: `Ya existe una caja con el código "${code}"` })
+      return res.status(409).json({ message: `Ya existe una caja con el código "${code}" en la sucursal` })
     }
 
     const created = await prisma.cashRegister.create({
-      data: { name, code, is_default: false, active: true }
+      data: { name, code, is_default: false, active: true, branch_id: branchId }
     })
     res.status(201).json(created)
   } catch (e) {
@@ -202,7 +206,7 @@ exports.setRegisterUsers = async (req, res, next) => {
     }
 
     const { id } = req.params
-    const register = await prisma.cashRegister.findUnique({ where: { id } })
+    const register = await prisma.cashRegister.findFirst({ where: { id, branch: { company_id: req.companyId } } })
     if (!register) return res.status(404).json({ message: 'Caja no encontrada' })
     if (!register.active) {
       return res.status(400).json({ message: 'No se pueden asignar usuarios a una caja inactiva' })
@@ -213,9 +217,11 @@ exports.setRegisterUsers = async (req, res, next) => {
     const userIds = [...new Set(rawIds.map(String))]
 
     if (userIds.length > 0) {
-      const found = await prisma.user.count({ where: { id: { in: userIds } } })
+      const found = await prisma.user.count({
+        where: { id: { in: userIds }, user_branches: { some: { branch_id: register.branch_id } } },
+      })
       if (found !== userIds.length) {
-        return res.status(400).json({ message: 'Uno o más usuarios no existen' })
+        return res.status(400).json({ message: 'Uno o más usuarios no existen o no pertenecen a la sucursal' })
       }
     }
 
@@ -259,7 +265,7 @@ exports.updateRegister = async (req, res, next) => {
     }
 
     const { id } = req.params
-    const register = await prisma.cashRegister.findUnique({ where: { id } })
+    const register = await prisma.cashRegister.findFirst({ where: { id, branch: { company_id: req.companyId } } })
     if (!register) return res.status(404).json({ message: 'Caja no encontrada' })
 
     const data = {}
@@ -291,7 +297,11 @@ exports.updateRegister = async (req, res, next) => {
         if (!register.active && data.active !== true) {
           throw Object.assign(new Error('BAD_DEFAULT'), { status: 400 })
         }
-        await tx.cashRegister.updateMany({ where: { is_default: true }, data: { is_default: false } })
+        // La caja predeterminada es por sucursal, no global.
+        await tx.cashRegister.updateMany({
+          where: { is_default: true, branch_id: register.branch_id },
+          data: { is_default: false },
+        })
         data.is_default = true
       }
       return tx.cashRegister.update({ where: { id }, data })
@@ -317,7 +327,7 @@ exports.getCurrent = async (req, res, next) => {
     }
 
     const registerId = req.query.cash_register_id || req.query.cashRegisterId || null
-    const register = await resolveRegister(prisma, registerId, req.user?.sub)
+    const register = await resolveRegister(prisma, registerId, req.user?.sub, require('../middlewares/tenant').requireBranch(req))
 
     if (!register) {
       return res.status(503).json({ message: 'No hay caja configurada. Ejecute migraciones y seed.' })
@@ -375,7 +385,7 @@ exports.openSession = async (req, res, next) => {
     const bodyRegisterId = req.body.cash_register_id || req.body.cashRegisterId || null
 
     const created = await prisma.$transaction(async (tx) => {
-      const register = await resolveRegister(tx, bodyRegisterId, uid)
+      const register = await resolveRegister(tx, bodyRegisterId, uid, require('../middlewares/tenant').requireBranch(req))
       if (!register) {
         throw new Error('NO_REGISTER')
       }
@@ -434,7 +444,7 @@ exports.closeSession = async (req, res, next) => {
     const bodyRegisterId = req.body.cash_register_id || req.body.cashRegisterId || null
 
     const closed = await prisma.$transaction(async (tx) => {
-      const register = await resolveRegister(tx, bodyRegisterId, uid)
+      const register = await resolveRegister(tx, bodyRegisterId, uid, require('../middlewares/tenant').requireBranch(req))
       if (!register) {
         throw new Error('NO_REGISTER')
       }

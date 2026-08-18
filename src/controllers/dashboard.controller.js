@@ -29,8 +29,11 @@ exports.getStats = async (req, res) => {
     // 1. Ventas del día (solo ventas con estado Completado - id: 1)
     const STATUS_COMPLETADO = 1;
 
+    const { branchWhere } = require('../middlewares/tenant')
+    const tenantSales = branchWhere(req)
     const salesAggregate = await prisma.sale.aggregate({
       where: {
+        ...tenantSales,
         sold_at: { gte: startOfDayUtc, lte: nowUtc },
         status_id: STATUS_COMPLETADO
       },
@@ -43,26 +46,27 @@ exports.getStats = async (req, res) => {
     const ventasHoy = salesAggregate._sum.adjusted_total || 0;  // ✅ Ventas netas
     const cantidadVentasHoy = salesAggregate._count || 0;
 
-    // 2. Productos en stock (productos activos con stock > 0)
-    const productosEnStock = await prisma.product.count({
-      where: {
-        stock: { gt: 0 },
-        deleted_at: null
-      }
-    });
-
-    // 3. Valor total del inventario (precio_venta * stock para todos los productos activos)
-    const productos = await prisma.product.findMany({
-      where: { deleted_at: null },
-      select: {
-        price: true,
-        stock: true
-      }
-    });
-
-    const valorInventario = productos.reduce((sum, p) => {
-      return sum + (Number(p.price || 0) * Number(p.stock || 0));
-    }, 0);
+    // 2 y 3. Stock y valor de inventario: de la sucursal activa (o total de la
+    // empresa en vista consolidada, usando el espejo products.stock)
+    let productosEnStock
+    let valorInventario
+    if (req.branchId) {
+      const rows = await prisma.productStock.findMany({
+        where: { branch_id: req.branchId, product: { deleted_at: null } },
+        select: { stock: true, product: { select: { price: true } } },
+      })
+      productosEnStock = rows.filter((r) => r.stock > 0).length
+      valorInventario = rows.reduce((sum, r) => sum + Number(r.product.price || 0) * Number(r.stock || 0), 0)
+    } else {
+      productosEnStock = await prisma.product.count({
+        where: { stock: { gt: 0 }, deleted_at: null, company_id: req.companyId }
+      })
+      const productos = await prisma.product.findMany({
+        where: { deleted_at: null, company_id: req.companyId },
+        select: { price: true, stock: true }
+      })
+      valorInventario = productos.reduce((sum, p) => sum + Number(p.price || 0) * Number(p.stock || 0), 0)
+    }
 
     // 4. Alertas críticas (alertas activas no resueltas con prioridad "Crítica")
     await syncLotExpiryAlerts(prisma); // advisory, autothrottled; no hay cron en serverless
@@ -75,6 +79,7 @@ exports.getStats = async (req, res) => {
     });
 
     const alertasCriticasQuery = {
+      ...branchWhere(req),
       resolved: 0,
       ...(statusActiva ? { status_id: statusActiva.id } : {}),
       ...(priorityCritica ? { priority_id: priorityCritica.id } : {})
@@ -90,6 +95,7 @@ exports.getStats = async (req, res) => {
 
     const salesYesterday = await prisma.sale.aggregate({
       where: {
+        ...tenantSales,
         sold_at: { gte: yesterdayStart, lt: yesterdayEnd },
         status_id: STATUS_COMPLETADO
       },

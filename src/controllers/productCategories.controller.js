@@ -52,6 +52,7 @@ exports.list = async (req, res, next) => {
     const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize ?? 20)))
     const { includeDeleted } = req.query
     const where = includeDeleted === 'true' ? {} : { deleted: false }
+    where.company_id = req.companyId
     
     const totalItems = await prisma.productCategory.count({ where })
     const totalPages = Math.max(1, Math.ceil(totalItems / pageSize))
@@ -128,7 +129,7 @@ exports.create = async (req, res, next) => {
     }
 
     const imageParsed = parseOptionalImageUrl(rawImageUrl)
-    const data = { name: name.trim() }
+    const data = { name: name.trim(), company_id: req.companyId }
     if (imageParsed.provided && imageParsed.value) {
       data.image_url = imageParsed.value
     }
@@ -187,7 +188,7 @@ exports.update = async (req, res, next) => {
     }
 
     const categoryId = Number(id)
-    const existing = await prisma.productCategory.findUnique({ where: { id: categoryId } })
+    const existing = await prisma.productCategory.findFirst({ where: { id: categoryId, company_id: req.companyId } })
     if (!existing) {
       return res.status(404).json({ message: 'Categoría no encontrada' })
     }
@@ -262,6 +263,12 @@ exports.remove = async (req, res, next) => {
       })
     }
     
+    const owned = await prisma.productCategory.findFirst({
+      where: { id: Number(id), company_id: req.companyId },
+      select: { id: true },
+    })
+    if (!owned) return res.status(404).json({ message: 'Categoría no encontrada' })
+
     // Soft delete
     const deleted = await prisma.productCategory.update({
       where: { id: Number(id) },
@@ -299,6 +306,11 @@ exports.remove = async (req, res, next) => {
 exports.restore = async (req, res, next) => {
   try {
     const { id } = req.params
+    const owned = await prisma.productCategory.findFirst({
+      where: { id: Number(id), company_id: req.companyId },
+      select: { id: true },
+    })
+    if (!owned) return res.status(404).json({ message: 'Categoría no encontrada' })
     const restored = await prisma.productCategory.update({
       where: { id: Number(id) },
       data: { deleted: false }
@@ -355,7 +367,7 @@ exports.validateImportMapped = async (req, res, next) => {
     }
 
     // Validate without importing
-    const validation = await bulkValidateCatalogs(items, 'categories')
+    const validation = await bulkValidateCatalogs(items, 'categories', req.companyId)
 
     res.json({
       ok: true,
@@ -391,7 +403,7 @@ exports.bulkImportMapped = async (req, res, next) => {
     }
 
     // Validate all categories
-    const validation = await bulkValidateCatalogs(items, 'categories')
+    const validation = await bulkValidateCatalogs(items, 'categories', req.companyId)
 
     if (validation.invalidRows.length > 0) {
       return res.status(400).json({
@@ -401,7 +413,7 @@ exports.bulkImportMapped = async (req, res, next) => {
     }
 
     // All valid, proceed to import
-    const result = await bulkCreateCatalogs(validation.validRows, 'categories')
+    const result = await bulkCreateCatalogs(validation.validRows, 'categories', req.companyId)
 
     res.json({
       ok: true,

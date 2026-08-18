@@ -12,30 +12,36 @@ const DEFAULT_CURRENCY_NAME = 'Quetzal'
 
 const RUNTIME_KEYS = ['timezone', 'company_name', 'company_logo_url', 'currency_code', 'currency_name']
 
-/** Caché en memoria: { data, expiresAt } */
-let systemConfigCache = null
+/** Caché en memoria por empresa: companyId -> { data, expiresAt } */
+const systemConfigCache = new Map()
 const CACHE_TTL_MS = 60 * 1000 // 60 segundos
 
 /**
  * Invalida la caché de configuración (llamar tras PATCH /api/settings).
+ * @param {string} [companyId] sin argumento invalida todas las empresas
  */
-function invalidateSystemConfigCache() {
-  systemConfigCache = null
+function invalidateSystemConfigCache(companyId) {
+  if (companyId) systemConfigCache.delete(String(companyId))
+  else systemConfigCache.clear()
 }
 
 /**
- * Obtiene la configuración de runtime en una sola consulta, con caché TTL.
+ * Configuración de runtime de UNA empresa, en una consulta y con caché TTL.
+ * Sin companyId devuelve los valores por defecto: nombre, logo, moneda y zona
+ * horaria son de la empresa, y servir los de otra sería peor que un default.
  * @param {import('@prisma/client').PrismaClient} prisma
- * @returns {Promise<{ timezone: string, company_name: string, currency_code: string, currency_name: string }>}
+ * @param {string} companyId
  */
-async function getSystemConfig(prisma) {
+async function getSystemConfig(prisma, companyId) {
   const now = Date.now()
-  if (systemConfigCache && systemConfigCache.expiresAt > now) {
-    return systemConfigCache.data
-  }
-  const rows = await prisma.systemSetting.findMany({
-    where: { key: { in: RUNTIME_KEYS } }
-  })
+  const key = String(companyId || '')
+  const cached = systemConfigCache.get(key)
+  if (cached && cached.expiresAt > now) return cached.data
+  const rows = companyId
+    ? await prisma.systemSetting.findMany({
+        where: { key: { in: RUNTIME_KEYS }, company_id: companyId },
+      })
+    : []
   const data = {
     timezone: DEFAULT_TZ,
     company_name: DEFAULT_COMPANY_NAME,
@@ -47,7 +53,7 @@ async function getSystemConfig(prisma) {
     const v = row.value != null ? String(row.value).trim() : ''
     if (RUNTIME_KEYS.includes(row.key) && v) data[row.key] = v
   }
-  systemConfigCache = { data, expiresAt: now + CACHE_TTL_MS }
+  systemConfigCache.set(key, { data, expiresAt: now + CACHE_TTL_MS })
   return data
 }
 
@@ -55,8 +61,8 @@ async function getSystemConfig(prisma) {
  * @param {import('@prisma/client').PrismaClient} prisma
  * @returns {Promise<string>} IANA timezone (ej. America/Guatemala)
  */
-async function getTimezone(prisma) {
-  const config = await getSystemConfig(prisma)
+async function getTimezone(prisma, companyId) {
+  const config = await getSystemConfig(prisma, companyId)
   return config.timezone
 }
 
@@ -64,8 +70,8 @@ async function getTimezone(prisma) {
  * @param {import('@prisma/client').PrismaClient} prisma
  * @returns {Promise<string>} Nombre de la empresa para reportes y PDFs
  */
-async function getCompanyName(prisma) {
-  const config = await getSystemConfig(prisma)
+async function getCompanyName(prisma, companyId) {
+  const config = await getSystemConfig(prisma, companyId)
   return config.company_name
 }
 
