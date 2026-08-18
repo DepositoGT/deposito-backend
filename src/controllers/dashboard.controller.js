@@ -53,19 +53,20 @@ exports.getStats = async (req, res) => {
     if (req.branchId) {
       const rows = await prisma.productStock.findMany({
         where: { branch_id: req.branchId, product: { deleted_at: null } },
-        select: { stock: true, product: { select: { price: true } } },
+        select: { stock: true, product: { select: { cost: true } } },
       })
       productosEnStock = rows.filter((r) => r.stock > 0).length
-      valorInventario = rows.reduce((sum, r) => sum + Number(r.product.price || 0) * Number(r.stock || 0), 0)
+      // Valor de inventario = unidades × costo unitario (no precio de venta).
+      valorInventario = rows.reduce((sum, r) => sum + Number(r.product.cost || 0) * Number(r.stock || 0), 0)
     } else {
       productosEnStock = await prisma.product.count({
         where: { stock: { gt: 0 }, deleted_at: null, company_id: req.companyId }
       })
       const productos = await prisma.product.findMany({
         where: { deleted_at: null, company_id: req.companyId },
-        select: { price: true, stock: true }
+        select: { cost: true, stock: true }
       })
-      valorInventario = productos.reduce((sum, p) => sum + Number(p.price || 0) * Number(p.stock || 0), 0)
+      valorInventario = productos.reduce((sum, p) => sum + Number(p.cost || 0) * Number(p.stock || 0), 0)
     }
 
     // 4. Alertas críticas (alertas activas no resueltas con prioridad "Crítica")

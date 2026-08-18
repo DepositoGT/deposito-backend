@@ -808,13 +808,24 @@ async function getFinancialData(startUtc, endUtc, req) {
     select: {
       qty: true,
       cost: true,
+      source: true,
       supplier: { select: { name: true } }
     }
   })
   let purchasesTotal = 0
+  let initialInventoryTotal = 0
+  let initialInventoryUnits = 0
+  let initialInventoryLines = 0
   const purchasesBySupplier = {}
   for (const pl of purchaseLogs) {
     const lineVal = number(pl.qty) * number(pl.cost)
+    // El saldo de apertura no es una compra del período: se reporta aparte.
+    if (pl.source === 'INITIAL') {
+      initialInventoryTotal += lineVal
+      initialInventoryUnits += number(pl.qty)
+      initialInventoryLines += 1
+      continue
+    }
     purchasesTotal += lineVal
     const name = pl.supplier?.name || '—'
     if (!purchasesBySupplier[name]) {
@@ -892,8 +903,11 @@ async function getFinancialData(startUtc, endUtc, req) {
     // contra la cuenta contable de Inventario.
     inventoryValueOwned: Number((inventoryValue + enTransito.value).toFixed(2)),
     purchasesPeriod: Number(purchasesTotal.toFixed(2)),
-    purchaseLogLines: purchaseLogs.length,
+    purchaseLogLines: purchaseLogs.length - initialInventoryLines,
     purchasesBySupplier: purchasesBySupplierList,
+    initialInventoryPeriod: Number(initialInventoryTotal.toFixed(2)),
+    initialInventoryUnitsPeriod: initialInventoryUnits,
+    initialInventoryLines,
     categoryProfitability,
     grossMarginPct,
     inventoryTurnover,

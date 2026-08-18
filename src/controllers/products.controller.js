@@ -365,6 +365,8 @@ exports.create = async (req, res, next) => {
           nowGt.millisecond
         ))
 
+        // Stock inicial de un producto nuevo = apertura, nunca una compra
+        // operativa del período (mismo criterio que 'INITIAL' en stock_movements).
         purchaseLog = await tx.purchaseLog.create({
           data: {
             product_id: product.id,
@@ -372,15 +374,15 @@ exports.create = async (req, res, next) => {
             qty: stock,
             cost: cost,
             date: dateAsUtcWithGtClock,
+            source: 'INITIAL',
           },
         })
 
-        // increment supplier total_purchases by qty * cost and set last_order
-        const amount = Number(stock) * Number(cost)
+        // No incrementa total_purchases del proveedor: es saldo de apertura,
+        // no una compra real que el proveedor haya despachado.
         await tx.supplier.update({
           where: { id: supplierId },
           data: {
-            total_purchases: { increment: amount },
             last_order: dateAsUtcWithGtClock,
           }
         })
@@ -1473,7 +1475,10 @@ async function updateAverageCost(tx, product, qty, unitCost, corriente) {
 exports.registerIncomingMerchandise = async (req, res, next) => {
   try {
     const body = req.body || {}
-    const { supplier_id, items, notes, location_id } = body
+    const { supplier_id, items, notes, location_id, is_initial_load } = body
+    // Carga de saldo de apertura (nuevo cliente/base) vs. compra operativa:
+    // mismo endpoint, distinta clasificación contable/analítica.
+    const merchandiseSource = is_initial_load ? 'INITIAL' : 'PURCHASE'
     const user = req.user
     if (!user || !user.sub) {
       return res.status(401).json({ message: 'Usuario no autenticado' })
@@ -1649,6 +1654,7 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
           registered_by,
           date: dateAsUtcWithGtClock,
           notes: notes || null,
+          source: merchandiseSource,
           payment_term_id,
           payment_status,
           paid_at,
@@ -1701,9 +1707,11 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
         // valuación del inventario y todos los márgenes.
         await updateAverageCost(tx, product, quantity, unitCost, costeoCorriente)
 
-        // La mercancía entra al stock de la sucursal (y al espejo global)
+        // La mercancía entra al stock de la sucursal (y al espejo global).
+        // reason sigue la misma clasificación que el resto del kardex:
+        // 'INITIAL' si es carga de apertura, 'PURCHASE' si es compra real.
         const [updated] = await restoreStockMap(tx, new Map([[String(product.id), quantity]]), branchId, {
-          reason: 'PURCHASE', refType: 'incoming_merchandise', refId: String(incomingMerchandise.id),
+          reason: merchandiseSource, refType: 'incoming_merchandise', refId: String(incomingMerchandise.id),
           userId: registered_by, locationId: lotLocationId,
         })
         updatedProducts.push(updated)
@@ -1716,6 +1724,7 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
             qty: quantity,
             cost: unitCost,
             date: dateAsUtcWithGtClock,
+            source: merchandiseSource,
           }
         })
         purchaseLogs.push(purchaseLog)
@@ -1760,11 +1769,11 @@ exports.registerIncomingMerchandise = async (req, res, next) => {
         totalPurchaseValue += quantity * unitCost
       }
 
-      // Update supplier: total_purchases and last_order
+      // Update supplier: total_purchases (solo compras reales, no apertura) and last_order
       await tx.supplier.update({
         where: { id: supplier_id },
         data: {
-          total_purchases: { increment: totalPurchaseValue },
+          ...(merchandiseSource === 'PURCHASE' ? { total_purchases: { increment: totalPurchaseValue } } : {}),
           last_order: dateAsUtcWithGtClock,
         }
       })
