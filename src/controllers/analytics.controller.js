@@ -242,7 +242,12 @@ exports.summary = async (req, res, next) => {
     // Excluye cargas de saldo de apertura (source: INITIAL) — esas no son
     // compras operativas, se reportan aparte en `initialInventory`.
     const incoming = await prisma.incomingMerchandise.findMany({
-      where: { date: { gte: startUtc, lte: endUtc } },
+      where: {
+        date: { gte: startUtc, lte: endUtc },
+        ...(req.branchId
+          ? { branch_id: req.branchId }
+          : { branch: { company_id: req.companyId } }),
+      },
       select: {
         date: true,
         payment_status: true,
